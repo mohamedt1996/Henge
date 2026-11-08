@@ -1,0 +1,69 @@
+name: Android APK
+
+on:
+  push:
+    branches: [android-port]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q gcc-aarch64-linux-gnu clang cmake pkg-config
+          pip install --user meson ninja
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Cache engine dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/deps
+          key: deps-${{ hashFiles('android/build_deps.sh', 'android/patches/**', 'third_party/mbedtls/**') }}
+
+      - name: Engine dependencies (zlib, libffi, pcre2, glib, libslirp, mbedtls, curl, lzfse)
+        run: |
+          if [ ! -f ~/deps/arm64/lib/libcurl.a ] || [ ! -d ~/deps/src/lzfse ]; then android/build_deps.sh ~/deps/arm64; fi
+
+      - name: Engine (hengevm-android, static arm64)
+        run: |
+          make -f android/Makefile build/android/hengevm-android DEPS=$HOME/deps/arm64 -j"$(nproc)"
+          mkdir -p android/apk/app/src/main/jniLibs/arm64-v8a
+          cp build/android/hengevm-android android/apk/app/src/main/jniLibs/arm64-v8a/libhengevm.so
+          aarch64-linux-gnu-strip android/apk/app/src/main/jniLibs/arm64-v8a/libhengevm.so
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.10.2
+
+      - name: APK
+        run: |
+          gradle -p android/apk assembleRelease --no-daemon
+          cp android/apk/app/build/outputs/apk/release/app-release.apk Henge-android.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Henge-android
+          path: Henge-android.apk
+
+      - name: Publish as a release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-latest
+          name: Henge for Android (latest build)
+          prerelease: true
+          make_latest: false
+          body: |
+            Built from ${{ github.sha }}. Install Henge-android.apk on an arm64 Android device (Android 10+).
+          files: Henge-android.apk

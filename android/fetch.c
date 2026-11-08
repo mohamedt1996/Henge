@@ -64,21 +64,6 @@ static size_t to_buf(char *d, size_t sz, size_t n, void *u) {
     return k;
 }
 
-static void ca_setup(CURL *c) {
-    /* Android keeps its CAs as a hashed directory; Termux and desktop Linux have a bundle. */
-    const char *bundle = getenv("CURL_CA_BUNDLE");
-    if (!bundle || !*bundle) bundle = NULL;
-    if (!bundle && access("/data/data/com.termux/files/usr/etc/tls/cert.pem", R_OK) == 0)
-        bundle = "/data/data/com.termux/files/usr/etc/tls/cert.pem";
-    if (!bundle && access("/etc/ssl/certs/ca-certificates.crt", R_OK) == 0) bundle = "/etc/ssl/certs/ca-certificates.crt";
-    if (bundle) {
-        curl_easy_setopt(c, CURLOPT_CAINFO, bundle);
-        curl_easy_setopt(c, CURLOPT_CAPATH, NULL); /* the built-in default is Android's directory */
-    } else {
-        curl_easy_setopt(c, CURLOPT_CAPATH, "/system/etc/security/cacerts");
-    }
-}
-
 /* ---- LZVN (as ios/Henge/BootROM.swift) ---- */
 
 static int lzvn(const uint8_t *s, size_t n, uint8_t *out, size_t expected) {
@@ -175,7 +160,6 @@ int hv_fetch_boot_rom(const char *path) {
     for (int attempt = 1; attempt <= 3; attempt++) {
         Buf b = {0};
         CURL *c = curl_easy_init();
-        ca_setup(c);
         curl_easy_setopt(c, CURLOPT_URL, ROM_SOURCE);
         curl_easy_setopt(c, CURLOPT_RANGE, range);
         curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
@@ -240,7 +224,6 @@ int hv_download(const char *url, const char *path) {
         if (!dl.f) return -1;
         dl.base = ftello(dl.f);
         CURL *c = curl_easy_init();
-        ca_setup(c);
         curl_easy_setopt(c, CURLOPT_URL, url);
         curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(c, CURLOPT_RESUME_FROM_LARGE, dl.base);

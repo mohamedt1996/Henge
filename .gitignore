@@ -1,1 +1,5 @@
 build/
+android/apk/app/src/main/jniLibs/
+android/apk/.gradle/
+android/apk/app/build/
+android/apk/build/

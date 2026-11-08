@@ -9,11 +9,26 @@ get https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz
 get https://github.com/libffi/libffi/releases/download/v3.5.0/libffi-3.5.0.tar.gz
 get https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.44/pcre2-10.44.tar.gz
 get https://github.com/utmapp/libslirp/releases/download/v4.9.1-release-mirror/libslirp-v4.9.1.tar.gz
+get https://github.com/curl/curl/releases/download/curl-8_11_1/curl-8.11.1.tar.gz
 [ -d glib ] || git clone -q --depth 1 --branch 2.80.5 https://github.com/GNOME/glib.git glib
+[ -d lzfse ] || git clone -q --depth 1 https://github.com/lzfse/lzfse.git lzfse
 export CC=aarch64-linux-gnu-gcc AR=aarch64-linux-gnu-ar RANLIB=aarch64-linux-gnu-ranlib CFLAGS="-O2 -fPIC"
 (cd zlib-1.3.1 && CHOST=aarch64-linux-gnu ./configure --prefix="$P" --static && make -j8 install)
 (cd libffi-3.5.0 && ./configure --host=aarch64-linux-gnu --prefix="$P" --disable-shared --disable-docs && make -j8 install)
 (cd pcre2-10.44 && ./configure --host=aarch64-linux-gnu --prefix="$P" --disable-shared && make -j8 install)
+# mbedtls: the copy Henge vendors (library + headers only), one archive under the three names curl expects
+mkdir -p mbedtls-build "$P/include"
+for f in "$H"/../third_party/mbedtls/library/*.c; do
+    $CC $CFLAGS -w -I"$H/../third_party/mbedtls/include" -I"$H/../third_party/mbedtls/library" -c "$f" -o "mbedtls-build/$(basename "${f%.c}").o"
+done
+$AR rcs "$P/lib/libmbedcrypto.a" mbedtls-build/*.o
+cp "$P/lib/libmbedcrypto.a" "$P/lib/libmbedtls.a"; cp "$P/lib/libmbedcrypto.a" "$P/lib/libmbedx509.a"
+cp -r "$H/../third_party/mbedtls/include/mbedtls" "$H/../third_party/mbedtls/include/psa" "$P/include/"
+(cd curl-8.11.1 && ./configure --host=aarch64-linux-gnu --prefix="$P" --disable-shared --enable-static --with-mbedtls="$P" \
+   --without-libpsl --without-brotli --without-zstd --without-nghttp2 --without-libidn2 --disable-ldap --disable-ldaps \
+   --disable-rtsp --disable-dict --disable-telnet --disable-tftp --disable-pop3 --disable-imap --disable-smtp --disable-gopher \
+   --disable-mqtt --disable-smb --disable-manual --disable-docs --with-zlib="$P" \
+   --with-ca-path=/system/etc/security/cacerts --without-ca-bundle && make -j8 && make install)
 unset CC AR RANLIB CFLAGS
 cat > cross.ini <<X
 [binaries]
