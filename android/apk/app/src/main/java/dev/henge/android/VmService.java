@@ -32,6 +32,11 @@ public class VmService extends Service {
     private PowerManager.WakeLock wake;
 
     public static File macDir(Context c) { return new File(c.getFilesDir(), "mac"); }
+    /** Shader captures go where a computer can copy them over USB: Android/data/dev.henge.android/files/shaders. */
+    public static File shaderDir(Context c) {
+        File ext = c.getExternalFilesDir(null);
+        return new File(ext != null ? ext : c.getFilesDir(), "shaders");
+    }
     public static File logFile(Context c) { return new File(c.getFilesDir(), "henge.log"); }
     public static boolean installed(Context c) {
         return new File(macDir(c), "machine.json").exists() && new File(c.getFilesDir(), "installed").exists();
@@ -52,11 +57,13 @@ public class VmService extends Service {
         wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "henge:vm");
         wake.acquire();
         boolean deleteImage = intent.getBooleanExtra("deleteImage", true);
-        new Thread(() -> run(mode, ram, cpus, release == null ? "15.6.1" : release, deleteImage), "engine").start();
+        String gpu = intent.getStringExtra("gpu");
+        new Thread(() -> run(mode, ram, cpus, release == null ? "15.6.1" : release, deleteImage,
+                gpu == null ? "on" : gpu), "engine").start();
         return START_NOT_STICKY;
     }
 
-    private void run(String mode, int ram, int cpus, String release, boolean deleteImage) {
+    private void run(String mode, int ram, int cpus, String release, boolean deleteImage, String gpu) {
         boolean install = "install".equals(mode);
         state = install ? "installing" : "running";
         File files = getFilesDir(), mac = macDir(this), log = logFile(this), pidFile = new File(files, "engine.pid");
@@ -74,6 +81,8 @@ public class VmService extends Service {
         } else {
             cmd.add("--mac"); cmd.add(mac.getPath());
             cmd.add("--vnc"); cmd.add("5900");
+            cmd.add("--gpu"); cmd.add(gpu);
+            if ("capture".equals(gpu)) { cmd.add("--shader-dir"); cmd.add(shaderDir(this).getPath()); }
         }
         cmd.add("--ram"); cmd.add(Integer.toString(ram));
         cmd.add("--cpus"); cmd.add(Integer.toString(cpus));

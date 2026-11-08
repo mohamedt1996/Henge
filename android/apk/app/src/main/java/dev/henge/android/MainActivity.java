@@ -479,6 +479,12 @@ public class MainActivity extends Activity {
         c.addView(stepper("Memory", ramMb() / 1024 + " GB", () -> setRam(ramMb() - 1024), () -> setRam(ramMb() + 1024),
                 ramMb() > 2048, ramMb() / 1024 < Math.max(2, (int) (totalRamMb() / 1024) - 2)));
         c.addView(hairline());
+        c.addView(choiceRow("Graphics", GPU_LABELS, java.util.Arrays.asList(GPU_MODES).indexOf(gpuMode()),
+                i -> { prefs.edit().putString("gpu", GPU_MODES[i]).apply(); render(true); }));
+        TextView gnote = text(GPU_NOTES[Math.max(0, java.util.Arrays.asList(GPU_MODES).indexOf(gpuMode()))], 13, DIM, false);
+        gnote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(gnote);
+        c.addView(hairline());
         c.addView(infoRow("Display", "VNC on 127.0.0.1:5900"));
         c.addView(hairline());
         c.addView(infoRow("Engine", VmService.busy() ? "Running" : VmService.state));
@@ -502,6 +508,7 @@ public class MainActivity extends Activity {
         i.putExtra(VmService.EXTRA_CPUS, cpus());
         i.putExtra(VmService.EXTRA_RELEASE, RELEASES[releaseIndex()]);
         i.putExtra("deleteImage", prefs.getBoolean("deleteAfter", true));
+        i.putExtra("gpu", gpuMode());
         if ("install".equals(mode)) prefs.edit().putInt("installedRelease", releaseIndex()).apply();
         startForegroundService(i);
         if ("run".equals(mode)) ui.postDelayed(() -> startActivity(new Intent(this, ScreenActivity.class)), 1500);
@@ -650,6 +657,37 @@ public class MainActivity extends Activity {
         b.setLayoutParams(new LinearLayout.LayoutParams(dp(46), dp(34)));
         if (enabled) { b.setOnClickListener(v -> r.run()); b.setBackground(ripple()); }
         return b;
+    }
+
+    static final String[] GPU_MODES = {"on", "off", "capture"};
+    static final String[] GPU_LABELS = {"GPU", "Off", "Capture"};
+    static final String[] GPU_NOTES = {
+            "macOS's GPU driver runs, but Android has no renderer for it yet: expect the boot screen, then black.",
+            "Experiment: no GPU device, so macOS may fall back to a plain framebuffer and show a slow desktop.",
+            "Saves every shader and pipeline macOS uses to Android/data/dev.henge.android/files/shaders, "
+                    + "the inventory for the Vulkan renderer. Copy it to a computer over USB."};
+
+    private String gpuMode() { return prefs.getString("gpu", "on"); }
+
+    /** A row with a segmented choice, the way iOS settings pick one of a few. */
+    private LinearLayout choiceRow(String label, String[] options, int selected, java.util.function.IntConsumer pick) {
+        LinearLayout r = row();
+        r.setPadding(dp(17), dp(10), dp(12), dp(10));
+        r.addView(text(label, 16, TEXT, false), new LinearLayout.LayoutParams(0, -2, 1));
+        LinearLayout seg = row();
+        seg.setBackground(round(RAISED, 9, 0));
+        seg.setPadding(dp(2), dp(2), dp(2), dp(2));
+        for (int i = 0; i < options.length; i++) {
+            final int idx = i;
+            TextView o = text(options[i], 14, i == selected ? Color.WHITE : DIM, i == selected);
+            o.setGravity(Gravity.CENTER);
+            o.setPadding(dp(12), dp(6), dp(12), dp(6));
+            if (i == selected) o.setBackground(round(ACCENT, 7, 0));
+            o.setOnClickListener(v -> pick.accept(idx));
+            seg.addView(o);
+        }
+        r.addView(seg);
+        return r;
     }
 
     private LinearLayout infoRow(String label, String value) {

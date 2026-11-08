@@ -21,7 +21,10 @@ static void usage(void) {
             "   or: hengevm-android --mac FOLDER (exported from Henge on iOS) [options]\n"
             "   or: hengevm-android --rom AVPBooter.vmapple2.bin --disk Disk.img --aux AuxiliaryStorage\n"
             "                       --ecid N --seed N [--ram MB (4096)] [--cpus N (2)] [--log 0-3] [--jit-mb MB] [--net 0|1]\n"
-            "                       [--vnc PORT (5900, 0 = off)]\n");
+            "                       [--vnc PORT (5900, 0 = off)] [--gpu on|off|capture] [--shader-dir DIR]\n"
+            "  --gpu off      no paravirtual GPU (experiment: macOS may fall back to a plain framebuffer)\n"
+            "  --gpu capture  keep the GPU device and save every shader library and pipeline macOS uses\n"
+            "                 (default DIR: shaders/ next to the disk), for building the Vulkan translation\n");
     exit(2);
 }
 
@@ -80,6 +83,7 @@ static void on_signal(int sig) {
 
 int main(int argc, char **argv) {
     int vnc_port = 5900;
+    const char *gpu = "on", *shader_dir = NULL;
     const char *install_dir = NULL, *release = "15.6.1", *ipsw = NULL;
     uint64_t disk_gb = 64;
     HvVmConfig vc = {.aux_offset = 16384, .ram_mb = 4096, .ncpus = 2, .log = 1, .no_net = 0, .no_sound = 1};
@@ -101,6 +105,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--cpus")) vc.ncpus = atoi(v);
         else if (!strcmp(a, "--log")) vc.log = atoi(v);
         else if (!strcmp(a, "--vnc")) vnc_port = atoi(v);
+        else if (!strcmp(a, "--gpu")) gpu = v;
+        else if (!strcmp(a, "--shader-dir")) shader_dir = v;
         else if (!strcmp(a, "--net")) vc.no_net = !atoi(v);
         else if (!strcmp(a, "--jit-mb")) vc.jit_bytes = (size_t)atoi(v) << 20;
         else usage();
@@ -147,6 +153,21 @@ int main(int argc, char **argv) {
         mkdir(work, 0755);
     }
     if (!vc.rom || !vc.disk || !vc.aux) usage();
+    if (!strcmp(gpu, "off")) {
+        setenv("HV_NO_GPU", "1", 1);
+        fprintf(stderr, "hengevm: GPU off (experiment)\n");
+    } else if (!strcmp(gpu, "capture") && !vc.installer) {
+        static char dir[1100];
+        if (!shader_dir) {
+            snprintf(dir, sizeof dir, "%s", vc.disk);
+            char *slash = strrchr(dir, '/');
+            snprintf(slash ? slash + 1 : dir, sizeof dir - (slash ? (size_t)(slash + 1 - dir) : 0), "shaders");
+            shader_dir = dir;
+        }
+        setenv("HV_SHADER_CAPTURE", shader_dir, 1);
+    } else if (strcmp(gpu, "on") && strcmp(gpu, "capture")) {
+        usage();
+    }
     setvbuf(stderr, NULL, _IONBF, 0);
     /* Android has no swap to speak of: back guest RAM with a file unless told otherwise. */
     if (!getenv("HV_RAM_FILE")) {

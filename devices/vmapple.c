@@ -229,7 +229,7 @@ static uint64_t tick_locked(HvMachine *m, HvCpu *cpu) {
     if (cpu->index != 0) return deadline; /* the others only have their own timers to look after */
     hv_pl031_tick(b->rtc);
     if (b->poll) b->poll();
-    hv_pvg_lite_poll(b->pvg);
+    if (b->pvg) hv_pvg_lite_poll(b->pvg);
     hv_virtio_blk_poll(b->root_blk);
     hv_virtio_blk_poll(b->aux_blk);
     hv_xhci_poll(b->usb);
@@ -304,7 +304,14 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     b->bdif = hv_bdif_create(m, VMAPPLE_BDOOR, root, aux);
     b->aes = hv_aes_create(m, b->gic, VMAPPLE_AES_1, VMAPPLE_AES_2, 32 + VMAPPLE_IRQ_AES);
     hv_machine_add_mmio(m, VMAPPLE_PVPANIC, 2, b, pvpanic_read, pvpanic_write, "pvpanic");
-    b->pvg = hv_pvg_lite_create(m, b->gic, VMAPPLE_GFX, VMAPPLE_IOSFC, 32 + 0x11, 32 + 0x10);
+    /* HV_NO_GPU (experiment): no paravirtual GPU. Its registers read as zero and ignore writes, so
+       macOS's driver finds no device instead of faulting, and macOS may fall back to the plain framebuffer. */
+    if (getenv("HV_NO_GPU")) {
+        hv_machine_add_mmio(m, VMAPPLE_GFX, 0x10000, NULL, NULL, NULL, "gfx-absent");
+        hv_machine_add_mmio(m, VMAPPLE_IOSFC, 0x10000, NULL, NULL, NULL, "iosurface-absent");
+    } else {
+        b->pvg = hv_pvg_lite_create(m, b->gic, VMAPPLE_GFX, VMAPPLE_IOSFC, 32 + 0x11, 32 + 0x10);
+    }
     hv_machine_add_mmio(m, VMAPPLE_RTC_SELECT, 0x4000, b, rtc_select_read, rtc_select_write, "rtc-select");
     avp_regs_create(m, ram_size);
     HvCfgParams p = *cfg;
