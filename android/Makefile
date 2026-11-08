@@ -57,8 +57,21 @@ $(B)/net_slirp.o: host/net_slirp.c host/*.h | $(B)
 	$(CC) $(CFLAGS) $(SLIRP_CFLAGS) -c $< -o $@
 $(B)/vnc.o: android/vnc.c android/vnc.h host/vm.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
-$(B)/hengevm-android: android/runner.c $(B)/vm.o $(B)/net_slirp.o $(B)/vnc.o $(B)/host_stubs.o $(B)/libhengevm.a
-	$(CC) $(CFLAGS) $^ $(SLIRP_LIBS) $(LIBS) -o $@
+LZFSE ?= $(dir $(DEPS))src/lzfse/src
+LZFSE_OBJ = $(B)/lzfse_decode.o $(B)/lzfse_decode_base.o $(B)/lzfse_fse.o $(B)/lzvn_decode_base.o
+$(B)/lzfse_%.o: $(LZFSE)/lzfse_%.c | $(B)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(B)/lzvn_decode_base.o: $(LZFSE)/lzvn_decode_base.c | $(B)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(B)/fetch.o: android/fetch.c android/fetch.h | $(B)
+	$(CC) $(CFLAGS) -I$(DEPS)/include -I$(LZFSE) -c $< -o $@
+$(B)/runner.o: android/runner.c android/*.h host/vm.h | $(B)
+	$(CC) $(CFLAGS) -I$(DEPS)/include -c $< -o $@
+$(B)/libhengerestore.a: android/build_restore.sh host/install.c host/libusb_shim.c
+	DEPS=$(DEPS) android/build_restore.sh
+RESTORE_LIBS = $(B)/libhengerestore.a $(DEPS)/libzip/lib/libzip.a -L$(DEPS)/lib -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz
+$(B)/hengevm-android: $(B)/runner.o $(B)/fetch.o $(LZFSE_OBJ) $(B)/vm.o $(B)/usb_host.o $(B)/net_slirp.o $(B)/vnc.o $(B)/host_stubs.o $(B)/libhengevm.a $(B)/libhengerestore.a
+	$(CC) $(CFLAGS) $(filter-out $(B)/libhengerestore.a,$^) $(RESTORE_LIBS) $(SLIRP_LIBS) $(LIBS) -o $@
 
 $(B)/libhengevm.a: $(ENGINE) $(DEV)
 	rm -f $@
