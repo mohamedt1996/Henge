@@ -2,6 +2,7 @@
    The disk, aux and identity come from an install made by Henge on an iPhone or iPad
    (or hengevm on a Mac); copy them to the device and point this at them. */
 #include "vm.h"
+#include "vnc.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -12,7 +13,8 @@
 static void usage(void) {
     fprintf(stderr,
             "usage: hengevm-android --rom AVPBooter.vmapple2.bin --disk Disk.img --aux AuxiliaryStorage\n"
-            "                       --ecid N --seed N [--ram MB (4096)] [--cpus N (2)] [--log 0-3] [--jit-mb MB]\n");
+            "                       --ecid N --seed N [--ram MB (4096)] [--cpus N (2)] [--log 0-3] [--jit-mb MB] [--net 0|1]\n"
+            "                       [--vnc PORT (5900, 0 = off)]\n");
     exit(2);
 }
 
@@ -24,7 +26,8 @@ static void on_signal(int sig) {
 }
 
 int main(int argc, char **argv) {
-    HvVmConfig vc = {.aux_offset = 16384, .ram_mb = 4096, .ncpus = 2, .log = 1, .no_net = 1, .no_sound = 1};
+    int vnc_port = 5900;
+    HvVmConfig vc = {.aux_offset = 16384, .ram_mb = 4096, .ncpus = 2, .log = 1, .no_net = 0, .no_sound = 1};
     for (int i = 1; i < argc; i++) {
         if (i + 1 >= argc) usage();
         const char *a = argv[i], *v = argv[++i];
@@ -37,6 +40,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--ram")) vc.ram_mb = strtoull(v, NULL, 0);
         else if (!strcmp(a, "--cpus")) vc.ncpus = atoi(v);
         else if (!strcmp(a, "--log")) vc.log = atoi(v);
+        else if (!strcmp(a, "--vnc")) vnc_port = atoi(v);
+        else if (!strcmp(a, "--net")) vc.no_net = !atoi(v);
         else if (!strcmp(a, "--jit-mb")) vc.jit_bytes = (size_t)atoi(v) << 20;
         else usage();
     }
@@ -48,15 +53,31 @@ int main(int argc, char **argv) {
         snprintf(ram, sizeof ram, "%s.ram", vc.disk);
         setenv("HV_RAM_FILE", ram, 0);
     }
+    /* DNS for the guest's NAT: Android has no /etc/resolv.conf, so fall back to public resolvers. */
+    if (!vc.no_net && !getenv("SLIRP_RESOLV_CONF") && access("/etc/resolv.conf", R_OK) != 0 &&
+        access("/data/data/com.termux/files/usr/etc/resolv.conf", R_OK) != 0) {
+        static char conf[1024];
+        snprintf(conf, sizeof conf, "%s.resolv.conf", vc.disk);
+        FILE *f = fopen(conf, "w");
+        if (f) {
+            fputs("nameserver 1.1.1.1\nnameserver 8.8.8.8\n", f);
+            fclose(f);
+            setenv("SLIRP_RESOLV_CONF", conf, 1);
+        }
+    }
     char err[256];
     if (hv_vm_create(&vc, err, sizeof err) != 0) {
         fprintf(stderr, "hengevm: %s\n", err);
         return 1;
     }
+    if (vnc_port) {
+        if (hv_vnc_start(vnc_port) == 0) fprintf(stderr, "hengevm: display on vnc://127.0.0.1:%d\n", vnc_port);
+        else fprintf(stderr, "hengevm: vnc port %d unavailable\n", vnc_port);
+    }
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
-    fprintf(stderr, "hengevm: %d CPUs, %llu MB, headless (no GPU, network or sound yet)\n", hv_vm_ncpus(),
-            (unsigned long long)vc.ram_mb);
+    fprintf(stderr, "hengevm: %d CPUs, %llu MB, network %s, no sound yet\n", hv_vm_ncpus(),
+            (unsigned long long)vc.ram_mb, vc.no_net ? "off" : "on (NAT)");
     int reason = hv_vm_run_cpu0();
     hv_vm_flush_disks();
     fprintf(stderr, "hengevm: stopped: %s\n", hv_vm_reason_name(reason));

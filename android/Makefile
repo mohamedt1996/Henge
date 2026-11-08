@@ -7,12 +7,15 @@ ifeq ($(CC),cc)
 CC = clang
 endif
 TARGET ?= --target=aarch64-linux-gnu
-CFLAGS = $(TARGET) -march=armv8.2-a+crypto -D_GNU_SOURCE -std=gnu11 -O2 -g -w -Iandroid/compat -Icore -Ihost -Idevices
+CFLAGS = $(TARGET) -march=armv8.2-a+crypto -D_GNU_SOURCE -std=gnu11 -O2 -g -w -Iandroid/compat -Iandroid -Icore -Ihost -Idevices
 ASFLAGS = $(TARGET) -march=armv8.6-a+crypto
 STATIC ?= -static
 LIBS = $(STATIC) -lpthread -lm
 B = build/android
 A = $(B)/asm
+DEPS ?= $(HOME)/deps/arm64
+SLIRP_CFLAGS = $(shell PKG_CONFIG_LIBDIR=$(DEPS)/lib/pkgconfig pkg-config --cflags slirp)
+SLIRP_LIBS = $(shell PKG_CONFIG_LIBDIR=$(DEPS)/lib/pkgconfig pkg-config --static --libs slirp)
 RUN ?= $(if $(filter aarch64 arm64,$(shell uname -m)),,qemu-aarch64 -cpu max)
 
 CORE = classify operands translate dispatch mmu memop exception sysreg machine
@@ -50,8 +53,12 @@ $(B)/vm.o: host/vm.c host/*.h android/compat/plat_linux.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(B)/host_stubs.o: android/host_stubs.c | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
-$(B)/hengevm-android: android/runner.c $(B)/vm.o $(B)/host_stubs.o $(B)/libhengevm.a
-	$(CC) $(CFLAGS) $^ $(LIBS) -o $@
+$(B)/net_slirp.o: host/net_slirp.c host/*.h | $(B)
+	$(CC) $(CFLAGS) $(SLIRP_CFLAGS) -c $< -o $@
+$(B)/vnc.o: android/vnc.c android/vnc.h host/vm.h | $(B)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(B)/hengevm-android: android/runner.c $(B)/vm.o $(B)/net_slirp.o $(B)/vnc.o $(B)/host_stubs.o $(B)/libhengevm.a
+	$(CC) $(CFLAGS) $^ $(SLIRP_LIBS) $(LIBS) -o $@
 
 $(B)/libhengevm.a: $(ENGINE) $(DEV)
 	rm -f $@

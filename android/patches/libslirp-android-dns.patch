@@ -1,0 +1,15 @@
+--- a/src/slirp.c
++++ b/src/slirp.c
+@@ -450,7 +450,11 @@
+     unsigned if_index;
+     unsigned nameservers = 0;
+ 
+-    f = fopen(RESOLV_CONF_PATH, "r");
++    /* Android has no /etc/resolv.conf: let the host name one, then try Termux's. */
++    const char *conf = getenv("SLIRP_RESOLV_CONF");
++    f = fopen(conf && *conf ? conf : RESOLV_CONF_PATH, "r");
++    if (!f)
++        f = fopen("/data/data/com.termux/files/usr/etc/resolv.conf", "r");
+     if (!f)
+         return -1;
+ 
