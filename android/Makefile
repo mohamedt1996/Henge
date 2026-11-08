@@ -22,7 +22,7 @@ DEV = $(DEVS:%=$(B)/%.o) $(B)/pvg_headless.o
 ASM = $(A)/harness.h $(A)/harness.S $(patsubst tests/%,$(A)/%,$(wildcard tests/*_programs.S tests/*_cases.s))
 TESTS = $(B)/test_classify $(B)/test_operands $(B)/test_jit_region $(B)/test_mmu $(B)/test_jit $(B)/test_mem $(B)/test_exc $(B)/test_devices
 
-all: $(B)/libhengevm.a $(TESTS)
+all: $(B)/libhengevm.a $(B)/hengevm-android $(TESTS)
 
 $(B) $(A):
 	mkdir -p $@
@@ -45,6 +45,13 @@ $(B)/%.o: devices/%.c devices/*.h android/compat/aes_soft.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(B)/pvg_headless.o: android/pvg_headless.c | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+$(B)/vm.o: host/vm.c host/*.h android/compat/plat_linux.h | $(B)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(B)/host_stubs.o: android/host_stubs.c | $(B)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(B)/hengevm-android: android/runner.c $(B)/vm.o $(B)/host_stubs.o $(B)/libhengevm.a
+	$(CC) $(CFLAGS) $^ $(LIBS) -o $@
 
 $(B)/libhengevm.a: $(ENGINE) $(DEV)
 	rm -f $@

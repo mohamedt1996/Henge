@@ -2,7 +2,22 @@
 #include "pvg_lite.h"
 
 #include <TargetConditionals.h>
+#ifdef __linux__
+#include "plat_linux.h"
+typedef const void *CFTypeRef;
+static inline CFTypeRef CFRetain(CFTypeRef p) { return p; }
+static inline void CFRelease(CFTypeRef p) { (void)p; }
+#define HV_UC_PC(uc) ((uc)->uc_mcontext.pc)
+#define HV_UC_LR(uc) ((uc)->uc_mcontext.regs[30])
+#define HV_UC_SP(uc) ((uc)->uc_mcontext.sp)
+#define HV_UC_X(uc, i) ((uc)->uc_mcontext.regs[i])
+#else
 #include <CoreFoundation/CoreFoundation.h>
+#define HV_UC_PC(uc) ((uc)->uc_mcontext->__ss.__pc)
+#define HV_UC_LR(uc) ((uc)->uc_mcontext->__ss.__lr)
+#define HV_UC_SP(uc) ((uc)->uc_mcontext->__ss.__sp)
+#define HV_UC_X(uc, i) ((uc)->uc_mcontext->__ss.__x[i])
+#endif
 #include <os/lock.h>
 #include <stdatomic.h>
 #include <pthread.h>
@@ -122,19 +137,19 @@ static int fail(char *err, size_t n, const char *msg) {
 static struct sigaction prior_ill, prior_bus, prior_segv;
 static void on_ill(int sig, siginfo_t *info, void *ctx) {
     ucontext_t *uc = ctx;
-    uint64_t pc = uc->uc_mcontext->__ss.__pc, rx = (uint64_t)(uintptr_t)m.jit.base, size = (uint64_t)m.jit.capacity * 4;
+    uint64_t pc = HV_UC_PC(uc), rx = (uint64_t)(uintptr_t)m.jit.base, size = (uint64_t)m.jit.capacity * 4;
     uint64_t used = (uint64_t)m.jit.used * 4;
     int in_rx = pc >= rx && pc < rx + size;
     int fetch = (uint64_t)(uintptr_t)info->si_addr == pc;
     if (sig == SIGILL || in_rx || fetch) {
         fprintf(stderr, "hengevm: signal %d in translated code: pc %llx (rx %llx size %llx used %llx, pc is rx%+lld), full flushes %llu, lr %llx, addr %p\n",
                 sig, (unsigned long long)pc, (unsigned long long)rx, (unsigned long long)size, (unsigned long long)used, (long long)(pc - rx),
-                (unsigned long long)m.stats.block_flushes, (unsigned long long)uc->uc_mcontext->__ss.__lr, info->si_addr);
-        for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%llx%c", i, (unsigned long long)uc->uc_mcontext->__ss.__x[i], i % 6 == 5 ? '\n' : ' ');
+                (unsigned long long)m.stats.block_flushes, (unsigned long long)HV_UC_LR(uc), info->si_addr);
+        for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%llx%c", i, (unsigned long long)HV_UC_X(uc, i), i % 6 == 5 ? '\n' : ' ');
         fprintf(stderr, "\n");
-        fprintf(stderr, "sp=%llx ram %llx size %llx\n", (unsigned long long)uc->uc_mcontext->__ss.__sp, (unsigned long long)(uintptr_t)board.ram, (unsigned long long)board.ram_size);
+        fprintf(stderr, "sp=%llx ram %llx size %llx\n", (unsigned long long)HV_UC_SP(uc), (unsigned long long)(uintptr_t)board.ram, (unsigned long long)board.ram_size);
         {
-            uint64_t x7 = uc->uc_mcontext->__ss.__x[7], x28 = uc->uc_mcontext->__ss.__x[28];
+            uint64_t x7 = HV_UC_X(uc, 7), x28 = HV_UC_X(uc, 28);
             if (x7 >= x28 && x7 < x28 + sizeof(HvCpu)) {
                 const uint64_t *ent = (const uint64_t *)(uintptr_t)(x7 + 0x500);
                 fprintf(stderr, "tlb entry at +%llx:", (unsigned long long)(x7 - x28));
@@ -154,7 +169,7 @@ static void on_ill(int sig, siginfo_t *info, void *ctx) {
             fprintf(stderr, "\n");
         }
         { /* x15 after a chained exit's check: the literal it loaded. Which exits, and where do they go now? */
-            uint64_t x15 = uc->uc_mcontext->__ss.__x[15];
+            uint64_t x15 = HV_UC_X(uc, 15);
             const uint32_t *w15 = (const uint32_t *)(uintptr_t)rx;
             uint64_t n15 = used / 4 < m.jit.capacity ? used / 4 : m.jit.capacity;
             int shown = 0;

@@ -14,9 +14,10 @@ static inline int pthread_cond_timedwait_relative_np(pthread_cond_t *cv, pthread
     return pthread_cond_timedwait(cv, mu, &abs);
 }
 
-#define QOS_CLASS_UTILITY 0
-#define QOS_CLASS_USER_INTERACTIVE 0
-#define QOS_CLASS_USER_INITIATED 0
+typedef int qos_class_t;
+#define QOS_CLASS_UTILITY 0x11
+#define QOS_CLASS_USER_INTERACTIVE 0x21
+#define QOS_CLASS_USER_INITIATED 0x19
 static inline int pthread_set_qos_class_self_np(int c, int p) { (void)c; (void)p; return 0; }
 static inline const char *mach_error_string(int kr) { return strerror(kr); }
 
@@ -35,3 +36,4 @@ static inline int __ulock_wake(uint32_t op, void *addr, uint64_t wake_value) {
     (void)wake_value;
     return (int)syscall(SYS_futex, addr, FUTEX_WAKE_PRIVATE, (op & HV_ULF_WAKE_ALL_) ? 0x7fffffff : 1, NULL, NULL, 0);
 }
+#define QOS_CLASS_DEFAULT 0x15
