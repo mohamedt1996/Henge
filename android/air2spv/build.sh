@@ -56,6 +56,11 @@ deps() {
   # Only NIR, the util libraries and the freedreno register headers are needed. computerator is
   # skipped: it needs ir3's assembler parser, which nothing here builds.
   sed -i 's/^if system_has_kms_drm$/if system_has_kms_drm and false/' "$M/src/freedreno/meson.build"
+  # With no driver configured Mesa builds NIR as a stub; build all of it (air2ir3's Mesa patch 0000 does
+  # the same).
+  grep -q '^with_nir_headers_only = false' "$M/src/compiler/nir/meson.build" ||
+    sed -i '/^  \].contains(true))$/a with_nir_headers_only = false' "$M/src/compiler/nir/meson.build"
+  grep -q '^with_nir_headers_only = false' "$M/src/compiler/nir/meson.build" || { echo "could not enable NIR in $M"; exit 1; }
   local opts=(-Dbuildtype=release -Dplatforms= -Dgallium-drivers= -Dvulkan-drivers= -Dopengl=true
     -Dgles1=disabled -Dgles2=disabled -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dllvm=disabled
     -Dtools=freedreno -Dfreedreno-kmds=msm -Dvideo-codecs= --wrap-mode=nodownload)
