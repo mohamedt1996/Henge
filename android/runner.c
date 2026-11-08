@@ -12,10 +12,38 @@
 
 static void usage(void) {
     fprintf(stderr,
-            "usage: hengevm-android --rom AVPBooter.vmapple2.bin --disk Disk.img --aux AuxiliaryStorage\n"
+            "usage: hengevm-android --mac FOLDER (exported from Henge on iOS) [options]\n"
+            "   or: hengevm-android --rom AVPBooter.vmapple2.bin --disk Disk.img --aux AuxiliaryStorage\n"
             "                       --ecid N --seed N [--ram MB (4096)] [--cpus N (2)] [--log 0-3] [--jit-mb MB] [--net 0|1]\n"
             "                       [--vnc PORT (5900, 0 = off)]\n");
     exit(2);
+}
+
+/* A Mac exported from Henge on iOS: AVPBooter.vmapple2.bin, auxiliary.bin, disk.img, machine.json. */
+static uint64_t json_u64(const char *js, const char *key) {
+    char pat[64];
+    snprintf(pat, sizeof pat, "\"%s\"", key);
+    const char *k = strstr(js, pat);
+    if (!k || !(k = strchr(k + strlen(pat), ':'))) return 0;
+    return strtoull(k + 1, NULL, 10);
+}
+
+static void load_mac(HvVmConfig *vc, const char *dir) {
+    static char rom[1024], aux[1024], disk[1024], info[1024], js[4096];
+    snprintf(rom, sizeof rom, "%s/AVPBooter.vmapple2.bin", dir);
+    snprintf(aux, sizeof aux, "%s/auxiliary.bin", dir);
+    snprintf(disk, sizeof disk, "%s/disk.img", dir);
+    snprintf(info, sizeof info, "%s/machine.json", dir);
+    vc->rom = rom, vc->aux = aux, vc->disk = disk;
+    FILE *f = fopen(info, "r");
+    if (!f) { fprintf(stderr, "hengevm: no %s\n", info); exit(1); }
+    size_t n = fread(js, 1, sizeof js - 1, f);
+    fclose(f);
+    js[n] = 0;
+    vc->ecid = json_u64(js, "ecid"), vc->seed = json_u64(js, "seed");
+    uint64_t ram = json_u64(js, "ramMB");
+    if (ram) vc->ram_mb = ram;
+    fprintf(stderr, "hengevm: %s: ECID %llu, %llu MB\n", dir, (unsigned long long)vc->ecid, (unsigned long long)vc->ram_mb);
 }
 
 static volatile sig_atomic_t stopping;
@@ -31,7 +59,8 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (i + 1 >= argc) usage();
         const char *a = argv[i], *v = argv[++i];
-        if (!strcmp(a, "--rom")) vc.rom = v;
+        if (!strcmp(a, "--mac")) load_mac(&vc, v);
+        else if (!strcmp(a, "--rom")) vc.rom = v;
         else if (!strcmp(a, "--disk")) vc.disk = v;
         else if (!strcmp(a, "--aux")) vc.aux = v;
         else if (!strcmp(a, "--aux-offset")) vc.aux_offset = strtoull(v, NULL, 0);
