@@ -2,9 +2,13 @@
 #include "pvg_lite.h"
 
 #include <errno.h>
+#ifdef __linux__
+#include "plat_linux.h"
+#else
 #include <mach/mach.h>
 #include <mach/mach_error.h>
 #include <mach/vm_map.h>
+#endif
 #include <pthread.h>
 #include <pthread/qos.h>
 #include <fcntl.h>
@@ -167,6 +171,9 @@ static void gic_msi_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
    pages out of this process's footprint. It allows that once a debugger has
    been attached, which is how an iOS app gets to use JIT at all. Returns NULL
    if it is refused. In pieces, as one memory entry has a size limit. */
+#ifdef __linux__
+static uint8_t *alloc_no_footprint(uint64_t size) { (void)size; return NULL; } /* no ledger on Linux: anonymous or file RAM below */
+#else
 extern kern_return_t mach_memory_entry_ownership(mach_port_t entry, task_t owner, int ledger_tag, int ledger_flags);
 
 static uint8_t *alloc_no_footprint(uint64_t size) {
@@ -193,6 +200,8 @@ static uint8_t *alloc_no_footprint(uint64_t size) {
     fprintf(stderr, "hengevm: guest RAM (%llu MB) is outside the footprint\n", (unsigned long long)(size >> 20));
     return (uint8_t *)base;
 }
+
+#endif
 
 /* A mapped file's page is slow to touch the first time and as fast as any other
    afterwards, so a background thread gets there before the guest does. Adding

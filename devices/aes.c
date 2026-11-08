@@ -1,6 +1,10 @@
 #include "aes.h"
 
+#ifdef __linux__
+#include "aes_soft.h"
+#else
 #include <CommonCrypto/CommonCryptor.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

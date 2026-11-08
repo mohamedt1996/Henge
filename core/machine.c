@@ -149,8 +149,12 @@ uint64_t hv_cpu_post(HvCpu *target, uint32_t flags) {
 /* HV_SYNC_WAIT: a CPU waiting for another's acknowledgement sleeps (after a short spin) instead of
    spinning and yielding, so a host core is free for the CPU it waits on: the phone has two fast cores
    for three guest CPUs, the display and the app. The kernel's compare-and-wait on a 32-bit word. */
+#ifdef __linux__
+#include "plat_linux.h"
+#else
 extern int __ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout_us);
 extern int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+#endif
 #define HV_UL_COMPARE_AND_WAIT 1u
 #define HV_ULF_WAKE_ALL 0x100u
 #define HV_ULF_NO_ERRNO 0x1000000u

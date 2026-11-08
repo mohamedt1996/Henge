@@ -57,7 +57,11 @@ int hv_disk_flush(HvDisk *d) {
     if (d->readonly) return 0;
     switch (hv_knob[HV_K_FLUSH]) {
     case 1: return 0;
+    #ifdef __linux__
+    case 2: return fdatasync(d->fd);
+#else
     case 2: return fcntl(d->fd, F_BARRIERFSYNC) == -1 ? -1 : 0;
+#endif
     default: return fsync(d->fd);
     }
 }

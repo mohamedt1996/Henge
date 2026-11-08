@@ -2,7 +2,12 @@
 
 #include <TargetConditionals.h>
 #include <libkern/OSCacheControl.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <unistd.h>
+#else
 #include <mach/mach.h>
+#endif
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +16,30 @@
 /* The split shape on a host that can make it itself: plain RW memory, an
    alias, and the original turned R-X. Works for macOS binaries without the
    hardened runtime; on iOS the executable half has to come from a debugger. */
+#ifdef __linux__
+/* Android/Linux: one memfd mapped twice, RW for the translator and R-X to run.
+   Android forbids anonymous W+X pages for apps (execmem), but this shape is allowed. */
+static int open_split(HvJitRegion *region, size_t bytes) {
+    size_t want = bytes, pg = (size_t)sysconf(_SC_PAGESIZE);
+    bytes = (bytes + pg - 1) & ~(pg - 1);
+    if (bytes < 4096) bytes = 4096;
+    int fd = (int)syscall(SYS_memfd_create, "henge-jit", 0u);
+    if (fd < 0) return -1;
+    if (ftruncate(fd, (off_t)bytes) != 0) { close(fd); return -1; }
+    void *rw = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    void *rx = mmap(NULL, bytes, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0);
+    close(fd);
+    if (rw == MAP_FAILED || rx == MAP_FAILED) {
+        if (rw != MAP_FAILED) munmap(rw, bytes);
+        if (rx != MAP_FAILED) munmap(rx, bytes);
+        return -1;
+    }
+    if (hv_jit_region_attach(region, rx, rw, bytes) != 0) return -1;
+    region->capacity = want / sizeof(uint32_t); /* tests ask for regions smaller than a page */
+    region->owned = 1;
+    return 0;
+}
+#else
 static int open_split(HvJitRegion *region, size_t bytes) {
     void *rx = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (rx == MAP_FAILED) return -1;
@@ -26,6 +55,8 @@ static int open_split(HvJitRegion *region, size_t bytes) {
     region->owned = 1;
     return 0;
 }
+
+#endif
 
 int hv_jit_region_open(HvJitRegion *region, size_t bytes) {
     memset(region, 0, sizeof *region);

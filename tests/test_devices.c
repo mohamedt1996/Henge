@@ -12,7 +12,11 @@ DECLARE_PROGRAM(p_timer_irq);
 DECLARE_PROGRAM(p_uart);
 extern const char devices_programs_begin[], devices_programs_finish[];
 
+#ifdef __linux__
+#define WORK "/tmp/hengevm-test"
+#else
 #define WORK "/Volumes/macOS Storage/husk-work/hengevm"
+#endif
 #define RAM_SIZE (64ull << 20)
 
 static HvMachine m;

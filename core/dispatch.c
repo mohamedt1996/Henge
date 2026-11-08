@@ -1,6 +1,9 @@
 #include "dispatch.h"
 
 #include <mach/mach.h>
+#ifdef __linux__
+#include "plat_linux.h"
+#endif
 #include <mach/mach_time.h>
 #include <sched.h>
 #include <stdio.h>

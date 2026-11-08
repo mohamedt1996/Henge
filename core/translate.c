@@ -1386,7 +1386,11 @@ static int translate_msr_inline(Emit *e, uint32_t insn, uint64_t pc) {
 #define COMMPAGE_TIMEBASE_TYPE   0xfffffc090ull
 static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical) {
     static int type = -1;
+#ifdef __linux__
+    type = 0; /* no Darwin commpage; the host counter's rate also differs: helper reads the 24 MHz clock */
+#else
     if (type < 0) type = *(volatile uint8_t *)(uintptr_t)COMMPAGE_TIMEBASE_TYPE;
+#endif
     if (type == 0) return 0; /* the kernel's own path: leave it to the helper */
     int rt = insn & 0x1f;
     if (rt == 31) return 1;
