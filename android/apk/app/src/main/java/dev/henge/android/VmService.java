@@ -51,11 +51,12 @@ public class VmService extends Service {
         PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
         wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "henge:vm");
         wake.acquire();
-        new Thread(() -> run(mode, ram, cpus, release == null ? "15.6.1" : release), "engine").start();
+        boolean deleteImage = intent.getBooleanExtra("deleteImage", true);
+        new Thread(() -> run(mode, ram, cpus, release == null ? "15.6.1" : release, deleteImage), "engine").start();
         return START_NOT_STICKY;
     }
 
-    private void run(String mode, int ram, int cpus, String release) {
+    private void run(String mode, int ram, int cpus, String release, boolean deleteImage) {
         boolean install = "install".equals(mode);
         state = install ? "installing" : "running";
         File files = getFilesDir(), mac = macDir(this), log = logFile(this), pidFile = new File(files, "engine.pid");
@@ -83,6 +84,8 @@ public class VmService extends Service {
             pb.environment().put("HOME", files.getPath());
             pb.environment().put("TMPDIR", getCacheDir().getPath());
             pb.environment().put("HENGE_PID", pidFile.getPath());
+            // Android's seccomp filter kills glibc's per-thread rseq registration on many devices.
+            pb.environment().put("GLIBC_TUNABLES", "glibc.pthread.rseq=0");
             pb.redirectErrorStream(true);
             pb.redirectOutput(ProcessBuilder.Redirect.appendTo(log));
             try (FileOutputStream o = new FileOutputStream(log, true)) {
@@ -95,10 +98,12 @@ public class VmService extends Service {
         }
         if (install && code == 0) {
             try { new File(files, "installed").createNewFile(); } catch (Exception ignored) { }
-            // The restore image is 17 GB; the Mac no longer needs it.
-            File[] images = mac.listFiles((d, n) -> n.endsWith(".ipsw"));
+            // The restore image is 17 GB; the Mac no longer needs it unless the user keeps it.
+            File[] images = deleteImage ? mac.listFiles((d, n) -> n.endsWith(".ipsw")) : null;
             if (images != null) for (File f : images) f.delete();
         }
+        if (code > 128) appendLog(log, "henge app: the engine was killed by " + signalName(code - 128)
+                + (code - 128 == 31 ? " (a syscall Android's seccomp filter does not allow)" : ""));
         state = install ? (code == 0 ? "installed" : "install failed (" + code + ")")
                         : (code == 0 ? "stopped" : "stopped (" + code + ")");
         process = null;
@@ -115,6 +120,14 @@ public class VmService extends Service {
         } catch (Exception e) {
             Process p = process;
             if (p != null) p.destroy();
+        }
+    }
+
+    static String signalName(int sig) {
+        switch (sig) {
+            case 4: return "SIGILL"; case 6: return "SIGABRT"; case 7: return "SIGBUS"; case 9: return "SIGKILL";
+            case 11: return "SIGSEGV"; case 15: return "SIGTERM"; case 31: return "SIGSYS";
+            default: return "signal " + sig;
         }
     }
 
