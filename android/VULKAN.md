@@ -27,7 +27,10 @@ serialized format. There is no AIR → SPIR-V translator. Two ways in, in order:
    (`tools/metallib_inventory.py`), and write each as GLSL → SPIR-V by hand, keyed by function name
    and bitcode hash. Anything not in the table is skipped (a missing effect, as pvg_metal.m already
    does for pipelines Metal refuses).
-2. **A general translator**, AIR bitcode → SPIR-V via LLVM, for apps' own shaders. Research-sized.
+2. **A general translator**, AIR bitcode → SPIR-V: [air2spv](air2spv/ABI.md). It reuses the AIR → NIR
+   front end of Snapintosh's air2ir3 (the compiler of its Adreno Metal driver) and Mesa's NIR → SPIR-V
+   back end, so captured WindowServer shaders and apps' own both go through one compiler. The
+   substitution table stays the fallback for anything it refuses.
 
 ## Status
 
@@ -40,4 +43,7 @@ serialized format. There is no AIR → SPIR-V translator. Two ways in, in order:
 - [ ] Vulkan device, swapchain on ScreenActivity's Surface, buffers/textures over guest memory.
 - [ ] Pipeline deserializer (Metal's private format) for the fields Vulkan needs: functions, vertex
       layout, blend, formats.
-- [ ] Hand-written SPIR-V for the top captured desktop shaders.
+- [x] `android/air2spv`: AIR → SPIR-V compiler, with a Vulkan resource layout (ABI.md) and a sidecar per
+      function (descriptors, push slots, varyings). Builds on Linux; its tests pass `spirv-val`.
+- [ ] Run `air2spv/translate_capture.sh` on a real `--gpu capture` and fix what it refuses.
+- [ ] Hand-written SPIR-V only for desktop shaders air2spv refuses.

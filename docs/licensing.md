@@ -19,6 +19,9 @@ the App Store.
 | StikJIT (the Bitrise build applies `ci/stikjit-high-address.patch`) | MPL-2.0 | `ios/Henge/Resources/legal/` |
 | idevice | MIT | `ios/Henge/Resources/legal/` |
 | Pairing library's Rust crates | Listed per crate | `ios/Henge/Resources/legal/LICENSES-rppairing-crates.txt` |
+| air2ir3 front end (Snapintosh) | MIT | `third_party/air2ir3` |
+| Mesa's `nir_to_spirv` and NIR (built into `air2spv`, not in this repository) | MIT | fetched by `android/air2spv/build.sh` |
+| LLVM (linked into `air2spv`, not in this repository) | Apache-2.0 WITH LLVM-exception | fetched by `android/air2spv/build.sh` |
 | libslirp, pcre2 | BSD | Prebuilt from Husk |
 | glib, libintl | LGPL-2.1-or-later | Prebuilt from Husk |
 
