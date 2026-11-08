@@ -19,9 +19,9 @@ SLIRP_LIBS = $(shell PKG_CONFIG_LIBDIR=$(DEPS)/lib/pkgconfig pkg-config --static
 RUN ?= $(if $(filter aarch64 arm64,$(shell uname -m)),,qemu-aarch64 -cpu max)
 
 CORE = classify operands translate dispatch mmu memop exception sysreg machine
-DEVS = $(filter-out pvg_lite,$(basename $(notdir $(wildcard devices/*.c))))
+DEVS = $(basename $(notdir $(wildcard devices/*.c)))
 ENGINE = $(CORE:%=$(B)/%.o) $(B)/jit_region.o $(B)/disk.o $(B)/enter.o
-DEV = $(DEVS:%=$(B)/%.o) $(B)/pvg_headless.o
+DEV = $(DEVS:%=$(B)/%.o) $(B)/pvg_nometal.o
 ASM = $(A)/harness.h $(A)/harness.S $(patsubst tests/%,$(A)/%,$(wildcard tests/*_programs.S tests/*_cases.s))
 TESTS = $(B)/test_classify $(B)/test_operands $(B)/test_jit_region $(B)/test_mmu $(B)/test_jit $(B)/test_mem $(B)/test_exc $(B)/test_devices
 
@@ -46,7 +46,7 @@ $(B)/%.o: host/%.c host/*.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(B)/%.o: devices/%.c devices/*.h android/compat/aes_soft.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
-$(B)/pvg_headless.o: android/pvg_headless.c | $(B)
+$(B)/pvg_nometal.o: android/pvg_nometal.c | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(B)/vm.o: host/vm.c host/*.h android/compat/plat_linux.h | $(B)

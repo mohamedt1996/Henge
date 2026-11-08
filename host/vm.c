@@ -4,9 +4,7 @@
 #include <TargetConditionals.h>
 #ifdef __linux__
 #include "plat_linux.h"
-typedef const void *CFTypeRef;
-static inline CFTypeRef CFRetain(CFTypeRef p) { return p; }
-static inline void CFRelease(CFTypeRef p) { (void)p; }
+#include <CoreFoundation/CoreFoundation.h>
 #define HV_UC_PC(uc) ((uc)->uc_mcontext.pc)
 #define HV_UC_LR(uc) ((uc)->uc_mcontext.regs[30])
 #define HV_UC_SP(uc) ((uc)->uc_mcontext.sp)
