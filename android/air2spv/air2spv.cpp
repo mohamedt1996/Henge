@@ -211,8 +211,8 @@ static bool scalarizeGlobalStores(nir_shader *s) {
     unsigned wm = nir_intrinsic_write_mask(in), es = v->bit_size / 8;
     for (unsigned c = 0; c < v->num_components; c++)
       if (wm & (1u << c))
-        nir_build_store_global(b, nir_channel(b, v, c), nir_iadd_imm(b, a, c * es), .align_mul = es,
-                               .access = nir_intrinsic_access(in));
+        nir_build_store_global(b, nir_channel(b, v, c), nir_iadd_imm(b, a, c * es), .access = nir_intrinsic_access(in),
+                               .align_mul = es);
     nir_instr_remove(&in->instr);
     return true;
   }, nir_metadata_control_flow, nullptr);

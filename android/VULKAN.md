@@ -39,8 +39,11 @@ serialized format. There is no AIR → SPIR-V translator. Two ways in, in order:
       (`Android/data/dev.henge.android/files/shaders`, reachable over USB).
 - [x] `tools/metallib_inventory.py SHADER_DIR [--extract OUT]`: functions, kinds, bind counts, and
       each function's bitcode as `.bc` for `llvm-dis`.
-- [ ] Shared-memory ring from engine to app; record decoder ported from pvg_metal.m to C.
-- [ ] Vulkan device, swapchain on ScreenActivity's Surface, buffers/textures over guest memory.
+- [x] Shared-memory ring from engine to app (`gpu/link.h`, `--gpu vulkan`); record decoder in C
+      (`gpu/replay`): passes, blits, object queries, swaps, the pointer. See [gpu/README.md](gpu/README.md).
+- [x] Vulkan device, swapchain on ScreenActivity's Surface (GpuView), buffers/textures/surfaces over guest memory.
+- [x] air2spv on the tablet (static arm64, `libair2spv.so`): shaders translated as macOS loads them.
+- [ ] Draws: Vulkan pipelines and the passes that draw moved onto the GPU.
 - [ ] Pipeline deserializer (Metal's private format) for the fields Vulkan needs: functions, vertex
       layout, blend, formats.
 - [x] `android/air2spv`: AIR → SPIR-V compiler, with a Vulkan resource layout (ABI.md) and a sidecar per

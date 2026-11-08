@@ -31,13 +31,21 @@ import java.net.Socket;
 public class ScreenActivity extends Activity {
     private RfbView view;
     private EditText keys;
+    private GpuView gpu; /* Graphics: Vulkan: the app draws the screen; VNC only carries input */
 
     @Override
     protected void onCreate(Bundle saved) {
         super.onCreate(saved);
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
+        boolean vulkan = "vulkan".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("gpu", "on")) && GpuView.loaded;
+        if (vulkan) {
+            gpu = new GpuView(this);
+            root.addView(gpu);
+            gpu.start();
+        }
         view = new RfbView(this);
+        view.overlay = vulkan;
         root.addView(view);
 
         // A hidden field takes the soft keyboard's text; its characters go to the Mac as keys.
@@ -101,6 +109,7 @@ public class ScreenActivity extends Activity {
 
     @Override protected void onResume() { super.onResume(); view.connect(); }
     @Override protected void onPause() { super.onPause(); view.disconnect(); }
+    @Override protected void onDestroy() { if (gpu != null) gpu.stop(); super.onDestroy(); }
 
     /** Hardware keyboards: keys go straight through as keysyms; the soft keyboard goes through the text field. */
     @Override public boolean dispatchKeyEvent(KeyEvent e) {
@@ -128,6 +137,8 @@ public class ScreenActivity extends Activity {
         private long downAt;
         private boolean dragging, moved, scrolling;
         private int buttons;
+        /* Over a GpuView: the frame is the GPU's; this view only places the pointer and says why there is none. */
+        boolean overlay;
 
         RfbView(Context c) {
             super(c);
@@ -239,15 +250,17 @@ public class ScreenActivity extends Activity {
         private final Rect dst = new Rect();
 
         @Override protected void onDraw(Canvas c) {
-            c.drawColor(Color.BLACK);
+            if (!overlay) c.drawColor(Color.BLACK);
             Bitmap f;
             synchronized (this) { f = frame; }
             if (f != null && message == null) {
                 float s = Math.min(getWidth() / (float) f.getWidth(), getHeight() / (float) f.getHeight());
                 int w = Math.round(f.getWidth() * s), h = Math.round(f.getHeight() * s);
                 int x = (getWidth() - w) / 2, y = (getHeight() - h) / 2;
-                dst.set(x, y, x + w, y + h);
-                synchronized (this) { c.drawBitmap(f, null, dst, paint); }
+                dst.set(x, y, x + w, y + h); /* the GPU's frame is letterboxed the same way (screen_vk.c) */
+                if (!overlay) synchronized (this) { c.drawBitmap(f, null, dst, paint); }
+            } else if (overlay && message == null) {
+                // nothing yet: the GPU view shows what there is
             } else {
                 Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
                 p.setColor(Color.LTGRAY);

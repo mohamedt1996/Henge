@@ -45,6 +45,14 @@ uint8_t *hv_pvg_lite_display_page(HvPvgLite *p);
 void hv_pvg_lite_command(HvPvgLite *p, const uint32_t *command, uint32_t length);
 void hv_pvg_lite_complete(HvPvgLite *p, uint32_t channel, uint32_t stamp);
 
+/* For a renderer in another process (android/gpu/link.h): a task's root page (16 KB page number, 0 if
+   none), the surface mapper's table (guest physical, 0 before the guest set it), and guest RAM. */
+uint32_t hv_pvg_lite_task_root(HvPvgLite *p, uint32_t task);
+uint64_t hv_pvg_lite_surface_table(HvPvgLite *p);
+uint64_t hv_pvg_lite_display_pa(HvPvgLite *p);
+int hv_pvg_lite_ram(HvPvgLite *p, uint64_t *pa, uint64_t *size);
+void hv_pvg_lite_mode(uint32_t *width, uint32_t *height);
+
 /* The size macOS is told its screen is. Set before the machine starts; default 1920 x 1080. */
 void hv_pvg_lite_set_mode(uint32_t width, uint32_t height);
 void hv_pvg_lite_set_size_mm(uint32_t width_mm, uint32_t height_mm);

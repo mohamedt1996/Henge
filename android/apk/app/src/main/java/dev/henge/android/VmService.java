@@ -111,6 +111,9 @@ public class VmService extends Service {
             File[] images = deleteImage ? mac.listFiles((d, n) -> n.endsWith(".ipsw")) : null;
             if (images != null) for (File f : images) f.delete();
         }
+        // Graphics: Vulkan keeps guest RAM as a named file for the renderer, which removes the name once it
+        // has it mapped; if it never attached, the file (as big as the Mac's memory) goes now.
+        new File(mac, "disk.img.ram").delete();
         if (code > 128) appendLog(log, "henge app: the engine was killed by " + signalName(code - 128)
                 + (code - 128 == 31 ? " (a syscall Android's seccomp filter does not allow)" : ""));
         state = install ? (code == 0 ? "installed" : "install failed (" + code + ")")

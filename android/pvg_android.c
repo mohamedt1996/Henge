@@ -9,8 +9,13 @@
    translation table is built from (android/tools/metallib_inventory.py). Commands still complete, so
    macOS runs as without a GPU backend. Without the variable this is the no-renderer stub it was. */
 #include "pvg_lite.h"
+#include "gpu/link.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -35,6 +40,10 @@ struct HvPvgMetal {
     struct { uint64_t hash; uint64_t binds; } pipes[2048];
     unsigned npipes;
     uint64_t execs, libs, pipelines;
+    /* HV_GPU_LINK: commands go to the app's Vulkan renderer (android/gpu/link.h) instead. */
+    HvLinkHeader *link;
+    uint64_t seq;
+    int linked; /* the app was attached at the last check */
 };
 
 static uint64_t fnv(const void *d, size_t n) {
@@ -194,6 +203,121 @@ static void exec(HvPvgMetal *m, const uint32_t *args, uint32_t n) {
     }
 }
 
+/* ---------------------------------------------------------------- the link to the app -- */
+
+static uint64_t now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
+static void pause_us(long us) {
+    struct timespec t = {0, us * 1000};
+    nanosleep(&t, NULL);
+}
+
+/* The app has looked at the link recently. CLOCK_MONOTONIC is the same clock in both processes. */
+static int app_attached(HvPvgMetal *m) {
+    uint64_t beat = __atomic_load_n(&m->link->heartbeat, __ATOMIC_ACQUIRE);
+    int on = beat && now_ns() - beat < HV_LINK_STALE_NS;
+    if (on != m->linked) {
+        m->linked = on;
+        fprintf(stderr, "hengevm: gpu link: renderer %s\n", on ? "attached" : "gone; completing commands without it");
+    }
+    return on;
+}
+
+static void link_publish(HvPvgMetal *m) {
+    HvLinkHeader *h = m->link;
+    for (uint32_t t = 0; t < HV_LINK_TASKS; t++) {
+        h->task_root[t] = hv_pvg_lite_task_root(m->lite, t);
+        h->task_objects[t] = hv_pvg_lite_task_objects(m->lite, t);
+    }
+    h->surface_table = hv_pvg_lite_surface_table(m->lite);
+    h->display_page = hv_pvg_lite_display_pa(m->lite);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+}
+
+/* Puts the command in the ring; returns its seq, or 0 if the app went away while waiting for room. */
+static uint64_t link_send(HvPvgMetal *m, uint32_t ch, const uint32_t *cmd, uint32_t len) {
+    HvLinkHeader *h = m->link;
+    uint32_t bytes = (uint32_t)((sizeof(HvLinkRecord) + len + 7) & ~7u);
+    if (bytes > HV_LINK_RING_BYTES / 2) return 0;
+    uint64_t head = h->head;
+    for (;;) {
+        uint64_t tail = __atomic_load_n(&h->tail, __ATOMIC_ACQUIRE);
+        uint32_t at = (uint32_t)(head % HV_LINK_RING_BYTES), room = HV_LINK_RING_BYTES - at;
+        uint64_t need = bytes + (room < bytes ? room : 0); /* a wrap wastes the rest of the ring */
+        if (HV_LINK_RING_BYTES - (head - tail) >= need) break;
+        if (!app_attached(m)) return 0;
+        pause_us(100);
+    }
+    uint8_t *ring = hv_link_ring(h);
+    uint32_t at = (uint32_t)(head % HV_LINK_RING_BYTES), room = HV_LINK_RING_BYTES - at;
+    if (room < bytes) {
+        if (room >= sizeof(HvLinkRecord)) *(HvLinkRecord *)(ring + at) = (HvLinkRecord){room, HV_REC_WRAP, 0, 0, 0};
+        head += room, at = 0;
+    }
+    HvLinkRecord *r = (HvLinkRecord *)(ring + at);
+    *r = (HvLinkRecord){bytes, HV_REC_COMMAND, ch, len, ++m->seq};
+    memcpy(r + 1, cmd, len);
+    __atomic_store_n(&h->head, head + bytes, __ATOMIC_RELEASE);
+    return m->seq;
+}
+
+static void link_wait(HvPvgMetal *m, uint64_t seq) {
+    for (unsigned spins = 0; __atomic_load_n(&m->link->done, __ATOMIC_ACQUIRE) < seq; spins++) {
+        if ((spins & 63) == 0 && !app_attached(m)) return;
+        pause_us(spins < 200 ? 20 : 200);
+    }
+}
+
+static void *link_work(void *arg) {
+    HvPvgMetal *m = arg;
+    for (;;) {
+        pthread_mutex_lock(&m->lock);
+        while (!m->head) pthread_cond_wait(&m->wake, &m->lock);
+        Job *j = m->head;
+        m->head = j->next;
+        if (!m->head) m->tail = NULL;
+        pthread_mutex_unlock(&m->lock);
+        uint32_t op = j->cmd[0] & 0xffff;
+        /* The display's own state (mode page, acks, swap counters) stays the engine's. */
+        if (op != 0x43 && op != 0x45) hv_pvg_lite_command(m->lite, j->cmd, j->len);
+        if (app_attached(m)) {
+            link_publish(m);
+            uint64_t seq = link_send(m, j->ch, j->cmd, j->len);
+            if (seq) link_wait(m, seq);
+        }
+        hv_pvg_lite_complete(m->lite, j->ch, j->cmd[2]);
+        free(j->cmd);
+        free(j);
+    }
+    return NULL;
+}
+
+static HvLinkHeader *link_open(HvPvgLite *lite, const char *path) {
+    int fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (fd < 0 || ftruncate(fd, HV_LINK_FILE_BYTES) != 0) {
+        fprintf(stderr, "hengevm: gpu link %s: %s\n", path, strerror(errno));
+        if (fd >= 0) close(fd);
+        return NULL;
+    }
+    HvLinkHeader *h = mmap(NULL, HV_LINK_FILE_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (h == MAP_FAILED) return NULL;
+    memset(h, 0, sizeof *h);
+    h->version = HV_LINK_VERSION;
+    h->header_bytes = HV_LINK_HEADER_BYTES, h->ring_bytes = HV_LINK_RING_BYTES;
+    if (hv_pvg_lite_ram(lite, &h->ram_pa, &h->ram_size) != 0) fprintf(stderr, "hengevm: gpu link: no guest RAM region\n");
+    const char *ram = getenv("HV_RAM_FILE");
+    snprintf(h->ram_file, sizeof h->ram_file, "%s", ram ? ram : "");
+    hv_pvg_lite_mode(&h->display_w, &h->display_h);
+    h->engine_alive = 1;
+    __atomic_store_n(&h->magic, HV_LINK_MAGIC, __ATOMIC_RELEASE); /* last: the app checks it first */
+    return h;
+}
+
 static void *work(void *arg) {
     HvPvgMetal *m = arg;
     for (;;) {
@@ -216,6 +340,19 @@ static void *work(void *arg) {
 }
 
 HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+    const char *linkpath = getenv("HV_GPU_LINK");
+    if (linkpath && *linkpath) {
+        HvPvgMetal *m = calloc(1, sizeof *m);
+        if (!m) return NULL;
+        m->lite = lite;
+        m->link = link_open(lite, linkpath);
+        if (!m->link) { free(m); return NULL; }
+        pthread_mutex_init(&m->lock, NULL);
+        pthread_cond_init(&m->wake, NULL);
+        if (pthread_create(&m->worker, NULL, link_work, m) != 0) { free(m); return NULL; }
+        fprintf(stderr, "hengevm: gpu link %s: waiting for the app's renderer\n", linkpath);
+        return m;
+    }
     const char *dir = getenv("HV_SHADER_CAPTURE");
     if (!dir || !*dir) return NULL;
     HvPvgMetal *m = calloc(1, sizeof *m);

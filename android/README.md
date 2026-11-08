@@ -3,6 +3,9 @@
 The engine (arm64 JIT, MMU, vmapple devices) builds for Linux/Android arm64 and passes its tests.
 - **Network:** libslirp NAT, like the iOS app (`android/build_deps.sh` builds the static deps). DNS comes from
   `/etc/resolv.conf`, Termux's resolv.conf, `SLIRP_RESOLV_CONF`, or falls back to 1.1.1.1/8.8.8.8.
+- **Graphics: Vulkan** (`--gpu vulkan`, the app's Graphics setting): the app's own renderer shows the screen and
+  translates macOS's shaders on the device ([gpu/README.md](gpu/README.md)). It does clears, copies and the
+  pointer so far, not draws.
 - **Display:** a built-in VNC server (`--vnc 5900`, localhost; set `HV_VNC_ANY=1` to listen on all interfaces)
   shows the boot framebuffer and forwards pointer and keys. The macOS desktop itself is drawn by Apple-GPU
   shader binaries that only Apple's Metal stack can load, so it does not render here.

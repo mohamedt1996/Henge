@@ -22,6 +22,12 @@ android {
         sourceCompatibility JavaVersion.VERSION_11
         targetCompatibility JavaVersion.VERSION_11
     }
-    // The engine is an executable shipped as lib*.so: it must be extracted to run.
+    // The engine is an executable shipped as lib*.so: it must be extracted to run. So is air2spv
+    // (libair2spv.so), which the renderer runs to translate macOS's shaders.
     packaging { jniLibs { useLegacyPackaging true } }
+    // libhengegpu.so: the Vulkan renderer (android/gpu/replay).
+    externalNativeBuild { cmake { path '../../gpu/replay/CMakeLists.txt' } }
+    // CI runners carry an NDK: use it rather than downloading the default one.
+    def ndk = System.getenv('ANDROID_NDK_LATEST_HOME')
+    if (ndk) ndkPath ndk
 }

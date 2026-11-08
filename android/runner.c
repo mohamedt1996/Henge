@@ -21,10 +21,12 @@ static void usage(void) {
             "   or: hengevm-android --mac FOLDER (exported from Henge on iOS) [options]\n"
             "   or: hengevm-android --rom AVPBooter.vmapple2.bin --disk Disk.img --aux AuxiliaryStorage\n"
             "                       --ecid N --seed N [--ram MB (4096)] [--cpus N (2)] [--log 0-3] [--jit-mb MB] [--net 0|1]\n"
-            "                       [--vnc PORT (5900, 0 = off)] [--gpu on|off|capture] [--shader-dir DIR]\n"
+            "                       [--vnc PORT (5900, 0 = off)] [--gpu on|off|capture|vulkan] [--shader-dir DIR]\n"
             "  --gpu off      no paravirtual GPU (experiment: macOS may fall back to a plain framebuffer)\n"
             "  --gpu capture  keep the GPU device and save every shader library and pipeline macOS uses\n"
-            "                 (default DIR: shaders/ next to the disk), for building the Vulkan translation\n");
+            "                 (default DIR: shaders/ next to the disk), for building the Vulkan translation\n"
+            "  --gpu vulkan   hand the GPU's commands to the Android app's Vulkan renderer through gpu.link\n"
+            "                 next to the disk (HV_GPU_LINK overrides); guest RAM stays a named file it maps\n");
     exit(2);
 }
 
@@ -165,7 +167,16 @@ int main(int argc, char **argv) {
             shader_dir = dir;
         }
         setenv("HV_SHADER_CAPTURE", shader_dir, 1);
-    } else if (strcmp(gpu, "on") && strcmp(gpu, "capture")) {
+    } else if (!strcmp(gpu, "vulkan") && !vc.installer) {
+        static char link[1100];
+        if (!getenv("HV_GPU_LINK")) {
+            snprintf(link, sizeof link, "%s", vc.disk);
+            char *slash = strrchr(link, '/');
+            snprintf(slash ? slash + 1 : link, sizeof link - (slash ? (size_t)(slash + 1 - link) : 0), "gpu.link");
+            setenv("HV_GPU_LINK", link, 1);
+        }
+        setenv("HV_RAM_KEEP", "1", 1);
+    } else if (strcmp(gpu, "on") && strcmp(gpu, "capture") && strcmp(gpu, "vulkan")) {
         usage();
     }
     setvbuf(stderr, NULL, _IONBF, 0);

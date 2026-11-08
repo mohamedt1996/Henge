@@ -271,7 +271,9 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     if (b->ram == MAP_FAILED && ram_file && *ram_file) {
         int fd = open(ram_file, O_RDWR | O_CREAT | O_TRUNC, 0600);
         if (fd >= 0) {
-            unlink(ram_file);
+            /* HV_RAM_KEEP: the Android app's renderer maps the same file (android/gpu/link.h); it
+               removes the name once it has the mapping. */
+            if (!getenv("HV_RAM_KEEP")) unlink(ram_file);
             if (ftruncate(fd, (off_t)ram_size) == 0)
                 b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
             close(fd);

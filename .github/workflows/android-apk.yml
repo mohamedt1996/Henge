@@ -23,8 +23,9 @@ jobs:
       - name: Toolchain
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q gcc-aarch64-linux-gnu clang cmake pkg-config
-          pip install --user meson ninja
+          sudo apt-get install -y -q gcc-aarch64-linux-gnu g++-aarch64-linux-gnu clang cmake pkg-config bison flex \
+            qemu-user spirv-tools libvulkan-dev mesa-vulkan-drivers
+          pip install --user meson ninja mako pyyaml packaging
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache engine dependencies
@@ -43,6 +44,23 @@ jobs:
           mkdir -p android/apk/app/src/main/jniLibs/arm64-v8a
           cp build/android/hengevm-android android/apk/app/src/main/jniLibs/arm64-v8a/libhengevm.so
           aarch64-linux-gnu-strip android/apk/app/src/main/jniLibs/arm64-v8a/libhengevm.so
+
+      - name: Cache air2spv dependencies (LLVM 22, Mesa's NIR for arm64)
+        uses: actions/cache@v4
+        with:
+          path: ~/air2spv-deps
+          key: air2spv-deps-arm64-${{ hashFiles('android/air2spv/build.sh') }}
+
+      - name: air2spv for the tablet (static arm64, run by the renderer to translate macOS's shaders)
+        run: |
+          android/air2spv/build.sh deps arm64
+          android/air2spv/build.sh arm64
+          android/air2spv/build.sh test arm64
+          cp build/air2spv-arm64/air2spv android/apk/app/src/main/jniLibs/arm64-v8a/libair2spv.so
+          aarch64-linux-gnu-strip android/apk/app/src/main/jniLibs/arm64-v8a/libair2spv.so
+
+      - name: Renderer self-test (Vulkan on lavapipe)
+        run: android/gpu/replay/selftest.sh
 
       - uses: actions/setup-java@v4
         with:

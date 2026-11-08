@@ -340,6 +340,29 @@ void *hv_pvg_lite_phys(HvPvgLite *p, uint64_t pa, uint64_t length) {
     return hv_phys_ptr(p->m, pa, length);
 }
 
+uint32_t hv_pvg_lite_task_root(HvPvgLite *p, uint32_t task) {
+    return task < 512 ? p->task_root[task] : 0;
+}
+
+uint64_t hv_pvg_lite_surface_table(HvPvgLite *p) {
+    return p->io_regs[0x10 / 8];
+}
+
+uint64_t hv_pvg_lite_display_pa(HvPvgLite *p) {
+    return p->display_pa;
+}
+
+int hv_pvg_lite_ram(HvPvgLite *p, uint64_t *pa, uint64_t *size) {
+    HvRam *r = hv_ram_lookup(p->m, 0x70000000ull); /* VMAPPLE_MEM */
+    if (!r) return -1;
+    *pa = r->pa, *size = r->size;
+    return 0;
+}
+
+void hv_pvg_lite_mode(uint32_t *width, uint32_t *height) {
+    *width = display_w, *height = display_h;
+}
+
 uint64_t hv_pvg_lite_task_objects(HvPvgLite *p, uint32_t task) {
     return task < 512 ? p->task_objects[task] : 0;
 }

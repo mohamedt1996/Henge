@@ -659,13 +659,15 @@ public class MainActivity extends Activity {
         return b;
     }
 
-    static final String[] GPU_MODES = {"on", "off", "capture"};
-    static final String[] GPU_LABELS = {"GPU", "Off", "Capture"};
+    static final String[] GPU_MODES = {"on", "off", "capture", "vulkan"};
+    static final String[] GPU_LABELS = {"GPU", "Off", "Capture", "Vulkan"};
     static final String[] GPU_NOTES = {
             "macOS's GPU driver runs, but Android has no renderer for it yet: expect the boot screen, then black.",
             "Experiment: no GPU device, so macOS may fall back to a plain framebuffer and show a slow desktop.",
             "Saves every shader and pipeline macOS uses to Android/data/dev.henge.android/files/shaders, "
-                    + "the inventory for the Vulkan renderer. Copy it to a computer over USB."};
+                    + "the inventory for the Vulkan renderer. Copy it to a computer over USB.",
+            "Experimental: the app's Vulkan renderer shows the screen. So far it does clears, copies and the pointer, "
+                    + "not draws, and translates macOS's shaders on the tablet into Android/data/dev.henge.android/files/spirv."};
 
     private String gpuMode() { return prefs.getString("gpu", "on"); }
 
