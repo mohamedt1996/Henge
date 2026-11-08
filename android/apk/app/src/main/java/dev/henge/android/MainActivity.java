@@ -301,11 +301,30 @@ public class MainActivity extends Activity {
     private double fraction(String log, int stage) {
         Matcher m;
         if (stage == 0) {
-            m = Pattern.compile("downloading macOS [0-9.]+ / [0-9.]+ GB \\(([0-9]+)%\\)").matcher(lastMatch(log, "henge: downloading macOS"));
+            String line = romPhase(log) ? lastMatch(log, "henge: boot ROM ") : lastMatch(log, "henge: downloading macOS ");
+            m = Pattern.compile("\\(([0-9]+)%\\)").matcher(line);
             return m.find() ? Integer.parseInt(m.group(1)) / 100.0 : 0;
         }
         m = Pattern.compile(" ([0-9]+)%").matcher(lastMatch(log, "henge: install: "));
         return m.find() ? Integer.parseInt(m.group(1)) / 100.0 : 0;
+    }
+
+    /** Fetching the small boot ROM, before the macOS download starts. */
+    private static boolean romPhase(String log) {
+        return log.lastIndexOf("henge: downloading macOS ") < Math.max(log.lastIndexOf("henge: boot ROM "),
+                log.lastIndexOf("henge: fetching the boot ROM"));
+    }
+
+    /** What the download is doing right now, in a line. */
+    private static String downloadDetail(String log) {
+        if (romPhase(log)) {
+            Matcher m = Pattern.compile("([0-9]+) / ([0-9]+) KB").matcher(lastMatch(log, "henge: boot ROM "));
+            return "Fetching the boot ROM from Apple" + (m.find() ? " · " + m.group(1) + " / " + m.group(2) + " KB" : "");
+        }
+        Matcher m = Pattern.compile("([0-9.]+) / ([0-9.]+) GB \\([0-9]+%\\) ([0-9.]+) MB/s").matcher(lastMatch(log, "henge: downloading macOS "));
+        if (m.find()) return "macOS · " + m.group(1) + " of " + m.group(2) + " GB · " + m.group(3) + " MB/s";
+        String r = lastMatch(log, "henge: download interrupted");
+        return r.isEmpty() ? "Starting the macOS download" : "Reconnecting…";
     }
 
     private void progress(LinearLayout page) {
@@ -328,8 +347,13 @@ public class MainActivity extends Activity {
             left = min <= 1 ? "About a minute left in this step" : "About " + min + " minutes left in this step";
         }
         TextView sub = text(left, 15, DIM, false);
-        sub.setPadding(0, dp(2), 0, dp(16));
+        sub.setPadding(0, dp(2), 0, stage == 0 ? 0 : dp(16));
         big.addView(sub);
+        if (stage == 0) {
+            TextView what = text(downloadDetail(log), 15, TEXT, false);
+            what.setPadding(0, dp(4), 0, dp(16));
+            big.addView(what);
+        }
         big.addView(bar(f, 11));
         page.addView(big);
 

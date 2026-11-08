@@ -24,6 +24,32 @@ enum { ROM_BLOCK_LENGTH = 859848, ROM_BLOCK_UNPACKED = 1048576, FORK_OFFSET = 87
        ROM_LENGTH = 214904 };
 static const char *ROM_SHA256 = "fd4973e42e609751830df6f3dd2d2b2ad2309fe38f0ca0f5aba02dcbefe45f91";
 
+/* No /etc/resolv.conf (Android): names resolve over HTTPS. Alternate resolvers between attempts, so a
+   blocked or slow one does not stall the install. */
+static void pick_dns(CURL *c, int attempt) {
+    if (getenv("HV_DOH") || access("/etc/resolv.conf", R_OK) == 0) return;
+    curl_easy_setopt(c, CURLOPT_DOH_URL, attempt % 2 ? "https://1.1.1.1/dns-query" : "https://8.8.8.8/dns-query");
+}
+
+/* Fail fast on a dead connection instead of waiting forever; resume handles the rest. */
+static void timeouts(CURL *c) {
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 20L);
+    curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+    curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 30L);
+}
+
+static int rom_progress(void *u, curl_off_t total, curl_off_t now, curl_off_t ut, curl_off_t un) {
+    (void)u, (void)total, (void)ut, (void)un;
+    static time_t last;
+    time_t t = time(NULL);
+    if (t != last) {
+        last = t;
+        fprintf(stderr, "\rhenge: boot ROM %lld / %d KB (%d%%)   ", (long long)now >> 10, ROM_BLOCK_LENGTH >> 10,
+                (int)(100 * now / ROM_BLOCK_LENGTH));
+    }
+    return 0;
+}
+
 static const HvRelease releases[] = {
     {"15.6.1", "macOS Sequoia 15.6.1",
      "https://updates.cdn-apple.com/2025SummerFCS/fullrestores/093-10809/CFD6DD38-DAF0-40DA-854F-31AAD1294C6F/"
@@ -157,7 +183,7 @@ int hv_fetch_boot_rom(const char *path) {
     fprintf(stderr, "henge: fetching the boot ROM from Apple (under 1 MB)\n");
     char range[64];
     snprintf(range, sizeof range, "%llu-%llu", rom_block_offset, rom_block_offset + ROM_BLOCK_LENGTH - 1);
-    for (int attempt = 1; attempt <= 3; attempt++) {
+    for (int attempt = 1; attempt <= 6; attempt++) {
         Buf b = {0};
         CURL *c = curl_easy_init();
         curl_easy_setopt(c, CURLOPT_URL, ROM_SOURCE);
@@ -165,16 +191,21 @@ int hv_fetch_boot_rom(const char *path) {
         curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, to_buf);
         curl_easy_setopt(c, CURLOPT_WRITEDATA, &b);
+        curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, rom_progress);
+        timeouts(c);
+        pick_dns(c, attempt);
         CURLcode rc = curl_easy_perform(c);
         long status = 0;
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
         curl_easy_cleanup(c);
         if (rc != CURLE_OK || status != 206 || b.n != ROM_BLOCK_LENGTH) {
-            fprintf(stderr, "henge: boot ROM request failed (%s, HTTP %ld, %zu bytes)\n", curl_easy_strerror(rc), status, b.n);
+            fprintf(stderr, "\nhenge: boot ROM request failed (%s, HTTP %ld, %zu bytes)\n", curl_easy_strerror(rc), status, b.n);
             free(b.p);
             sleep((unsigned)attempt);
             continue;
         }
+        fprintf(stderr, "\rhenge: boot ROM %d / %d KB (100%%)   \n", ROM_BLOCK_LENGTH >> 10, ROM_BLOCK_LENGTH >> 10);
         uint8_t *whole = malloc(ROM_BLOCK_UNPACKED), rom[ROM_LENGTH];
         size_t got = lzfse_decode_buffer(whole, ROM_BLOCK_UNPACKED, b.p, b.n, NULL);
         int ok = got == ROM_BLOCK_UNPACKED && file_from_fork(whole + FORK_OFFSET, FORK_LENGTH, rom) == 0 && genuine(rom, ROM_LENGTH);
@@ -197,7 +228,7 @@ int hv_fetch_boot_rom(const char *path) {
 
 /* ---- the restore image: resumable, with progress ---- */
 
-typedef struct { FILE *f; curl_off_t base; time_t last; } Dl;
+typedef struct { FILE *f; curl_off_t base, mark; time_t last, mark_t; double rate; } Dl;
 
 static size_t to_file(char *d, size_t sz, size_t n, void *u) { return fwrite(d, sz, n, ((Dl *)u)->f) * sz; }
 
@@ -208,7 +239,14 @@ static int dl_progress(void *u, curl_off_t total, curl_off_t now, curl_off_t ut,
     if (total > 0 && t != dl->last) {
         dl->last = t;
         double all = (double)(total + dl->base), at = (double)(now + dl->base);
-        fprintf(stderr, "\rhenge: downloading macOS %.1f / %.1f GB (%.0f%%)   ", at / 1e9, all / 1e9, 100 * at / all);
+        if (!dl->mark_t) dl->mark_t = t, dl->mark = now;
+        else if (t - dl->mark_t >= 3) { /* smoothed over a few seconds */
+            double r = (double)(now - dl->mark) / (double)(t - dl->mark_t);
+            dl->rate = dl->rate ? dl->rate * 0.6 + r * 0.4 : r;
+            dl->mark_t = t, dl->mark = now;
+        }
+        fprintf(stderr, "\rhenge: downloading macOS %.1f / %.1f GB (%.0f%%) %.1f MB/s   ", at / 1e9, all / 1e9, 100 * at / all,
+                dl->rate / 1e6);
     }
     return 0;
 }
@@ -232,8 +270,8 @@ int hv_download(const char *url, const char *path) {
         curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
         curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, dl_progress);
         curl_easy_setopt(c, CURLOPT_XFERINFODATA, &dl);
-        curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1024L);
-        curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 60L);
+        timeouts(c);
+        pick_dns(c, attempt);
         CURLcode rc = curl_easy_perform(c);
         long status = 0;
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
