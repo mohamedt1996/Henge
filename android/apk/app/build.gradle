@@ -27,7 +27,12 @@ android {
     packaging { jniLibs { useLegacyPackaging true } }
     // libhengegpu.so: the Vulkan renderer (android/gpu/replay).
     externalNativeBuild { cmake { path '../../gpu/replay/CMakeLists.txt' } }
-    // CI runners carry an NDK: use it rather than downloading the default one.
+    // CI runners carry an NDK: use it (and say its version, which AGP checks) rather than downloading one.
     def ndk = System.getenv('ANDROID_NDK_LATEST_HOME')
-    if (ndk) ndkPath ndk
+    if (ndk) {
+        def props = new Properties()
+        new File(ndk, 'source.properties').withInputStream { props.load(it) }
+        ndkPath ndk
+        ndkVersion props.getProperty('Pkg.Revision')
+    }
 }
