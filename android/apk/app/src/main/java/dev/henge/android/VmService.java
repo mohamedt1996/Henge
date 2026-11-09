@@ -173,6 +173,7 @@ public class VmService extends Service {
         File active = new File(files, "run.active");
         String build = Integer.toString(buildNumber(this));
         if (active.exists()) {
+            logLastCrash(log);
             String last = "";
             try { last = new String(Files.readAllBytes(active.toPath()), StandardCharsets.UTF_8).trim(); } catch (Exception ignored) { }
             String lastMode = last.contains("@") ? last.substring(0, last.indexOf('@')) : last;
@@ -308,6 +309,54 @@ public class VmService extends Service {
         if (wake != null && wake.isHeld()) wake.release();
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
+    }
+
+    /** Android's record of this app's last death (ApplicationExitInfo, Android 11+), with the tombstone's
+     *  backtrace from Android 12: the native crash the app's own handler may not have caught. */
+    private void logLastCrash(File log) {
+        if (android.os.Build.VERSION.SDK_INT < 30) return;
+        try {
+            android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+            java.util.List<android.app.ApplicationExitInfo> exits = am.getHistoricalProcessExitReasons(null, 0, 1);
+            if (exits.isEmpty()) return;
+            android.app.ApplicationExitInfo e = exits.get(0);
+            appendLog(log, "henge app: Android's record of the last death: reason " + e.getReason() + " (" + exitReason(e.getReason())
+                    + "), status " + e.getStatus() + ", " + e.getDescription() + ", at " + new java.util.Date(e.getTimestamp()));
+            if (android.os.Build.VERSION.SDK_INT >= 31 && e.getReason() == android.app.ApplicationExitInfo.REASON_CRASH_NATIVE) {
+                try (java.io.InputStream in = e.getTraceInputStream()) {
+                    if (in == null) { appendLog(log, "henge app: no tombstone kept"); return; }
+                    java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(in, StandardCharsets.UTF_8));
+                    StringBuilder sb = new StringBuilder("henge app: tombstone:\n");
+                    int lines = 0;
+                    boolean inFrames = false;
+                    for (String l; (l = r.readLine()) != null && lines < 120; ) {
+                        // The header (signal, fault address, abort message), the registers' first lines and the backtrace.
+                        if (l.startsWith("signal ") || l.startsWith("Abort message") || l.startsWith("Cause") || l.startsWith("pid:"))
+                            { sb.append("  ").append(l).append('\n'); lines++; }
+                        if (l.startsWith("backtrace:")) inFrames = true;
+                        else if (inFrames && l.trim().startsWith("#")) { sb.append("  ").append(l.trim()).append('\n'); lines++; }
+                        else if (inFrames && l.trim().isEmpty()) inFrames = false;
+                    }
+                    appendLog(log, sb.toString());
+                }
+            }
+        } catch (Exception ex) {
+            appendLog(log, "henge app: could not read Android's record of the last death: " + ex);
+        }
+    }
+
+    private static String exitReason(int r) {
+        switch (r) {
+            case android.app.ApplicationExitInfo.REASON_CRASH_NATIVE: return "native crash";
+            case android.app.ApplicationExitInfo.REASON_CRASH: return "Java crash";
+            case android.app.ApplicationExitInfo.REASON_LOW_MEMORY: return "low memory";
+            case android.app.ApplicationExitInfo.REASON_ANR: return "ANR";
+            case android.app.ApplicationExitInfo.REASON_SIGNALED: return "signalled";
+            case android.app.ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE: return "excessive resource usage";
+            case android.app.ApplicationExitInfo.REASON_USER_REQUESTED: return "user requested";
+            case android.app.ApplicationExitInfo.REASON_OTHER: return "other";
+            default: return "?";
+        }
     }
 
     static int buildNumber(Context c) {

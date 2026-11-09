@@ -5,6 +5,9 @@
    guest RAM as one memory-map range over the RAM file, the IOSurface mapper device beside the GPU, the
    two interrupt lines pulsed per raise, one display whose frames are drawn into a frame target and
    handed to the replay's presenter (replay_show_frame) for the screen. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE /* Dl_info, dladdr */
+#endif
 #include "../reims_link.h"
 #include "../replay/replay.h"
 #include "reims_vgpu.h"
@@ -88,6 +91,67 @@ static void set_stage(const char *s) { stage = s; hlog("reims: %s", s); }
 /* A native crash in this process takes the whole app (and the engine with it) down with nothing in henge.log:
    write the signal and the stage first (write() only: async-signal-safe), then hand over to debuggerd's handler. */
 static struct sigaction old_act[32];
+
+/* Async-signal-safe formatting: hex and a few strings. */
+static size_t put_str(char *out, size_t m, size_t cap, const char *c) { while (*c && m < cap - 1) out[m++] = *c++; return m; }
+static size_t put_hex(char *out, size_t m, size_t cap, uint64_t v) {
+    char d[19]; int n = 0;
+    do d[n++] = "0123456789abcdef"[v & 15], v >>= 4; while (v);
+    if (m < cap - 3) out[m++] = '0', out[m++] = 'x';
+    while (n && m < cap - 1) out[m++] = d[--n];
+    return m;
+}
+
+/* The frames of the crashing thread: _Unwind_Backtrace walks them (not strictly signal-safe, but the
+   process is dying anyway), dladdr names the library and the offset in it, which `ndk-stack`/`addr2line`
+   turn into lines. The faulting address too: a NULL or near-NULL one is a missing object. */
+#include <dlfcn.h>
+#include <unwind.h>
+typedef struct { uintptr_t pc[48]; int n; } Frames;
+static _Unwind_Reason_Code take_frame(struct _Unwind_Context *ctx, void *arg) {
+    Frames *f = arg;
+    uintptr_t pc = _Unwind_GetIP(ctx);
+    if (pc && f->n < (int)(sizeof f->pc / sizeof *f->pc)) f->pc[f->n++] = pc;
+    return f->n < (int)(sizeof f->pc / sizeof *f->pc) ? _URC_NO_REASON : _URC_END_OF_STACK;
+}
+static void write_backtrace(int sig, siginfo_t *si) {
+    char out[512];
+    size_t m = 0;
+    m = put_str(out, m, sizeof out, "henge-gpu: reims: fault address ");
+    m = put_hex(out, m, sizeof out, (uint64_t)(uintptr_t)(sig == SIGSEGV || sig == SIGBUS ? si->si_addr : 0));
+    m = put_str(out, m, sizeof out, ", code ");
+    m = put_hex(out, m, sizeof out, (uint64_t)si->si_code);
+    m = put_str(out, m, sizeof out, "\n");
+    (void)!write(log_fd, out, m);
+    Frames f = {{0}, 0};
+    _Unwind_Backtrace(take_frame, &f);
+    for (int i = 0; i < f.n; i++) {
+        Dl_info info;
+        m = 0;
+        m = put_str(out, m, sizeof out, "henge-gpu: reims:   #");
+        m = put_hex(out, m, sizeof out, (uint64_t)i);
+        m = put_str(out, m, sizeof out, " pc ");
+        if (dladdr((void *)f.pc[i], &info) && info.dli_fname) {
+            m = put_hex(out, m, sizeof out, (uint64_t)(f.pc[i] - (uintptr_t)info.dli_fbase));
+            m = put_str(out, m, sizeof out, " ");
+            const char *base = strrchr(info.dli_fname, '/');
+            m = put_str(out, m, sizeof out, base ? base + 1 : info.dli_fname);
+            if (info.dli_sname) {
+                m = put_str(out, m, sizeof out, " (");
+                m = put_str(out, m, sizeof out, info.dli_sname);
+                m = put_str(out, m, sizeof out, "+");
+                m = put_hex(out, m, sizeof out, (uint64_t)(f.pc[i] - (uintptr_t)info.dli_saddr));
+                m = put_str(out, m, sizeof out, ")");
+            }
+        } else {
+            m = put_hex(out, m, sizeof out, (uint64_t)f.pc[i]);
+            m = put_str(out, m, sizeof out, " ?");
+        }
+        m = put_str(out, m, sizeof out, "\n");
+        (void)!write(log_fd, out, m);
+    }
+}
+
 static void on_crash(int sig, siginfo_t *si, void *uc) {
     if (log_fd >= 0) {
         char out[256];
@@ -97,6 +161,7 @@ static void on_crash(int sig, siginfo_t *si, void *uc) {
         for (unsigned i = 0; i < 5; i++)
             for (const char *c = parts[i]; *c && m < sizeof out - 1; c++) out[m++] = *c;
         (void)!write(log_fd, out, m);
+        write_backtrace(sig, si);
     }
     struct sigaction *o = &old_act[sig];
     if (o->sa_flags & SA_SIGINFO) { if (o->sa_sigaction) { o->sa_sigaction(sig, si, uc); return; } }
@@ -107,6 +172,10 @@ static void on_crash(int sig, siginfo_t *si, void *uc) {
 static void install_crash_log(void) {
     static int done;
     if (done++) return;
+    /* SA_ONSTACK needs a stack: without one a stack overflow's SIGSEGV has nowhere to run the handler. */
+    static char alt[1 << 16];
+    stack_t ss = {.ss_sp = alt, .ss_size = sizeof alt, .ss_flags = 0};
+    sigaltstack(&ss, NULL);
     int sigs[] = {SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE};
     struct sigaction a = {0};
     a.sa_sigaction = on_crash;

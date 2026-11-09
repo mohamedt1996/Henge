@@ -72,7 +72,13 @@ minutes of GPU work; then WindowServer's `inplace_copy_lph` pipeline needed fram
 or `VK_EXT_fragment_shader_interlock`, and Qualcomm's driver has neither. `m2v_unordered_fetch.py`
 emits the input-attachment form without the order flags on Android (a tiler shades one pixel's
 fragments in order in practice; the extension promises what the hardware does). Where the bet is
-wrong the picture is wrong, not the process. What to expect next, in order:
+wrong the picture is wrong, not the process.
+
+Sixth run: no `fatal`; a plain SIGSEGV in native code two minutes in, after the fetch pipelines went
+through (797 interrupts, 2 presents). The stage says only "running", so this build adds a backtrace
+to the crash handler (`_Unwind_Backtrace` + `dladdr`: library and offset per frame, the fault
+address) and, at the next start, Android's own record of the last death with its tombstone
+(`ApplicationExitInfo`, Android 12+). What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
   `reims` lines in `adb logcat -s henge-gpu`, and a `reims-vgpu: fatal` line ends the app's process;
