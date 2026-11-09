@@ -60,6 +60,7 @@ struct HvPvgLite {
     uint32_t draining;
     uint32_t barrier_waits[MAX_CHANNELS];
     uint64_t barriers, barrier_drains, barrier_retries, barrier_timeouts;
+    uint64_t commands; /* GPU commands taken, for the heartbeat */
     CFTypeRef layer; /* retained until replaced; layer_lock serializes lazy replay handoff */
     os_unfair_lock layer_lock;
     int layer_set; /* an explicit NULL also overrides the renderer's Mac test layer */
@@ -397,6 +398,10 @@ void hv_pvg_lite_barrier_stats(HvPvgLite *p, uint64_t out[4]) {
     out[0] = p->barriers, out[1] = p->barrier_drains, out[2] = p->barrier_retries, out[3] = p->barrier_timeouts;
 }
 
+void hv_pvg_lite_activity(HvPvgLite *p, uint64_t *commands, uint64_t *swaps) {
+    *commands = p ? p->commands : 0, *swaps = p ? p->swaps : 0;
+}
+
 uint64_t hv_pvg_lite_gpu_frames(HvPvgLite *p) {
     return p && p->metal ? hv_pvg_metal_gpu_frames(p->metal) : 0;
 }
@@ -511,6 +516,7 @@ static void tally_exec(HvPvgLite *p, const uint32_t *table, uint32_t size, uint3
 
 /* Commands that do something even without a GPU to run them. */
 static void channel_command(HvPvgLite *p, const uint32_t *table, uint32_t size, uint32_t rd, const uint32_t *hdr) {
+    p->commands++;
     uint32_t op = hdr[0] & 0xffff, args[32], skip = (hdr[0] >> 16) * 8; /* the barriers come first */
     uint32_t n = hdr[1] > 12 + skip ? hdr[1] - 12 - skip : 0;
     if (n > sizeof args) n = sizeof args;

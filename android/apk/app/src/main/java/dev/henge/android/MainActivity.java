@@ -174,11 +174,21 @@ public class MainActivity extends Activity {
             case INSTALL: title.setText(installing() ? "Installing" : "Install macOS"); install(page); break;
             case SETTINGS: title.setText("Settings"); settings(page); break;
         }
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(Math.min(dp(680), getResources().getDisplayMetrics().widthPixels), -2,
+                Gravity.CENTER_HORIZONTAL);
+        /* A refresh of the same page swaps the page inside the existing scroller: a new ScrollView every second
+           jumped to the top and back (the flicker while the log was being written). */
+        if (keepScroll && content.getChildCount() == 1 && content.getChildAt(0) instanceof ScrollView
+                && ((ScrollView) content.getChildAt(0)).getChildAt(0) instanceof FrameLayout) {
+            FrameLayout centre = (FrameLayout) ((ScrollView) content.getChildAt(0)).getChildAt(0);
+            centre.removeAllViews();
+            centre.addView(page, lp);
+            return;
+        }
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
         FrameLayout centre = new FrameLayout(this);
-        centre.addView(page, new FrameLayout.LayoutParams(Math.min(dp(680), getResources().getDisplayMetrics().widthPixels), -2,
-                Gravity.CENTER_HORIZONTAL));
+        centre.addView(page, lp);
         scroll.addView(centre);
         content.removeAllViews();
         content.addView(scroll);
@@ -1006,6 +1016,10 @@ public class MainActivity extends Activity {
             android.widget.Toast.makeText(this, "Copied the last 256 KB. The whole log is in "
                     + "Android/data/dev.henge.android/files/verbose.log", android.widget.Toast.LENGTH_LONG).show();
         }));
+        body.addView(gap(10));
+        body.addView(link("Save the full log to Downloads", v -> saveToDownloads(false)));
+        body.addView(gap(10));
+        body.addView(link("Export captured shaders to Downloads", v -> saveToDownloads(true)));
         if (clear) {
             body.addView(gap(10));
             body.addView(link("Clear log", v -> { VmService.logFile(this).delete(); prefs.edit().putLong("installStart", 0).apply();
@@ -1015,8 +1029,56 @@ public class MainActivity extends Activity {
         return l;
     }
 
+    /* The log is read and filtered off the UI thread, and only when the file grew: reading up to 96 KB and running
+       the filters on the UI thread every second stalled the app's drawing while the engine wrote. */
+    private static final java.util.concurrent.ExecutorService LOG_READER = java.util.concurrent.Executors.newSingleThreadExecutor();
+    private static volatile String logText = "";
+    private static volatile String logKey = "";
+    private static volatile boolean logReading;
+
+    /** Download/Henge/: the whole verbose log and the install log, or the shader capture as a zip. */
+    private void saveToDownloads(boolean shaders) {
+        android.widget.Toast.makeText(this, shaders ? "Zipping the shaders…" : "Saving the log…", android.widget.Toast.LENGTH_SHORT).show();
+        String stamp = new java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(new java.util.Date());
+        android.content.Context c = getApplicationContext();
+        new Thread(() -> {
+            List<String> saved = new ArrayList<>();
+            if (shaders) {
+                String n = VmService.toDownloads(c, VmService.shaderDir(c), "henge-shaders-" + stamp + ".zip", "application/zip");
+                if (n != null) saved.add(n);
+            } else {
+                String n = VmService.toDownloads(c, VmService.logFile(c), "henge-verbose-" + stamp + ".log", "text/plain");
+                if (n != null) saved.add(n);
+                n = VmService.toDownloads(c, new File(VmService.macDir(c), "restore/install.log"), "henge-install-" + stamp + ".log", "text/plain");
+                if (n != null) saved.add(n);
+            }
+            String msg = saved.isEmpty() ? (shaders ? "No shaders captured yet." : "No log to save yet.")
+                    : "Saved to Download/Henge: " + TextUtils.join(", ", saved);
+            ui.post(() -> android.widget.Toast.makeText(c, msg, android.widget.Toast.LENGTH_LONG).show());
+        }).start();
+    }
+
     private TextView logView(int lines, boolean verbose) {
-        String all = read(VmService.logFile(this), Math.max(0, VmService.logFile(this).length() - (verbose ? 96 : 48) * 1024));
+        File f = VmService.logFile(this);
+        String key = f.length() + "|" + lines + "|" + verbose;
+        String shown = key.equals(logKey) || !logText.isEmpty() ? logText : "";
+        TextView t = text(shown.isEmpty() ? "Nothing yet." : shown, 10, DIM, false, Typeface.MONOSPACE);
+        t.setTextIsSelectable(true);
+        if (!key.equals(logKey) && !logReading) {
+            logReading = true;
+            LOG_READER.execute(() -> {
+                String text = filterLog(read(f, Math.max(0, f.length() - (verbose ? 96 : 48) * 1024)), lines, verbose);
+                logText = text;
+                logKey = key;
+                logReading = false;
+                ui.post(() -> { if (t.isAttachedToWindow() && !text.equals(t.getText().toString()))
+                    t.setText(text.isEmpty() ? "Nothing yet." : text); });
+            });
+        }
+        return t;
+    }
+
+    private static String filterLog(String all, int lines, boolean verbose) {
         // A progress bar redrawn with \r, or printed as "Label: 93.1%" line after line, shows as its latest value.
         List<String> ls = new ArrayList<>();
         for (String raw : all.split("\n")) {
@@ -1033,9 +1095,7 @@ public class MainActivity extends Activity {
         }
         StringBuilder b = new StringBuilder();
         for (int i = Math.max(0, ls.size() - lines); i < ls.size(); i++) b.append(ls.get(i)).append('\n');
-        TextView t = text(b.length() == 0 ? "Nothing yet." : b.toString().trim(), 10, DIM, false, Typeface.MONOSPACE);
-        t.setTextIsSelectable(true);
-        return t;
+        return b.toString().trim();
     }
 
     private TextView link(String t, View.OnClickListener l) {

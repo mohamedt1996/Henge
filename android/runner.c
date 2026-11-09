@@ -10,6 +10,7 @@
 #include "cpu.h"
 #include "vmapple.h"
 #include "virtio_usb.h"
+#include "pvg_lite.h"
 #include <sys/stat.h>
 #include <curl/curl.h>
 static void curl_global_init_all(void) { curl_global_init(CURL_GLOBAL_ALL); }
@@ -91,29 +92,63 @@ static void *install_watchdog(void *arg) {
     fflush(stdout);
     _exit(1);
 }
-/* Every 30 s (installing or booting), where each guest CPU is and who owns the USB port. A boot that gives no serial
-   output still shows here whether the kernel runs (EL1 PCs at 0xfffffe..., blocks climbing), spins in one place,
-   sleeps (blocks flat), stopped (halted), and whether its USB driver ever touched the port. */
+/* Every 30 s (installing or booting), where each guest CPU is, what the disk and GPU did, and who owns the USB port.
+   A boot that gives no serial output still shows here whether the kernel runs (EL1 PCs at 0xfffffe..., blocks
+   climbing), spins in one place, sleeps (blocks flat), stopped (halted), and whether it does disk or GPU work.
+   Idle is the same PC on every CPU with a few thousand blocks: that alone is not a hang. A hang is no CPU moving
+   off its PC and no disk or GPU work for 2 minutes; then each CPU's registers go to the log, once per hang. */
 static int heartbeat_no_cpus; /* Gunyah runs the CPU: its state is not ours to read */
+static void dump_cpu(int i, HvCpu *c) {
+    fprintf(stderr, "henge: stuck? cpu%d EL%u pc %llx sp %llx x29 %llx x30 %llx | elr %llx spsr %llx esr %llx far %llx | "
+                    "x0 %llx x1 %llx x2 %llx x3 %llx daif %llx\n",
+            i, c->el, (unsigned long long)c->pc, (unsigned long long)c->sp, (unsigned long long)c->x[29],
+            (unsigned long long)c->x[30], (unsigned long long)c->elr_el1, (unsigned long long)c->spsr_el1,
+            (unsigned long long)c->esr_el1, (unsigned long long)c->far_el1, (unsigned long long)c->x[0],
+            (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[3], (unsigned long long)c->daif);
+}
 static void *install_heartbeat(void *arg) {
     (void)arg;
-    uint64_t last[HV_MAX_CPUS] = {0};
+    uint64_t last[HV_MAX_CPUS] = {0}, last_pc[HV_MAX_CPUS] = {0};
+    uint64_t last_disk = 0, last_gpu = 0;
+    int still = 0, reported = 0;
     for (int t = 30; install_done == -2; t += 30) {
         sleep(30);
-        HvVirtioUsb *u = hv_vm_board()->vusb;
+        HvVmapple *b = hv_vm_board();
+        HvVirtioUsb *u = b->vusb;
+        int moved = 0;
         fprintf(stderr, "henge: guest %d s:", t);
         for (int i = 0; i < hv_vm_ncpus() && !heartbeat_no_cpus; i++) {
             HvCpu *c = hv_vm_cpu(i);
             uint64_t n = c->icount;
             if (c->halted) fprintf(stderr, " cpu%d stopped at %llx", i, (unsigned long long)c->pc);
             else if (c->off) fprintf(stderr, " cpu%d off", i);
-            else fprintf(stderr, " cpu%d EL%u %llx +%llu", i, c->el, (unsigned long long)c->pc,
-                         (unsigned long long)(n - last[i]));
-            last[i] = n;
+            else {
+                fprintf(stderr, " cpu%d EL%u %llx +%llu", i, c->el, (unsigned long long)c->pc,
+                        (unsigned long long)(n - last[i]));
+                if (c->pc != last_pc[i]) moved = 1;
+            }
+            last[i] = n, last_pc[i] = c->pc;
         }
+        uint64_t disk = (b->root_blk ? b->root_blk->requests : 0) + (b->aux_blk ? b->aux_blk->requests : 0);
+        uint64_t cmds = 0, swaps = 0;
+        hv_pvg_lite_activity(b->pvg, &cmds, &swaps);
+        fprintf(stderr, " | disk +%llu | gpu +%llu cmds, %llu frames", (unsigned long long)(disk - last_disk),
+                (unsigned long long)(cmds - last_gpu), (unsigned long long)swaps);
+        if (disk != last_disk || cmds != last_gpu) moved = 1;
+        last_disk = disk, last_gpu = cmds;
         if (u) fprintf(stderr, " | usb: %s, kernel driver %s (status %#x)", u->rom_on ? "iBoot has it" : "iBoot let go",
                        u->pci_on ? "on" : "not started", u->vio.status);
         fputc('\n', stderr);
+        if (heartbeat_no_cpus) continue;
+        still = moved ? 0 : still + 1;
+        if (moved) reported = 0;
+        if (still >= 4 && !reported) { /* 2 minutes without anything moving */
+            reported = 1;
+            for (int i = 0; i < hv_vm_ncpus(); i++) {
+                HvCpu *c = hv_vm_cpu(i);
+                if (!c->halted && !c->off) dump_cpu(i, c);
+            }
+        }
     }
     return NULL;
 }

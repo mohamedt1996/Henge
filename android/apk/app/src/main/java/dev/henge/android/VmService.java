@@ -48,6 +48,41 @@ public class VmService extends Service {
         catch (Exception ignored) { }
     }
 
+    /** Copies a file, or a folder as a zip, into the tablet's Download folder (MediaStore: no permission needed).
+     *  Returns the name it got, or null if there was nothing to copy or it failed. */
+    static String toDownloads(Context c, File src, String name, String mime) {
+        if (src == null || !src.exists()) return null;
+        android.content.ContentValues v = new android.content.ContentValues();
+        v.put(android.provider.MediaStore.Downloads.DISPLAY_NAME, name);
+        v.put(android.provider.MediaStore.Downloads.MIME_TYPE, mime);
+        v.put(android.provider.MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Henge");
+        android.net.Uri uri = c.getContentResolver().insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+        if (uri == null) return null;
+        try (java.io.OutputStream out = c.getContentResolver().openOutputStream(uri)) {
+            if (src.isDirectory()) {
+                try (java.util.zip.ZipOutputStream z = new java.util.zip.ZipOutputStream(out)) { zipInto(z, src, ""); }
+            } else {
+                Files.copy(src.toPath(), out);
+            }
+            return name;
+        } catch (Exception e) {
+            c.getContentResolver().delete(uri, null, null);
+            return null;
+        }
+    }
+
+    private static void zipInto(java.util.zip.ZipOutputStream z, File dir, String prefix) throws java.io.IOException {
+        File[] fs = dir.listFiles();
+        if (fs == null) return;
+        for (File f : fs) {
+            String n = prefix + f.getName();
+            if (f.isDirectory()) { zipInto(z, f, n + "/"); continue; }
+            z.putNextEntry(new java.util.zip.ZipEntry(n));
+            Files.copy(f.toPath(), z);
+            z.closeEntry();
+        }
+    }
+
     /** Where downloads are kept (restore images, the boot ROM): Henge/ on the tablet's storage when the app has
      *  all-files access, so they outlive an uninstall; else the app's own folder, which outlives updates. */
     public static File libraryDir(Context c) {

@@ -40,6 +40,8 @@ void hv_pvg_lite_task_pages(HvPvgLite *p, uint32_t task, uint64_t first, uint64_
 void hv_pvg_lite_set_layer(HvPvgLite *p, void *layer);
 uint64_t hv_pvg_lite_gpu_frames(HvPvgLite *p);
 void hv_pvg_lite_barrier_stats(HvPvgLite *p, uint64_t out[4]);
+/* GPU commands taken and display swaps so far (0 without a device). */
+void hv_pvg_lite_activity(HvPvgLite *p, uint64_t *commands, uint64_t *swaps);
 /* The display's shared state page, or NULL before the guest named it. */
 uint8_t *hv_pvg_lite_display_page(HvPvgLite *p);
 void hv_pvg_lite_command(HvPvgLite *p, const uint32_t *command, uint32_t length);
