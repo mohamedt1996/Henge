@@ -247,7 +247,10 @@ static void *beat_loop(void *arg) {
     Host *h = arg;
     uint64_t last = now_ns();
     while (!h->stop) {
-        if (h->h) __atomic_store_n(&h->h->app_heartbeat, now_ns(), __ATOMIC_RELEASE);
+        if (h->h) {
+            __atomic_store_n(&h->h->app_heartbeat, now_ns(), __ATOMIC_RELEASE);
+            if (h->ready && !h->stop) __atomic_store_n(&h->h->app_ready, 1, __ATOMIC_RELEASE); /* survives a header reset */
+        }
         usleep(250000);
         if (now_ns() - last > 10000000000ull && h->ready) {
             uint64_t guest = 0, host = 0;
@@ -328,7 +331,8 @@ static void *attach_loop(void *arg) {
         if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size >= (off_t)HV_REIMS_FILE_BYTES) {
             HvReimsHeader *x = mmap(NULL, HV_REIMS_FILE_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
             close(fd);
-            if (x != MAP_FAILED && __atomic_load_n(&x->magic, __ATOMIC_ACQUIRE) == HV_REIMS_MAGIC && x->version == HV_REIMS_VERSION) {
+            if (x != MAP_FAILED && __atomic_load_n(&x->magic, __ATOMIC_ACQUIRE) == HV_REIMS_MAGIC && x->version == HV_REIMS_VERSION &&
+                __atomic_load_n(&x->engine_alive, __ATOMIC_ACQUIRE) && x->ram_file[0]) {
                 h->h = x;
                 pthread_create(&h->beat, NULL, beat_loop, h);
                 if (bring_up(h) != 0) hlog("reims: no GPU this run");

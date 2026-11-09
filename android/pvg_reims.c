@@ -51,6 +51,17 @@ static int app_alive(void) {
     return __atomic_load_n(&R.h->app_ready, __ATOMIC_ACQUIRE) && beat && now_ns() - beat < HV_REIMS_STALE_NS;
 }
 
+#define HV_REIMS_BRINGUP_SECS 45
+static int wait_for_app_secs(int secs) {
+    for (int i = 0; !app_alive(); i++) {
+        if (i == 0) fprintf(stderr, "hengevm: reims: waiting for the app's GPU to come up\n");
+        if (i >= secs * 10) return -1;
+        usleep(100000);
+    }
+    fprintf(stderr, "hengevm: reims: the app's GPU is up\n");
+    return 0;
+}
+
 /* Until the app's device exists the GPU cannot answer, and macOS's driver must not see a dead device:
    the first access waits for it (the app starts the renderer with the VM). */
 static int wait_for_app(void) {
@@ -144,10 +155,13 @@ int hv_pvg_external_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_t i
     /* The app opens guest RAM the moment it sees the magic below: give it the RAM file first. runner.c shares
        it only after hv_vm_create returns, by which time the app had already hit EACCES and given up. */
     hv_android_share_with_app(file);
-    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    /* A new file, never the last run's truncated in place: the app may already have the old one mapped, and
+       truncating under it zeroed app_ready (or SIGBUSed it), leaving the guest waiting on a GPU that never came. */
+    unlink(path);
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
     if (fd >= 0) hv_android_share_with_app(path);
     if (fd < 0 || ftruncate(fd, HV_REIMS_FILE_BYTES) != 0) {
-        fprintf(stderr, "hengevm: reims: %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "hengevm: reims: %s: %s; using GPU instead\n", path, strerror(errno));
         if (fd >= 0) close(fd);
         return 0;
     }
@@ -161,6 +175,19 @@ int hv_pvg_external_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_t i
     hv_pvg_lite_mode(&h->display_w, &h->display_h);
     h->engine_alive = 1;
     __atomic_store_n(&h->magic, HV_REIMS_MAGIC, __ATOMIC_RELEASE);
+    /* The guest has not run yet: wait here for the app's device, and if it does not come, boot with pvg_lite
+       rather than hand macOS a GPU that never answers (a frozen boot). */
+    R.h = h;
+    if (wait_for_app_secs(HV_REIMS_BRINGUP_SECS) != 0) {
+        fprintf(stderr, "hengevm: reims: the app's GPU did not come up in %d s (its \"reims:\" lines say why); "
+                        "booting with Graphics GPU instead\n", HV_REIMS_BRINGUP_SECS);
+        __atomic_store_n(&h->magic, 0, __ATOMIC_RELEASE);
+        h->engine_alive = 0;
+        munmap(h, HV_REIMS_FILE_BYTES);
+        unlink(path);
+        R.h = NULL;
+        return 0;
+    }
     R = (Reims){h, m, gic, gfx_irq, iosfc_irq, 0, 0, 0};
     hv_machine_add_mmio(m, gfx_pa, 0x10000, &R, gfx_read, gfx_write, "gfx-reims");
     hv_machine_add_mmio(m, iosfc_pa, 0x10000, &R, iosfc_read, iosfc_write, "iosurface-reims");

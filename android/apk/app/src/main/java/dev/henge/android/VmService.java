@@ -198,6 +198,8 @@ public class VmService extends Service {
                 appendLog(log, "henge app: " + (p.waitFor() == 0 ? out : "could not raise vm.max_map_count (no root?): " + out));
             } catch (Exception e) { appendLog(log, "henge app: could not raise vm.max_map_count: " + e); }
         }
+        // The last run's gpu.reims is stale: the app must attach only to the one this engine is about to make.
+        if (reims) new File(mac, "gpu.reims").delete();
         if (reims && !(GpuView.loaded && GpuView.nativeReimsStart(new File(mac, "gpu.reims").getPath(), log.getPath())))
             appendLog(log, "henge app: this build has no reims-vgpu; the GPU will not answer");
         int code = -1;
