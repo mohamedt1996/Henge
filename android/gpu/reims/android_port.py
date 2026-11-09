@@ -133,6 +133,10 @@ def main() -> None:
                 sys.exit(f'android_port: {path}: {old.splitlines()[0].strip()!r} not found once; upstream changed')
             t = t.replace(old, new)
         path.write_text(t)
+    # metal2vulkan on a device without VK_EXT_external_memory_host (Qualcomm's driver): host memory as
+    # copies, not a refusal that ends the app at the first IOSurface texture (m2v_no_host_import.py).
+    import subprocess
+    subprocess.run([sys.executable, '-I', str(HERE / 'm2v_no_host_import.py'), str(m2v)], check=True)
     print(f'android_port: {total} Linux-only places now take Android')
 
 

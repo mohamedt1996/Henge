@@ -54,7 +54,18 @@ ring size. The IOSurface device sizes its descriptor table, page mappings and fe
 page size (sysconf), equal to the guest's on every host the library supports (Apple silicon 16 KiB
 both, x86-64 Linux 4 KiB both); Android arm64 has 4 KiB host pages under a 16 KiB-page guest, so the
 4 KiB table mapping died in the map. `android_port.py` makes the device's pages the guest's
-(`APV_PAGE_SIZE`). What to expect next, in order:
+(`APV_PAGE_SIZE`).
+
+Fourth run: the mapper set up (ring 0x400 entries, a whole page), the GPU driver's handshake went
+through, 14 interrupts reached macOS and a frame was shown; then the first texture over an IOSurface
+died: `newTextureWithDescriptor:iosurface:plane:: ... Unsupported { feature: HostMemory, needs:
+VK_EXT_external_memory_host }`. Qualcomm's Vulkan driver has no `VK_EXT_external_memory_host`, which
+metal2vulkan uses to wrap guest pages as GPU memory, and without it its Importer refused to exist.
+`m2v_no_host_import.py` (run by `android_port.py`) gives such a device an importer that imports
+nothing, so every no-copy buffer and IOSurface texture takes the runtime's existing copy path
+(`copied-host-pages`: a copy of the pages, compared on the CPU at each commit). Slower than imports,
+and the first thing to revisit (Turnip has the extension; a bundled Turnip is the long-term route).
+What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
   `reims` lines in `adb logcat -s henge-gpu`, and a `reims-vgpu: fatal` line ends the app's process;
