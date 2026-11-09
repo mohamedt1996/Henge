@@ -43,3 +43,19 @@ Not run yet on the tablet. What to expect, in order:
 
 The app's process must stay alive while the Mac runs: VmService starts the device before the engine
 and stops it after. Without the app the engine waits a minute for it at the first GPU access.
+
+## Testing without the tablet
+
+`reims/selftest.c` plays the engine against the app's half (`host.c`) on reims-vgpu, on any Vulkan
+driver: the device, IOSurface device and display come up, gfx and IOSurface register reads and writes
+cross through the slots, and a frame of the display is encoded into a frame target and read back.
+Built on Linux against a reims-vgpu built for the host (the window crate's Android stub standing in for
+SDL3), it passed on lavapipe (2026-11-09):
+
+    cc -DHENGE_REIMS -I<reims>/crates/reims-vgpu-c/include android/gpu/reims/host.c \
+       android/gpu/reims/selftest.c libreims_vgpu_c.a -lpthread -ldl -lm -o reims-selftest
+    VK_ICD_FILENAMES=<lavapipe>/lvp_icd.json ./reims-selftest /tmp/x
+
+On a host without `/dev/udmabuf` (Android), reims-vgpu views guest memory a 4 KB mapping at a time,
+counted against `vm.max_map_count`: at 65530 that covers about 190 MB of guest RAM. The app raises it
+through su when Graphics: reims starts, and logs whether it could.

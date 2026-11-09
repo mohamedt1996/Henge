@@ -185,6 +185,19 @@ public class VmService extends Service {
         if (gunyah()) { cmd.add("--engine"); cmd.add("gunyah"); }
         // Graphics: reims: the GPU device runs in this process (libhengegpu.so), up before the engine needs it.
         boolean reims = !install && "reims".equals(gpu);
+        // reims-vgpu views guest memory a 4 KB mapping at a time where Android has no /dev/udmabuf: at the default
+        // vm.max_map_count (65530) that covers ~190 MB of the Mac's RAM. Raise it where root is there (best effort).
+        if (reims) {
+            try {
+                Process p = new ProcessBuilder("su", "-c", "sysctl -w vm.max_map_count=2097152").redirectErrorStream(true).start();
+                StringBuilder sb = new StringBuilder();
+                try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                    for (String l; (l = r.readLine()) != null; ) sb.append(l).append(' ');
+                }
+                String out = sb.toString().trim();
+                appendLog(log, "henge app: " + (p.waitFor() == 0 ? out : "could not raise vm.max_map_count (no root?): " + out));
+            } catch (Exception e) { appendLog(log, "henge app: could not raise vm.max_map_count: " + e); }
+        }
         if (reims && !(GpuView.loaded && GpuView.nativeReimsStart(new File(mac, "gpu.reims").getPath(), log.getPath())))
             appendLog(log, "henge app: this build has no reims-vgpu; the GPU will not answer");
         int code = -1;
