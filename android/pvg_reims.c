@@ -189,8 +189,13 @@ int hv_pvg_external_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_t i
         return 0;
     }
     R = (Reims){h, m, gic, gfx_irq, iosfc_irq, 0, 0, 0};
+    /* Self-locked, as the GIC: each access waits for the app, and under the engine's device lock that wait
+       stalled every other device for the other vCPU (a timer or UART access queued behind a GPU register).
+       reims-vgpu takes its own locks, as QEMU's MMIO calls into it do. */
     hv_machine_add_mmio(m, gfx_pa, 0x10000, &R, gfx_read, gfx_write, "gfx-reims");
+    m->mmio[m->nmmio - 1].self_locked = 1;
     hv_machine_add_mmio(m, iosfc_pa, 0x10000, &R, iosfc_read, iosfc_write, "iosurface-reims");
+    m->mmio[m->nmmio - 1].self_locked = 1;
     pthread_t t;
     pthread_create(&t, NULL, irq_thread, NULL);
     pthread_detach(t);

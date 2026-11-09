@@ -40,7 +40,15 @@ and pipeline records in `$HOME/.cache/reims-vgpu-vulkan` and refuses to make a d
 directory; an Android app's process has no `HOME`. `host.c` now sets `HOME` to a folder the app
 passes (`files/reims-home`, which outlives the process: the second boot finds the first's pipelines,
 which is what macOS-uke found makes WindowServer usable), and `android_port.py` caps the cache at
-4 GiB instead of the library's 25. What to expect next, in order:
+4 GiB instead of the library's 25.
+
+Second run (same day): device, IOSurface device and display came up, and the app died at
+`reims-vgpu: fatal: memory.map.mapping_length_unaligned` while running: macOS's IOSurface mapper
+wrote a ring size whose length (size x 16 bytes) is not whole 16 KiB pages, which the library
+treats as host death (its docs 6.23). `android_port.py` now rounds the ring's mapping up to whole
+pages (the ring's index math keeps the guest's size), `host.c` logs the mapper's setup registers,
+and the engine's reims MMIO is self-locked so a GPU access no longer stalls the other devices. What
+to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
   `reims` lines in `adb logcat -s henge-gpu`, and a `reims-vgpu: fatal` line ends the app's process;

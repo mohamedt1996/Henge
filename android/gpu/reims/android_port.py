@@ -73,6 +73,35 @@ def main() -> None:
         if t.count(old) != 1:
             sys.exit(f'android_port: {platform}: SHADER_CACHE_CAPACITY not found once; upstream changed')
         platform.write_text(t.replace(old, new))
+    # The IOSurface mapper's ring: the library maps ring size x 16 bytes and dies unless that is whole
+    # 16 KiB pages (docs/testing.md 6.23). On the tablet macOS wrote a size that is not
+    # ("reims-vgpu: fatal: memory.map.mapping_length_unaligned", the app's first death past device
+    # creation). The mapping is of guest RAM, so it is rounded up to whole pages: the ring's own index
+    # math keeps the guest's size, and a mapping past the end of RAM is refused, not fatal, as before.
+    regs = reims / 'crates' / 'reims-vgpu-core' / 'src' / 'iosurface' / 'regs.rs'
+    t = regs.read_text()
+    anchor = '        let (length, overflow) = ring_size.overflowing_mul(RING_COMMAND_SIZE);\n'
+    rounding = (
+        '        // Henge\'s Android port: whole guest pages, not host death, for a ring of another size.\n'
+        '        let length = {\n'
+        '            let page = crate::guest::records::APV_PAGE_SIZE;\n'
+        '            let rounded = length.div_ceil(page).saturating_mul(page);\n'
+        '            if rounded != length {\n'
+        '                log::warn!(\n'
+        '                    "ring size {ring_size} ({length} bytes) is not whole guest pages; mapping {rounded} bytes"\n'
+        '                );\n'
+        '            }\n'
+        '            rounded\n'
+        '        };\n'
+    )
+    if rounding not in t:
+        if t.count(anchor) != 1:
+            sys.exit(f'android_port: {regs}: the ring-size write not found once; upstream changed')
+        # After the overflow check that follows the anchor: its `return;` and closing brace.
+        at = t.index(anchor)
+        end = t.index('            return;\n        }\n', at) + len('            return;\n        }\n')
+        t = t[:end] + rounding + t[end:]
+        regs.write_text(t)
     print(f'android_port: {total} Linux-only places now take Android')
 
 

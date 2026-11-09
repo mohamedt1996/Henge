@@ -269,6 +269,13 @@ static void *slot_loop(void *arg) {
             if (s->write) rvg_device_mmio_write(h->dev, s->offset, (uint32_t)s->value);
             else v = rvg_device_mmio_read(h->dev, s->offset);
         } else {
+            /* The mapper's setup registers, a handful of writes per boot: their values are what the first
+               death past device creation turned on (a ring size the library would not map). */
+            if (s->write && (s->offset == 0x1000 || s->offset == 0x1008 || s->offset == 0x1010 || s->offset == 0x1030))
+                hlog("reims: iosurface mapper: %s = %#llx (%u-byte write)",
+                     s->offset == 0x1000 ? "ring base" : s->offset == 0x1008 ? "ring size (entries)" :
+                     s->offset == 0x1010 ? "descriptor table" : "descriptor enable",
+                     (unsigned long long)s->value, s->size);
             if (s->write) rvg_iosurface_device_mmio_write(h->iosfc, s->offset, s->value);
             else v = rvg_iosurface_device_mmio_read(h->iosfc, s->offset);
         }
