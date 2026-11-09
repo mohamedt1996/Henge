@@ -8,6 +8,7 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.os.Environment;
 import android.os.IBinder;
 import android.os.PowerManager;
 
@@ -38,6 +39,52 @@ public class VmService extends Service {
         return new File(ext != null ? ext : c.getFilesDir(), "shaders");
     }
     public static File logFile(Context c) { return new File(c.getFilesDir(), "henge.log"); }
+
+    /** Where downloads are kept (restore images, the boot ROM): Henge/ on the tablet's storage when the app has
+     *  all-files access, so they outlive an uninstall; else the app's own folder, which outlives updates. */
+    public static File libraryDir(Context c) {
+        File d = sharedLibrary() != null ? sharedLibrary() : appLibrary(c);
+        d.mkdirs();
+        return d;
+    }
+    static File sharedLibrary() {
+        return android.os.Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager() ? new File(Environment.getExternalStorageDirectory(), "Henge") : null;
+    }
+    static File appLibrary(Context c) {
+        File ext = c.getExternalFilesDir("downloads");
+        return ext != null ? ext : new File(c.getFilesDir(), "downloads");
+    }
+    /** Every place a download may be, newest home first (older builds kept it inside the Mac). */
+    static List<File> imageDirs(Context c) {
+        List<File> l = new ArrayList<>();
+        if (sharedLibrary() != null) l.add(sharedLibrary());
+        l.add(appLibrary(c));
+        l.add(macDir(c));
+        return l;
+    }
+    /** A complete restore image of this release (its name holds the version, as Apple's and Henge's do). */
+    public static File findImage(Context c, String release) {
+        File best = null;
+        for (File d : imageDirs(c)) {
+            File[] f = d.listFiles((x, n) -> n.endsWith(".ipsw") && n.contains(release));
+            if (f != null) for (File x : f) if (x.length() > (1L << 30) && (best == null || x.length() > best.length())) best = x;
+        }
+        return best;
+    }
+    /** Moves downloads from older homes into the library (a rename: same storage, so instant), else leaves them. */
+    static void gatherImages(Context c) {
+        File lib = libraryDir(c);
+        for (File d : imageDirs(c)) {
+            if (d.equals(lib)) continue;
+            File[] f = d.listFiles((x, n) -> n.endsWith(".ipsw") || n.endsWith(".ipsw.part") || n.equals("AVPBooter.vmapple2.bin"));
+            if (f == null) continue;
+            for (File x : f) {
+                if (d.equals(macDir(c)) && x.getName().equals("AVPBooter.vmapple2.bin")) continue; // the Mac's own copy stays
+                File to = new File(lib, x.getName());
+                if (!to.exists()) x.renameTo(to);
+            }
+        }
+    }
     public static boolean installed(Context c) {
         return new File(macDir(c), "machine.json").exists() && new File(c.getFilesDir(), "installed").exists();
     }
@@ -56,7 +103,7 @@ public class VmService extends Service {
         PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
         wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "henge:vm");
         wake.acquire();
-        boolean deleteImage = intent.getBooleanExtra("deleteImage", true);
+        boolean deleteImage = intent.getBooleanExtra("deleteImage", false);
         String gpu = intent.getStringExtra("gpu");
         new Thread(() -> run(mode, ram, cpus, release == null ? "15.6.1" : release, deleteImage,
                 gpu == null ? "on" : gpu), "engine").start();
@@ -67,6 +114,8 @@ public class VmService extends Service {
         boolean install = "install".equals(mode);
         state = install ? "installing" : "running";
         File files = getFilesDir(), mac = macDir(this), log = logFile(this), pidFile = new File(files, "engine.pid");
+        gatherImages(this);
+        File lib = libraryDir(this), image = findImage(this, release);
         String engine = getApplicationInfo().nativeLibraryDir + "/libhengevm.so";
         List<String> cmd = new ArrayList<>();
         // sh: a bigger stack (each guest CPU keeps a large structure on it) and the engine's pid for Stop.
@@ -77,11 +126,14 @@ public class VmService extends Service {
         if (install) {
             cmd.add("--install"); cmd.add(mac.getPath());
             cmd.add("--release"); cmd.add(release);
+            if (image != null) { cmd.add("--ipsw"); cmd.add(image.getPath()); }
+            cmd.add("--cache"); cmd.add(lib.getPath());
             cmd.add("--vnc"); cmd.add("5900");
         } else {
             cmd.add("--mac"); cmd.add(mac.getPath());
             cmd.add("--vnc"); cmd.add("5900");
             cmd.add("--gpu"); cmd.add(gpu);
+            cmd.add("--cache"); cmd.add(lib.getPath()); // a missing boot ROM comes back from here
             if ("capture".equals(gpu)) { cmd.add("--shader-dir"); cmd.add(shaderDir(this).getPath()); }
         }
         cmd.add("--ram"); cmd.add(Integer.toString(ram));
@@ -107,9 +159,9 @@ public class VmService extends Service {
         }
         if (install && code == 0) {
             try { new File(files, "installed").createNewFile(); } catch (Exception ignored) { }
-            // The restore image is 17 GB; the Mac no longer needs it unless the user keeps it.
-            File[] images = deleteImage ? mac.listFiles((d, n) -> n.endsWith(".ipsw")) : null;
-            if (images != null) for (File f : images) f.delete();
+            // The restore image is 17 GB; kept by default so a reinstall needs no download.
+            File done = findImage(this, release);
+            if (deleteImage && done != null) done.delete();
         }
         // Graphics: Vulkan keeps guest RAM as a named file for the renderer, which removes the name once it
         // has it mapped; if it never attached, the file (as big as the Mac's memory) goes now.

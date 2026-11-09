@@ -12,6 +12,11 @@ The engine (arm64 JIT, MMU, vmapple devices) builds for Linux/Android arm64 and 
 - **Install on the device:** `--install FOLDER` fetches the boot ROM from Apple (under 1 MB), downloads the
   macOS restore image (resumable), and restores it with the vendored idevicerestore/usbmuxd stack
   (`android/build_restore.sh`), as the iOS app does. About 45 GB free: 17 GB image (deletable after), ~26 GB Mac.
+  `--cache DIR` keeps the image and boot ROM there: a reinstall reuses them, and a `--mac` run whose boot
+  ROM is missing restores it from there (or Apple). The app keeps downloads in Henge/ on shared storage when
+  given all-files access (outlives an uninstall), else in its own folder; Settings lists them, imports an
+  .ipsw, and runs the device check (`android/tools/device_check.sh`, root used when granted). Every build is
+  signed with `android/apk/henge-debug.keystore`, so a new APK installs over the old one and keeps the Mac.
 - **Not yet:** sound.
 
     android/build_deps.sh             # static zlib/libffi/pcre2/glib/libslirp in ~/deps/arm64

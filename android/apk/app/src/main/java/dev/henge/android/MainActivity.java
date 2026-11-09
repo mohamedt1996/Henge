@@ -12,6 +12,7 @@ import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.net.Uri;
 import android.os.StatFs;
 import android.system.Os;
 import android.text.TextUtils;
@@ -94,6 +95,7 @@ public class MainActivity extends Activity {
         root.addView(tabBar);
         setContentView(root);
         if (VmService.state.equals("installing")) tab = Tab.INSTALL;
+        if (!VmService.busy()) new Thread(() -> VmService.gatherImages(this)).start();
     }
 
     @Override protected void onResume() { super.onResume(); lastSignature = ""; ui.post(refresh); }
@@ -159,11 +161,15 @@ public class MainActivity extends Activity {
             card.addView(gap(14));
             card.addView(text("No Mac yet", 24, TEXT, true));
             card.addView(gap(6));
-            TextView t = text("Install macOS on this tablet. It downloads from Apple and installs here.", 15, DIM, false);
+            int saved = savedRelease();
+            TextView t = text(saved >= 0 ? NAMES[saved] + " is already downloaded here, so installing needs no download."
+                                         : "Install macOS on this tablet. It downloads from Apple and installs here.", 15, DIM, false);
             t.setGravity(Gravity.CENTER);
             card.addView(t);
             card.addView(gap(14));
-            card.addView(primary("Install macOS", true, v -> show(Tab.INSTALL)));
+            if (saved >= 0) card.addView(primary("Install from the saved download", !busy, v -> {
+                prefs.edit().putInt("release", saved).apply(); confirmInstall(); }));
+            else card.addView(primary("Install macOS", true, v -> show(Tab.INSTALL)));
             page.addView(card);
             return;
         }
@@ -260,7 +266,7 @@ public class MainActivity extends Activity {
         LinearLayout toggle = row();
         toggle.setPadding(dp(17), dp(14), dp(17), dp(14));
         toggle.addView(text("Delete the download after", 16, TEXT, false), new LinearLayout.LayoutParams(0, -2, 1));
-        boolean del = prefs.getBoolean("deleteAfter", true);
+        boolean del = prefs.getBoolean("deleteAfter", false);
         toggle.addView(pill(del ? "On" : "Off", del ? GOOD : FAINT));
         toggle.setOnClickListener(v -> { prefs.edit().putBoolean("deleteAfter", !del).apply(); render(true); });
         toggle.setBackground(ripple());
@@ -393,7 +399,7 @@ public class MainActivity extends Activity {
         c.addView(gap(10));
         c.addView(text(failureReason(), 15, TEXT, false));
         c.addView(gap(10));
-        c.addView(text("Downloads resume where they stopped, so trying again does not start over.", 13, DIM, false));
+        c.addView(text("Downloads are kept and resume where they stopped, so trying again does not start over.", 13, DIM, false));
         c.addView(gap(16));
         c.addView(primary("Back", true, v -> { VmService.state = "idle"; render(true); }));
         page.addView(c);
@@ -490,6 +496,9 @@ public class MainActivity extends Activity {
         c.addView(infoRow("Engine", VmService.busy() ? "Running" : VmService.state));
         page.addView(c);
 
+        downloads(page);
+        tablet(page);
+
         page.addView(heading("Log"));
         LinearLayout l = card(22);
         l.addView(logView(40));
@@ -497,6 +506,176 @@ public class MainActivity extends Activity {
         l.addView(link("Clear log", v -> { VmService.logFile(this).delete(); prefs.edit().putLong("installStart", 0).apply();
             installStart = 0; render(true); }));
         page.addView(l);
+    }
+
+    // MARK: Downloads
+
+    private static final int PICK_IMAGE = 7;
+    private static volatile String importing, importError;
+    private static volatile long importDone, importTotal;
+
+    /** The kept downloads: where they live, each one (tap to delete), and bringing in an .ipsw from elsewhere. */
+    private void downloads(LinearLayout page) {
+        page.addView(heading("Downloads"));
+        LinearLayout c = card(22);
+        c.setPadding(0, 0, 0, 0);
+        File lib = VmService.libraryDir(this);
+        boolean shared = VmService.sharedLibrary() != null;
+        c.addView(infoRow("Kept in", shared ? "Henge/ on this tablet" : "the app's folder"));
+        TextView where = text(shared ? "Outlives uninstalling Henge. Put an .ipsw here yourself and Henge uses it."
+                : "Kept across updates, but uninstalling Henge deletes it. Allow all-files access to keep it in Henge/ on "
+                + "the tablet's storage instead.", 13, DIM, false);
+        where.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(where);
+        if (!shared && android.os.Build.VERSION.SDK_INT >= 30) {
+            c.addView(hairline());
+            LinearLayout r = row();
+            r.setPadding(dp(17), dp(14), dp(17), dp(14));
+            r.addView(text("Keep after uninstall", 16, ACCENT_LIGHT, false), new LinearLayout.LayoutParams(0, -2, 1));
+            r.setBackground(ripple());
+            r.setOnClickListener(v -> {
+                try {
+                    startActivity(new Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                            Uri.parse("package:" + getPackageName())));
+                } catch (Exception e) {
+                    startActivity(new Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+                }
+            });
+            c.addView(r);
+        }
+        java.util.List<File> found = new java.util.ArrayList<>();
+        for (File d : VmService.imageDirs(this)) {
+            File[] f = d.listFiles((x, n) -> n.endsWith(".ipsw") || n.endsWith(".ipsw.part")
+                    || (!d.equals(VmService.macDir(this)) && n.equals("AVPBooter.vmapple2.bin")));
+            if (f != null) found.addAll(java.util.Arrays.asList(f));
+        }
+        for (File f : found) {
+            c.addView(hairline());
+            LinearLayout r = row();
+            r.setPadding(dp(17), dp(12), dp(17), dp(12));
+            String n = f.getName();
+            String label = n.endsWith(".part") ? n.replace(".ipsw.part", "") + " (unfinished: resumes on Install)"
+                    : n.equals("AVPBooter.vmapple2.bin") ? "Boot ROM" : n;
+            TextView name = text(label, 15, TEXT, false);
+            name.setSingleLine(true);
+            name.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+            r.addView(name, new LinearLayout.LayoutParams(0, -2, 1));
+            r.addView(text(bytes(f.length()), 14, DIM, false));
+            r.setBackground(ripple());
+            r.setOnClickListener(v -> new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                    .setTitle("Delete " + label + "?")
+                    .setMessage("Installing again will download it again.")
+                    .setPositiveButton("Delete", (d, w) -> { f.delete(); render(true); })
+                    .setNegativeButton("Cancel", null).show());
+            c.addView(r);
+        }
+        c.addView(hairline());
+        if (importing != null) {
+            LinearLayout r = column();
+            r.setPadding(dp(17), dp(12), dp(17), dp(12));
+            r.addView(text("Copying " + importing + " · " + bytes(importDone) + " of " + bytes(importTotal), 14, TEXT, false));
+            r.addView(gap(8));
+            r.addView(bar(importTotal > 0 ? importDone / (double) importTotal : 0, 7));
+            c.addView(r);
+        } else {
+            LinearLayout r = row();
+            r.setPadding(dp(17), dp(14), dp(17), dp(14));
+            r.addView(text("Add a restore image (.ipsw)…", 16, ACCENT_LIGHT, false), new LinearLayout.LayoutParams(0, -2, 1));
+            r.setBackground(ripple());
+            r.setOnClickListener(v -> {
+                Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                i.addCategory(Intent.CATEGORY_OPENABLE);
+                i.setType("*/*");
+                startActivityForResult(i, PICK_IMAGE);
+            });
+            c.addView(r);
+            if (importError != null) {
+                TextView e = text(importError, 13, BAD, false);
+                e.setPadding(dp(17), 0, dp(17), dp(12));
+                c.addView(e);
+            }
+        }
+        page.addView(c);
+    }
+
+    @Override
+    protected void onActivityResult(int request, int result, Intent data) {
+        super.onActivityResult(request, result, data);
+        if (request != PICK_IMAGE || result != RESULT_OK || data == null || data.getData() == null) return;
+        Uri uri = data.getData();
+        String name = displayName(uri);
+        int rel = -1;
+        for (int i = 0; i < RELEASES.length; i++) if (name.contains(RELEASES[i])) rel = i;
+        if (!name.toLowerCase(java.util.Locale.US).endsWith(".ipsw")) { importError = name + " is not an .ipsw."; render(true); return; }
+        if (rel < 0) rel = releaseIndex(); // a name without the version: taken as the chosen release
+        File to = new File(VmService.libraryDir(this), RELEASES[rel] + ".ipsw"), part = new File(to.getPath() + ".import");
+        importing = name; importError = null; importDone = 0; importTotal = 0;
+        render(true);
+        new Thread(() -> {
+            try (android.os.ParcelFileDescriptor pfd = getContentResolver().openFileDescriptor(uri, "r");
+                 java.io.FileInputStream in = new java.io.FileInputStream(pfd.getFileDescriptor());
+                 java.io.FileOutputStream out = new java.io.FileOutputStream(part)) {
+                importTotal = pfd.getStatSize();
+                in.getChannel().transferTo(0, Long.MAX_VALUE, out.getChannel()); // progress: the copy's size, polled
+            } catch (Exception e) {
+                importError = "Could not copy it: " + e.getMessage();
+            }
+            if (importError == null && !part.renameTo(to)) importError = "Could not save it in " + to.getParent();
+            part.delete();
+            importing = null;
+        }, "import").start();
+        ui.post(importProgress = () -> {
+            importDone = part.length();
+            if (importing != null) ui.postDelayed(importProgress, 500);
+        });
+    }
+    private Runnable importProgress;
+
+    private String displayName(Uri uri) {
+        try (android.database.Cursor q = getContentResolver().query(uri, new String[]{android.provider.OpenableColumns.DISPLAY_NAME},
+                null, null, null)) {
+            if (q != null && q.moveToFirst()) return q.getString(0);
+        } catch (Exception ignored) { }
+        String p = uri.getLastPathSegment();
+        return p == null ? "image.ipsw" : p;
+    }
+
+    // MARK: This tablet
+
+    private static volatile String checkResult;
+    private static volatile boolean checking;
+
+    /** The device check, run on demand: root (if granted) reads the hypervisor devices and kernel settings. */
+    private void tablet(LinearLayout page) {
+        page.addView(heading("This tablet"));
+        LinearLayout c = card(22);
+        if (checkResult != null) {
+            TextView t = text(checkResult.trim(), 11, DIM, false, Typeface.MONOSPACE);
+            t.setTextIsSelectable(true);
+            c.addView(t);
+            c.addView(gap(10));
+            c.addView(link("Copy", v -> {
+                getSystemService(android.content.ClipboardManager.class)
+                        .setPrimaryClip(android.content.ClipData.newPlainText("Henge device check", checkResult));
+                android.widget.Toast.makeText(this, "Copied", android.widget.Toast.LENGTH_SHORT).show();
+            }));
+            c.addView(gap(10));
+        }
+        c.addView(secondary(checking ? "Checking…" : checkResult == null ? "Check this tablet" : "Check again", ACCENT_LIGHT, v -> {
+            if (checking) return;
+            checking = true;
+            render(true);
+            new Thread(() -> {
+                String r = DeviceCheck.run(getApplicationContext());
+                checkResult = r;
+                checking = false;
+            }, "device-check").start();
+        }));
+        TextView note = text("Asks for root (su) to read the hypervisor devices; saved to Android/data/dev.henge.android/files/device-check.txt.",
+                13, DIM, false);
+        note.setPadding(0, dp(10), 0, 0);
+        c.addView(note);
+        page.addView(c);
     }
 
     // MARK: Engine
@@ -507,7 +686,7 @@ public class MainActivity extends Activity {
         i.putExtra(VmService.EXTRA_RAM, ramMb());
         i.putExtra(VmService.EXTRA_CPUS, cpus());
         i.putExtra(VmService.EXTRA_RELEASE, RELEASES[releaseIndex()]);
-        i.putExtra("deleteImage", prefs.getBoolean("deleteAfter", true));
+        i.putExtra("deleteImage", prefs.getBoolean("deleteAfter", false));
         i.putExtra("gpu", gpuMode());
         if ("install".equals(mode)) prefs.edit().putInt("installedRelease", releaseIndex()).apply();
         startForegroundService(i);
@@ -531,11 +710,14 @@ public class MainActivity extends Activity {
         return mi.totalMem >> 20;
     }
     private long imageSize(int i) {
-        File[] f = VmService.macDir(this).listFiles((d, n) -> n.endsWith(".ipsw") && n.contains(RELEASES[i]));
-        if (f == null) return 0;
-        long s = 0;
-        for (File x : f) s = Math.max(s, x.length());
-        return s;
+        File f = VmService.findImage(this, RELEASES[i]);
+        return f == null ? 0 : f.length();
+    }
+    /** The release whose download is here (the chosen one first), or -1. */
+    private int savedRelease() {
+        if (imageSize(releaseIndex()) > 0) return releaseIndex();
+        for (int i = 0; i < RELEASES.length; i++) if (imageSize(i) > 0) return i;
+        return -1;
     }
     private static long allocated(File f) {
         try { return Os.stat(f.getPath()).st_blocks * 512; } catch (Exception e) { return 0; }
@@ -666,8 +848,8 @@ public class MainActivity extends Activity {
             "Experiment: no GPU device, so macOS may fall back to a plain framebuffer and show a slow desktop.",
             "Saves every shader and pipeline macOS uses to Android/data/dev.henge.android/files/shaders, "
                     + "the inventory for the Vulkan renderer. Copy it to a computer over USB.",
-            "Experimental: the app's Vulkan renderer shows the screen. So far it does clears, copies and the pointer, "
-                    + "not draws, and translates macOS's shaders on the tablet into Android/data/dev.henge.android/files/spirv."};
+            "Experimental: the app's Vulkan renderer shows the screen and draws on the GPU, translating macOS's shaders "
+                    + "on the tablet into Android/data/dev.henge.android/files/spirv. Blending and some draws are still guesses."};
 
     private String gpuMode() { return prefs.getString("gpu", "on"); }
 

@@ -17,7 +17,7 @@ static void curl_global_init_all(void) { curl_global_init(CURL_GLOBAL_ALL); }
 
 static void usage(void) {
     fprintf(stderr,
-            "usage: hengevm-android --install FOLDER [--release 15.6.1] [--ipsw FILE] [--disk-gb 64] [--rom FILE] [--ram MB] [--cpus N]\n"
+            "usage: hengevm-android --install FOLDER [--release 15.6.1] [--ipsw FILE] [--disk-gb 64] [--rom FILE] [--cache DIR] [--ram MB] [--cpus N]\n"
             "   or: hengevm-android --mac FOLDER (exported from Henge on iOS) [options]\n"
             "   or: hengevm-android --rom AVPBooter.vmapple2.bin --disk Disk.img --aux AuxiliaryStorage\n"
             "                       --ecid N --seed N [--ram MB (4096)] [--cpus N (2)] [--log 0-3] [--jit-mb MB] [--net 0|1]\n"
@@ -57,6 +57,22 @@ static void load_mac(HvVmConfig *vc, const char *dir) {
     fprintf(stderr, "hengevm: %s: ECID %llu, %llu MB\n", dir, (unsigned long long)vc->ecid, (unsigned long long)vc->ram_mb);
 }
 
+/* The boot ROM at path, from the download cache when it holds a genuine one, else from Apple; the
+   cache keeps a copy so the next install or run needs no network. */
+static int ensure_rom(const char *path, const char *cache) {
+    char cached[1100], cmd[2400];
+    if (cache) {
+        snprintf(cached, sizeof cached, "%s/AVPBooter.vmapple2.bin", cache);
+        if (hv_fetch_boot_rom(cached) != 0) return -1;
+        if (strcmp(cached, path)) {
+            snprintf(cmd, sizeof cmd, "cp '%s' '%s'", cached, path);
+            if (system(cmd) != 0) return -1;
+        }
+        return 0;
+    }
+    return hv_fetch_boot_rom(path);
+}
+
 static volatile int install_done = -2;
 static void on_install(int step, double p, void *user) {
     (void)user;
@@ -86,7 +102,7 @@ static void on_signal(int sig) {
 int main(int argc, char **argv) {
     int vnc_port = 5900;
     const char *gpu = "on", *shader_dir = NULL;
-    const char *install_dir = NULL, *release = "15.6.1", *ipsw = NULL;
+    const char *install_dir = NULL, *release = "15.6.1", *ipsw = NULL, *cache = NULL;
     uint64_t disk_gb = 64;
     HvVmConfig vc = {.aux_offset = 16384, .ram_mb = 4096, .ncpus = 2, .log = 1, .no_net = 0, .no_sound = 1};
     for (int i = 1; i < argc; i++) {
@@ -95,6 +111,7 @@ int main(int argc, char **argv) {
         if (!strcmp(a, "--install")) install_dir = v;
         else if (!strcmp(a, "--release")) release = v;
         else if (!strcmp(a, "--ipsw")) ipsw = v;
+        else if (!strcmp(a, "--cache")) cache = v;
         else if (!strcmp(a, "--disk-gb")) disk_gb = strtoull(v, NULL, 0);
         else if (!strcmp(a, "--mac")) load_mac(&vc, v);
         else if (!strcmp(a, "--rom")) vc.rom = v;
@@ -135,11 +152,15 @@ int main(int argc, char **argv) {
             char cmd[2300];
             snprintf(cmd, sizeof cmd, "cp '%s' '%s'", vc.rom, rom_path);
             if (strcmp(vc.rom, rom_path) && system(cmd) != 0) return 1;
-        } else if (hv_fetch_boot_rom(rom_path) != 0) {
+        } else if (ensure_rom(rom_path, cache) != 0) {
             return 1;
         }
         if (!ipsw) {
-            snprintf(ipsw_path, sizeof ipsw_path, "%s/%s.ipsw", install_dir, r->id);
+            /* In the cache when given, so a reinstall (or a new Mac) reuses the download. */
+            snprintf(ipsw_path, sizeof ipsw_path, "%s/%s.ipsw", cache ? cache : install_dir, r->id);
+            struct stat have;
+            if (stat(ipsw_path, &have) == 0 && have.st_size > 0)
+                fprintf(stderr, "henge: using the saved %s (%s)\n", r->name, ipsw_path);
             fprintf(stderr, "henge: %s\n", r->name);
             if (hv_download(r->url, ipsw_path) != 0) {
                 fprintf(stderr, "henge: download failed; run again to resume\n");
@@ -155,6 +176,11 @@ int main(int argc, char **argv) {
         mkdir(work, 0755);
     }
     if (!vc.rom || !vc.disk || !vc.aux) usage();
+    if (!install_dir && access(vc.rom, R_OK) != 0) { /* a Mac whose boot ROM went missing: put it back */
+        curl_global_init_all();
+        fprintf(stderr, "henge: %s is missing; restoring it\n", vc.rom);
+        if (ensure_rom(vc.rom, cache) != 0) return 1;
+    }
     if (!strcmp(gpu, "off")) {
         setenv("HV_NO_GPU", "1", 1);
         fprintf(stderr, "hengevm: GPU off (experiment)\n");
