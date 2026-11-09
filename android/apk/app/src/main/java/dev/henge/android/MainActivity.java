@@ -981,8 +981,8 @@ public class MainActivity extends Activity {
             + "|psci 0x.*"                                         // PSCI calls (HV_PSCI_LOG)
             + "|.*<Debug>.*"                                       // the restore tools' debug lines
             + "|\\s*<(?:\\?xml|!DOCTYPE|/?(?:plist|dict|key|string|integer|data|array|true|false|real|date)\\b).*" // plist dumps
-            + "|henge: guest \\d+ s:.*"                            // the install heartbeat
-            + "|gunyah: \\d+ device accesses.*"
+            + "|henge: guest \\d+ s:.*"                            // the 30 s heartbeat (installs and boots)
+            + "|gunyah: (?:\\d+ )?device accesses.*"
             + "|hengevm: (?:read of|write to) implementation-defined.*"
             + "|hengevm: unknown hypervisor call.*"
             + "|mmio (?:read|write) .*"

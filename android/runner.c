@@ -91,7 +91,7 @@ static void *install_watchdog(void *arg) {
     fflush(stdout);
     _exit(1);
 }
-/* While installing: every 30 s, where each guest CPU is and who owns the USB port. A boot that gives no serial
+/* Every 30 s (installing or booting), where each guest CPU is and who owns the USB port. A boot that gives no serial
    output still shows here whether the kernel runs (EL1 PCs at 0xfffffe..., blocks climbing), spins in one place,
    sleeps (blocks flat), stopped (halted), and whether its USB driver ever touched the port. */
 static int heartbeat_no_cpus; /* Gunyah runs the CPU: its state is not ours to read */
@@ -306,7 +306,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     heartbeat_no_cpus = gunyah;
-    if (install_dir) {
+    { /* installs and normal boots alike: a still screen says nothing about whether the CPUs still run */
         pthread_t hb;
         if (pthread_create(&hb, NULL, install_heartbeat, NULL) == 0) pthread_detach(hb);
     }
