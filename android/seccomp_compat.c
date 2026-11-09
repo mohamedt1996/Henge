@@ -40,7 +40,19 @@ static void on_sigsys(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = ctx;
 #if defined(__aarch64__)
     /* The kernel has already moved the PC past the svc; only the result is ours to set. */
-    uc->uc_mcontext.regs[0] = (unsigned long long)(long long)-ENOSYS;
+    unsigned long long *r = uc->uc_mcontext.regs;
+    if (si->si_syscall == 202 /* __NR_accept */) {
+        /* bionic only uses accept4, so the filter traps plain accept; glibc's accept has no fallback
+           (usbmuxd died on it: the restore OS was never seen). Same call, flags 0. */
+        long ret;
+        register long x0 __asm__("x0") = (long)r[0], x1 __asm__("x1") = (long)r[1], x2 __asm__("x2") = (long)r[2],
+                      x3 __asm__("x3") = 0, x8 __asm__("x8") = 242 /* __NR_accept4 */;
+        __asm__ volatile("svc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3), "r"(x8) : "memory");
+        ret = x0;
+        r[0] = (unsigned long long)ret;
+        return;
+    }
+    r[0] = (unsigned long long)(long long)-ENOSYS;
 #elif defined(__x86_64__)
     uc->uc_mcontext.gregs[REG_RAX] = -ENOSYS;
 #endif
