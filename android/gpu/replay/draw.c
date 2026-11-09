@@ -16,6 +16,30 @@
 
 #include "replay.h"
 
+/* Vulkan 1.2/1.3 entry points: Android's libvulkan exports only 1.0/1.1 at minSdk 29. */
+static PFN_vkCmdBeginRendering p_vkCmdBeginRendering;
+#define vkCmdBeginRendering p_vkCmdBeginRendering
+static PFN_vkCmdEndRendering p_vkCmdEndRendering;
+#define vkCmdEndRendering p_vkCmdEndRendering
+static PFN_vkCmdSetCullMode p_vkCmdSetCullMode;
+#define vkCmdSetCullMode p_vkCmdSetCullMode
+static PFN_vkCmdSetDepthCompareOp p_vkCmdSetDepthCompareOp;
+#define vkCmdSetDepthCompareOp p_vkCmdSetDepthCompareOp
+static PFN_vkCmdSetDepthTestEnable p_vkCmdSetDepthTestEnable;
+#define vkCmdSetDepthTestEnable p_vkCmdSetDepthTestEnable
+static PFN_vkCmdSetDepthWriteEnable p_vkCmdSetDepthWriteEnable;
+#define vkCmdSetDepthWriteEnable p_vkCmdSetDepthWriteEnable
+static PFN_vkCmdSetFrontFace p_vkCmdSetFrontFace;
+#define vkCmdSetFrontFace p_vkCmdSetFrontFace
+static PFN_vkCmdSetPrimitiveTopology p_vkCmdSetPrimitiveTopology;
+#define vkCmdSetPrimitiveTopology p_vkCmdSetPrimitiveTopology
+static PFN_vkCmdSetStencilOp p_vkCmdSetStencilOp;
+#define vkCmdSetStencilOp p_vkCmdSetStencilOp
+static PFN_vkCmdSetStencilTestEnable p_vkCmdSetStencilTestEnable;
+#define vkCmdSetStencilTestEnable p_vkCmdSetStencilTestEnable
+static PFN_vkGetBufferDeviceAddress p_vkGetBufferDeviceAddress;
+#define vkGetBufferDeviceAddress p_vkGetBufferDeviceAddress
+
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -224,6 +248,18 @@ Gpu *gpu_create(Objects *os, Shaders *shaders) {
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, family, 1, &prio};
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &want, 0, 1, &qci, 0, NULL, 0, NULL, NULL};
     if (vkCreateDevice(g->phys, &dci, NULL, &g->dev) != VK_SUCCESS) goto fail;
+    p_vkCmdBeginRendering = (PFN_vkCmdBeginRendering)vkGetDeviceProcAddr(g->dev, "vkCmdBeginRendering");
+    p_vkCmdEndRendering = (PFN_vkCmdEndRendering)vkGetDeviceProcAddr(g->dev, "vkCmdEndRendering");
+    p_vkCmdSetCullMode = (PFN_vkCmdSetCullMode)vkGetDeviceProcAddr(g->dev, "vkCmdSetCullMode");
+    p_vkCmdSetDepthCompareOp = (PFN_vkCmdSetDepthCompareOp)vkGetDeviceProcAddr(g->dev, "vkCmdSetDepthCompareOp");
+    p_vkCmdSetDepthTestEnable = (PFN_vkCmdSetDepthTestEnable)vkGetDeviceProcAddr(g->dev, "vkCmdSetDepthTestEnable");
+    p_vkCmdSetDepthWriteEnable = (PFN_vkCmdSetDepthWriteEnable)vkGetDeviceProcAddr(g->dev, "vkCmdSetDepthWriteEnable");
+    p_vkCmdSetFrontFace = (PFN_vkCmdSetFrontFace)vkGetDeviceProcAddr(g->dev, "vkCmdSetFrontFace");
+    p_vkCmdSetPrimitiveTopology = (PFN_vkCmdSetPrimitiveTopology)vkGetDeviceProcAddr(g->dev, "vkCmdSetPrimitiveTopology");
+    p_vkCmdSetStencilOp = (PFN_vkCmdSetStencilOp)vkGetDeviceProcAddr(g->dev, "vkCmdSetStencilOp");
+    p_vkCmdSetStencilTestEnable = (PFN_vkCmdSetStencilTestEnable)vkGetDeviceProcAddr(g->dev, "vkCmdSetStencilTestEnable");
+    p_vkGetBufferDeviceAddress = (PFN_vkGetBufferDeviceAddress)vkGetDeviceProcAddr(g->dev, "vkGetBufferDeviceAddress");
+    if (!p_vkCmdBeginRendering || !p_vkGetBufferDeviceAddress || !p_vkCmdSetStencilOp) goto fail;
     vkGetDeviceQueue(g->dev, family, 0, &g->queue);
     vkGetPhysicalDeviceMemoryProperties(g->phys, &g->mem);
     VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, family};
