@@ -60,6 +60,39 @@ EDITS = {
     }
 '''),
     ],
+    # Raster order groups (`[[raster_order_group]]`, a fragment function whose body runs in the
+    # fragment interlock): a device with no interlock runs the body unordered on Android instead of
+    # refusing the pipeline (WindowServer's second refused pipeline on the tablet: "Unsupported {
+    # feature: RasterOrderGroups, needs: FragmentShaderPixelInterlock }"). The same bet as the fetch:
+    # a tiler shades one pixel's fragments in order in practice. Imageblocks share the section, so
+    # the same `None` covers them; a non-fragment stage's refusal stands.
+    'crates/metal2vulkan/src/lower/fragment/mod.rs': [
+        ('''    let interlock =
+        if rog::declared(cx.entry) || cx.families.fragment.imageblock.is_some() || storage {
+            Some(rog::mode(cx)?)
+        } else {
+            None
+        };
+''', '''    let interlock =
+        if rog::declared(cx.entry) || cx.families.fragment.imageblock.is_some() || storage {
+            // Henge's Android port: no interlock on the device, no critical section, unordered
+            // (m2v_unordered_fetch.py).
+            let mode = rog::mode(cx);
+            let no_interlock = {
+                let f = cx.profile.fields().fragment;
+                !f.pixel_interlock && !f.sample_interlock
+            };
+            match mode {
+                Err(_) if cfg!(target_os = "android") && cx.stage == Stage::Fragment && no_interlock => {
+                    None
+                }
+                other => Some(other?),
+            }
+        } else {
+            None
+        };
+'''),
+    ],
     # The runtime's two flags, only where the extension is enabled.
     'crates/metal2vulkan-runtime/src/pipeline/graphics.rs': [
         ('''        let blend_flags = match key.pass.fetch_inputs {

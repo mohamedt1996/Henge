@@ -78,7 +78,13 @@ Sixth run: no `fatal`; a plain SIGSEGV in native code two minutes in, after the 
 through (797 interrupts, 2 presents). The stage says only "running", so this build adds a backtrace
 to the crash handler (`_Unwind_Backtrace` + `dladdr`: library and offset per frame, the fault
 address) and, at the next start, Android's own record of the last death with its tombstone
-(`ApplicationExitInfo`, Android 12+). What to expect next, in order:
+(`ApplicationExitInfo`, Android 12+).
+
+Seventh run: no segfault this time; 114 presents, 2669 interrupts, then WindowServer's next
+pipeline was refused: `Unsupported { feature: RasterOrderGroups, needs: FragmentShaderPixelInterlock }`.
+`[[raster_order_group]]` runs a fragment function's body in the fragment interlock, which Qualcomm's
+driver lacks; on Android the body now runs without the critical section (the same tiler bet as the
+fetch; `m2v_unordered_fetch.py`). What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
   `reims` lines in `adb logcat -s henge-gpu`, and a `reims-vgpu: fatal` line ends the app's process;
