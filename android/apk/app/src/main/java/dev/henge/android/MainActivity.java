@@ -50,7 +50,7 @@ public class MainActivity extends Activity {
     static final String[] STEP_NAMES = {"detecting", "preparing", "sending the system", "verifying",
             "flashing firmware", "flashing", "updating", "finishing"};
 
-    enum Tab { MACS, INSTALL, SETTINGS }
+    enum Tab { MACS, INSTALL, VNC, SETTINGS }
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private SharedPreferences prefs;
@@ -93,6 +93,7 @@ public class MainActivity extends Activity {
         tabBar.setPadding(0, dp(6), 0, dp(6));
         tabBar.addView(tabButton("▭", "Macs", Tab.MACS), new LinearLayout.LayoutParams(0, -2, 1));
         tabBar.addView(tabButton("↓", "Install", Tab.INSTALL), new LinearLayout.LayoutParams(0, -2, 1));
+        tabBar.addView(tabButton("▣", "VNC", Tab.VNC), new LinearLayout.LayoutParams(0, -2, 1));
         tabBar.addView(tabButton("⚙", "Settings", Tab.SETTINGS), new LinearLayout.LayoutParams(0, -2, 1));
         root.addView(tabBar);
         setContentView(root);
@@ -101,7 +102,39 @@ public class MainActivity extends Activity {
     }
 
     @Override protected void onResume() { super.onResume(); lastSignature = ""; ui.post(refresh); }
-    @Override protected void onPause() { super.onPause(); ui.removeCallbacks(refresh); }
+    @Override protected void onPause() { super.onPause(); ui.removeCallbacks(refresh); vncOff(); }
+
+    // MARK: VNC
+
+    /** The engine's screen (127.0.0.1:5900) inside the app, also while macOS installs: one view, kept across
+     *  page rebuilds, connected only while this tab shows. */
+    private ScreenActivity.RfbView vnc;
+    private boolean vncConnected;
+
+    private void vncOff() {
+        if (vnc != null && vncConnected) { vnc.disconnect(); vncConnected = false; }
+    }
+
+    private View vncPage() {
+        if (vnc == null) vnc = new ScreenActivity.RfbView(this);
+        if (vnc.getParent() != null) ((android.view.ViewGroup) vnc.getParent()).removeView(vnc);
+        if (!vncConnected) { vnc.connect(); vncConnected = true; }
+        LinearLayout page = column();
+        page.setPadding(dp(12), dp(4), dp(12), dp(10));
+        FrameLayout frame = new FrameLayout(this);
+        frame.setBackgroundColor(0xff000000);
+        frame.addView(vnc, new FrameLayout.LayoutParams(-1, -1));
+        page.addView(frame, new LinearLayout.LayoutParams(-1, 0, 1));
+        page.addView(gap(8));
+        TextView note = text(VmService.busy()
+                ? (installing() ? "The installing Mac's screen. Tap clicks, drag moves, two fingers scroll."
+                                : "The Mac's screen. Tap clicks, drag moves, two fingers scroll.")
+                : "Nothing is running. Start a Mac or an install and its screen shows here.", 13, DIM, false);
+        page.addView(note);
+        page.addView(gap(6));
+        page.addView(link("Full screen with keyboard", v -> startActivity(new Intent(this, ScreenActivity.class))));
+        return page;
+    }
 
     private final Runnable refresh = new Runnable() {
         @Override public void run() {
@@ -127,6 +160,13 @@ public class MainActivity extends Activity {
             LinearLayout b = (LinearLayout) tabBar.getChildAt(i);
             for (int j = 0; j < b.getChildCount(); j++) ((TextView) b.getChildAt(j)).setTextColor(on ? ACCENT_LIGHT : FAINT);
         }
+        if (tab == Tab.VNC) { /* no scrolling: drags go to the Mac */
+            title.setText("VNC");
+            content.removeAllViews();
+            content.addView(vncPage());
+            return;
+        }
+        vncOff();
         LinearLayout page = column();
         page.setPadding(dp(16), dp(4), dp(16), dp(24));
         switch (tab) {
