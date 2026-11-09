@@ -263,8 +263,15 @@ static void *beat_loop(void *arg) {
 /* ------------------------------------------------------------------ bring-up -- */
 static int bring_up(Host *h) {
     HvReimsHeader *x = h->h;
-    h->ram_fd = open(x->ram_file, O_RDWR | O_CLOEXEC);
-    if (h->ram_fd < 0) { hlog("reims: guest RAM %s: %s", x->ram_file, strerror(errno)); return -1; }
+    /* The engine may still be handing the RAM file over (owner, SELinux label): retry for 30 s, not once. */
+    for (int i = 0; !h->stop; i++) {
+        h->ram_fd = open(x->ram_file, O_RDWR | O_CLOEXEC);
+        if (h->ram_fd >= 0) break;
+        if (i == 0 || i == 300) hlog("reims: guest RAM %s: %s%s", x->ram_file, strerror(errno), i ? "; giving up" : "; retrying");
+        if (i == 300) return -1;
+        usleep(100000);
+    }
+    if (h->ram_fd < 0) return -1;
     h->ram_pa = x->ram_pa, h->ram_size = x->ram_size;
     h->ram = mmap(NULL, h->ram_size, PROT_READ | PROT_WRITE, MAP_SHARED, h->ram_fd, 0);
     if (h->ram == MAP_FAILED) { h->ram = NULL; hlog("reims: mapping guest RAM: %s", strerror(errno)); return -1; }

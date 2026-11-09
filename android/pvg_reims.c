@@ -54,13 +54,21 @@ static int app_alive(void) {
 /* Until the app's device exists the GPU cannot answer, and macOS's driver must not see a dead device:
    the first access waits for it (the app starts the renderer with the VM). */
 static int wait_for_app(void) {
-    static int announced;
+    static int announced, given_up;
+    /* Once the app has failed to come up, each later access looks only briefly: 60 s per register access
+       froze the guest outright (the heartbeat's "+0"). */
+    unsigned limit = given_up ? 5 : 600;
     for (unsigned i = 0; !app_alive(); i++) {
         if (!announced++) fprintf(stderr, "hengevm: reims: waiting for the app's GPU (open the Mac's screen)\n");
-        if (i > 600) return -1; /* 60 s */
+        if (i > limit) {
+            if (!given_up++) fprintf(stderr, "hengevm: reims: the app's GPU never came up (see its \"reims:\" lines above); "
+                                            "use Graphics GPU or Vulkan until it does\n");
+            return -1;
+        }
         usleep(100000);
     }
-    if (announced == 1) fprintf(stderr, "hengevm: reims: the app's GPU is there\n"), announced = 2;
+    if (announced && announced != -1) fprintf(stderr, "hengevm: reims: the app's GPU is there\n"), announced = -1;
+    given_up = 0;
     return 0;
 }
 
@@ -133,6 +141,9 @@ int hv_pvg_external_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_t i
         fprintf(stderr, "hengevm: reims: guest RAM is not a file the app can map; GPU off\n");
         return 0;
     }
+    /* The app opens guest RAM the moment it sees the magic below: give it the RAM file first. runner.c shares
+       it only after hv_vm_create returns, by which time the app had already hit EACCES and given up. */
+    hv_android_share_with_app(file);
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (fd >= 0) hv_android_share_with_app(path);
     if (fd < 0 || ftruncate(fd, HV_REIMS_FILE_BYTES) != 0) {
