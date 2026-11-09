@@ -62,6 +62,17 @@ def main() -> None:
     # The window's frame sink on the Vulkan platform implements the stub's trait as Linux's.
     sink = reims / 'crates' / 'reims-vgpu' / 'src' / 'window' / 'vulkan.rs'
     total += widen(sink)
+    # The shader cache ($HOME/.cache/reims-vgpu-vulkan, HOME being the folder the app gives host.c) may hold
+    # 25 GiB by default, on a tablet whose storage the Mac's disk already fills: 4 GiB here. The whole
+    # constant is matched so a changed upstream stops the build instead of silently keeping 25 GiB.
+    platform = reims / 'crates' / 'reims-vgpu-vulkan' / 'src' / 'platform.rs'
+    t = platform.read_text()
+    old = 'const SHADER_CACHE_CAPACITY: u64 = rt::DEFAULT_CAPACITY;'
+    new = 'const SHADER_CACHE_CAPACITY: u64 = 4 << 30; // Henge\'s Android port: 4 GiB, not 25'
+    if new not in t:
+        if t.count(old) != 1:
+            sys.exit(f'android_port: {platform}: SHADER_CACHE_CAPACITY not found once; upstream changed')
+        platform.write_text(t.replace(old, new))
     print(f'android_port: {total} Linux-only places now take Android')
 
 

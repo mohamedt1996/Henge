@@ -5,8 +5,10 @@
 
 typedef struct Replay Replay;
 
-/* Waits for the engine's file at path (gpu.reims next to the disk) and brings reims-vgpu up on it. */
-int reims_host_start(const char *path, const char *log_path);
+/* Waits for the engine's file at path (gpu.reims next to the disk) and brings reims-vgpu up on it. home is a
+   writable folder of the app's that becomes the process's HOME: metal2vulkan keeps its shader cache in
+   $HOME/.cache and refuses to make a device without one (NULL: keep the process's HOME, if any). */
+int reims_host_start(const char *path, const char *log_path, const char *home);
 void reims_host_stop(void);
 int reims_host_running(void);
 /* The screen frames go to (NULL: none; frames are then not drawn). */

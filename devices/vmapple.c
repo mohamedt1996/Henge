@@ -52,13 +52,26 @@ static void pvpanic_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
         size_t n = 0;
         while (p + n < end && n < 3000 && (p[n] == '\n' || p[n] == '\t' || (p[n] >= 32 && p[n] < 127))) n++;
         if (n > 80) {
-            /* The log goes on past NULs (backtrace, kexts): print what reads as text. */
+            /* The log goes on past NULs (backtrace, kexts): print what reads as text, run by run. Runs
+               shorter than a dozen characters are the memory beyond the log, whose stray printable bytes
+               showed in the app's Log as lines of "/9// //9/": they count as gap, not text, and 512 bytes
+               of gap end the dump. */
             char out[6001];
-            size_t k = 0;
-            for (size_t i = 0; i < 6000 && p + i < end && k < 6000; i++) {
-                uint8_t c = p[i];
-                if (c == '\n' || c == '\t' || (c >= 32 && c < 127)) out[k++] = (char)c;
-                else if (c == 0 && k && out[k - 1] != '\n') out[k++] = '\n';
+            size_t k = 0, gap = 0;
+            for (size_t i = 0; i < 6000 && p + i < end && k < 6000;) {
+                size_t run = 0;
+                while (p + i + run < end && i + run < 6000 &&
+                       (p[i + run] == '\n' || p[i + run] == '\t' || (p[i + run] >= 32 && p[i + run] < 127))) run++;
+                if (run == 0 || (i && run < 12)) {
+                    gap += run ? run : 1;
+                    if (gap > 512) break;
+                    i += run ? run : 1;
+                    continue;
+                }
+                if (k && out[k - 1] != '\n') out[k++] = '\n';
+                size_t take = run < 6000 - k ? run : 6000 - k;
+                memcpy(out + k, p + i, take), k += take;
+                i += run, gap = 0;
             }
             out[k] = 0;
             fprintf(stderr, "hengevm: panic text at PA %llx:\n%s\n", (unsigned long long)(VMAPPLE_MEM + (uint64_t)(p - b->ram)), out);

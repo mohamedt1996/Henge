@@ -52,7 +52,11 @@ public class GpuView extends SurfaceView implements SurfaceHolder.Callback {
     static native long nativeStart(String linkPath, String air2spvPath, String cacheDir);
     static native void nativeSurface(long handle, Object surface);
     static native void nativeStop(long handle);
-    /** Graphics: reims: the paravirtual GPU device itself (reims-vgpu), for the VM VmService runs. */
-    static native boolean nativeReimsStart(String reimsPath, String logPath);
+    /**
+     * Graphics: reims: the paravirtual GPU device itself (reims-vgpu), for the VM VmService runs. homeDir is a
+     * folder of the app's that becomes the process's HOME: metal2vulkan keeps its translated shaders in
+     * $HOME/.cache and refuses to make a device without one (an app process has no HOME of its own).
+     */
+    static native boolean nativeReimsStart(String reimsPath, String logPath, String homeDir);
     static native void nativeReimsStop();
 }

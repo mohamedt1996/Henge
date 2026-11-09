@@ -39,6 +39,12 @@ public class VmService extends Service {
         return new File(ext != null ? ext : c.getFilesDir(), "shaders");
     }
     public static File logFile(Context c) { return new File(c.getFilesDir(), "henge.log"); }
+    /** Graphics: reims: HOME for reims-vgpu in this process; its shader cache is $HOME/.cache/reims-vgpu-vulkan. */
+    public static File reimsHomeDir(Context c) {
+        File d = new File(c.getFilesDir(), "reims-home");
+        d.mkdirs();
+        return d;
+    }
 
     /** The verbose log where a computer sees it over USB: Android/data/dev.henge.android/files/verbose.log. */
     static void exportLog(Context c) {
@@ -218,7 +224,10 @@ public class VmService extends Service {
         // The last run's gpu.reims is stale: the app must attach only to the one this engine is about to make.
         if (reims) new File(mac, "gpu.reims").delete();
 
-        if (reims && !(GpuView.loaded && GpuView.nativeReimsStart(new File(mac, "gpu.reims").getPath(), log.getPath())))
+        // reims-vgpu's shader cache (translated Metal shaders and the driver's pipelines) lives under HOME, which this
+        // process does not have: give it a folder that outlives the process, so a second boot finds the first's work.
+        if (reims && !(GpuView.loaded && GpuView.nativeReimsStart(new File(mac, "gpu.reims").getPath(), log.getPath(),
+                reimsHomeDir(this).getPath())))
             appendLog(log, "henge app: this build has no reims-vgpu; the GPU will not answer");
         int code = -1;
         try {

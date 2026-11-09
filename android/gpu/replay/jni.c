@@ -38,15 +38,15 @@ JNIEXPORT void JNICALL Java_dev_henge_android_GpuView_nativeStop(JNIEnv *env, jc
 }
 
 /* Graphics: reims: the GPU device for the VM the service runs, from its start to its end. */
-JNIEXPORT jboolean JNICALL Java_dev_henge_android_GpuView_nativeReimsStart(JNIEnv *env, jclass cls, jstring path, jstring log) {
+JNIEXPORT jboolean JNICALL Java_dev_henge_android_GpuView_nativeReimsStart(JNIEnv *env, jclass cls, jstring path, jstring log, jstring home) {
     (void)cls;
 #ifdef HENGE_REIMS
-    const char *p = str(env, path), *l = str(env, log);
-    int ok = p && reims_host_start(p, l) == 0;
-    unstr(env, path, p), unstr(env, log, l);
+    const char *p = str(env, path), *l = str(env, log), *h = str(env, home);
+    int ok = p && reims_host_start(p, l, h) == 0;
+    unstr(env, path, p), unstr(env, log, l), unstr(env, home, h);
     return ok ? JNI_TRUE : JNI_FALSE;
 #else
-    (void)env, (void)path, (void)log;
+    (void)env, (void)path, (void)log, (void)home;
     return JNI_FALSE; /* this build has no reims-vgpu */
 #endif
 }

@@ -25,6 +25,7 @@
 
 typedef struct {
     char path[1024];
+    char home[1024];
     HvReimsHeader *h;
     int ram_fd;
     uint8_t *ram;
@@ -330,6 +331,21 @@ static int bring_up(Host *h) {
         .memory_files = &file,
         .callbacks = &cb,
     };
+    /* metal2vulkan keeps its translated shaders on disk and refuses to make a device without a directory
+       for them: $HOME/.cache/reims-vgpu-vulkan, and an Android app's process has no HOME at all
+       ("the Vulkan runtime refused it: no shader cache directory: no home directory", a reims-vgpu fatal
+       that took the app down at the first start on the tablet). The app passes a folder of its own that
+       outlives the process, so the second boot finds the first's pipelines (macOS-uke's lesson: its
+       persistent cache is what made WindowServer usable). Set before the first device: reims-vgpu reads
+       HOME once, when it builds its device options. */
+    if (h->home[0]) {
+        mkdir(h->home, 0700);
+        setenv("HOME", h->home, 1);
+        setenv("XDG_CACHE_HOME", h->home, 0);
+        hlog("reims: shader cache under %s", h->home);
+    } else if (!getenv("HOME")) {
+        hlog("reims: no HOME and no cache folder given: metal2vulkan will refuse the device");
+    }
     set_stage("rvg_device_create (Vulkan device, guest memory map)");
     RvgStatus st = rvg_device_create(&dc, &h->dev);
     if (st != RVG_OK) { hlog("reims: rvg_device_create: %s", rvg_status_message(st)); return -1; }
@@ -395,12 +411,13 @@ static void *attach_loop(void *arg) {
     return NULL;
 }
 
-int reims_host_start(const char *path, const char *log_path) {
+int reims_host_start(const char *path, const char *log_path, const char *home) {
     pthread_mutex_lock(&host_lock);
     if (H) { pthread_mutex_unlock(&host_lock); return 0; }
     Host *h = calloc(1, sizeof *h);
     if (!h) { pthread_mutex_unlock(&host_lock); return -1; }
     snprintf(h->path, sizeof h->path, "%s", path);
+    if (home && *home) snprintf(h->home, sizeof h->home, "%s", home);
     if (log_fd < 0 && log_path && *log_path) log_fd = open(log_path, O_WRONLY | O_APPEND | O_CLOEXEC);
     /* reims-vgpu reports a panic on stderr and aborts; an app's stderr is /dev/null, so the reason was lost. */
     if (log_fd >= 0) dup2(log_fd, 2);

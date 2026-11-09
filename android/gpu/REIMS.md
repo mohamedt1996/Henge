@@ -33,9 +33,15 @@ engine (hengevm, --gpu reims)                     app (libhengegpu.so)
 
 ## Status
 
-Not run yet on the tablet. What to expect, in order:
+First run on the tablet (2026-11-09): the build for Android works, the engine's file is found, guest
+RAM is mapped, and `rvg_device_create` died at once with `reims-vgpu: fatal: ... the Vulkan runtime
+refused it: no shader cache directory: no home directory`. metal2vulkan keeps its translated shaders
+and pipeline records in `$HOME/.cache/reims-vgpu-vulkan` and refuses to make a device without the
+directory; an Android app's process has no `HOME`. `host.c` now sets `HOME` to a folder the app
+passes (`files/reims-home`, which outlives the process: the second boot finds the first's pipelines,
+which is what macOS-uke found makes WindowServer usable), and `android_port.py` caps the cache at
+4 GiB instead of the library's 25. What to expect next, in order:
 
-- the build for Android itself (CI's "reims-vgpu for the tablet" step);
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
   `reims` lines in `adb logcat -s henge-gpu`, and a `reims-vgpu: fatal` line ends the app's process;
 - speed: every GPU register access crosses processes (a futex round trip), and frames are read back
