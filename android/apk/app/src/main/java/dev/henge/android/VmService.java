@@ -183,6 +183,10 @@ public class VmService extends Service {
         cmd.add("--ram"); cmd.add(Integer.toString(gunyah() ? Math.min(ram, 3072) : ram));
         cmd.add("--cpus"); cmd.add(Integer.toString(cpus));
         if (gunyah()) { cmd.add("--engine"); cmd.add("gunyah"); }
+        // Graphics: reims: the GPU device runs in this process (libhengegpu.so), up before the engine needs it.
+        boolean reims = !install && "reims".equals(gpu);
+        if (reims && !(GpuView.loaded && GpuView.nativeReimsStart(new File(mac, "gpu.reims").getPath())))
+            appendLog(log, "henge app: this build has no reims-vgpu; the GPU will not answer");
         int code = -1;
         try {
             // Gunyah: /dev/gunyah is closed to apps, so the engine runs as root through su; afterwards everything it
@@ -230,6 +234,7 @@ public class VmService extends Service {
                         java.nio.file.StandardCopyOption.REPLACE_EXISTING); } catch (Exception ignored) { }
             }
         }
+        if (reims && GpuView.loaded) GpuView.nativeReimsStop();
         exportLog(this);
         if (install && code == 0) {
             try { new File(files, "installed").createNewFile(); } catch (Exception ignored) { }

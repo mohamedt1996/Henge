@@ -38,7 +38,8 @@ public class ScreenActivity extends Activity {
         super.onCreate(saved);
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
-        boolean vulkan = "vulkan".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("gpu", "on")) && GpuView.loaded;
+        String gpuMode = getSharedPreferences("henge", MODE_PRIVATE).getString("gpu", "on");
+        boolean vulkan = ("vulkan".equals(gpuMode) || "reims".equals(gpuMode)) && GpuView.loaded;
         if (vulkan) {
             gpu = new GpuView(this);
             root.addView(gpu);

@@ -4,6 +4,9 @@
 #include <jni.h>
 
 #include "replay.h"
+#ifdef HENGE_REIMS
+#include "../reims/reims_host.h"
+#endif
 
 static const char *str(JNIEnv *env, jstring s) { return s ? (*env)->GetStringUTFChars(env, s, NULL) : NULL; }
 static void unstr(JNIEnv *env, jstring s, const char *c) { if (s && c) (*env)->ReleaseStringUTFChars(env, s, c); }
@@ -13,6 +16,9 @@ JNIEXPORT jlong JNICALL Java_dev_henge_android_GpuView_nativeStart(JNIEnv *env, 
     const char *l = str(env, link), *t = str(env, tool), *c = str(env, cache);
     Replay *r = l ? replay_start(l, NULL, t, c) : NULL;
     unstr(env, link, l), unstr(env, tool, t), unstr(env, cache, c);
+#ifdef HENGE_REIMS
+    if (r && reims_host_running()) reims_host_set_sink(r); /* Graphics: reims: this screen shows its frames */
+#endif
     return (jlong)(intptr_t)r;
 }
 
@@ -25,5 +31,29 @@ JNIEXPORT void JNICALL Java_dev_henge_android_GpuView_nativeSurface(JNIEnv *env,
 
 JNIEXPORT void JNICALL Java_dev_henge_android_GpuView_nativeStop(JNIEnv *env, jclass cls, jlong handle) {
     (void)env, (void)cls;
+#ifdef HENGE_REIMS
+    reims_host_set_sink(NULL);
+#endif
     replay_stop((Replay *)(intptr_t)handle);
+}
+
+/* Graphics: reims: the GPU device for the VM the service runs, from its start to its end. */
+JNIEXPORT jboolean JNICALL Java_dev_henge_android_GpuView_nativeReimsStart(JNIEnv *env, jclass cls, jstring path) {
+    (void)cls;
+#ifdef HENGE_REIMS
+    const char *p = str(env, path);
+    int ok = p && reims_host_start(p) == 0;
+    unstr(env, path, p);
+    return ok ? JNI_TRUE : JNI_FALSE;
+#else
+    (void)env, (void)path;
+    return JNI_FALSE; /* this build has no reims-vgpu */
+#endif
+}
+
+JNIEXPORT void JNICALL Java_dev_henge_android_GpuView_nativeReimsStop(JNIEnv *env, jclass cls) {
+    (void)env, (void)cls;
+#ifdef HENGE_REIMS
+    reims_host_stop();
+#endif
 }

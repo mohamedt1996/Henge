@@ -182,5 +182,7 @@ void replay_command(Replay *r, uint32_t channel, const uint32_t *cmd, uint32_t l
 Replay *replay_for_test(Guest *g, Screen *screen);
 void replay_present_now(Replay *r);
 void replay_enable_draws(Replay *r, const char *air2spv, const char *cache_dir);
+/* Graphics: reims: a whole frame (RGBA8, w x h, tightly packed) drawn elsewhere, shown as it is. */
+void replay_show_frame(Replay *r, const uint8_t *rgba, uint32_t w, uint32_t h);
 
 #endif

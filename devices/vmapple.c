@@ -1,6 +1,14 @@
 #include "vmapple.h"
 #include "pvg_lite.h"
 
+/* The paravirtual GPU run by the host instead of pvg_lite: 1 if it took the device. Android's pvg_reims.c
+   defines it; elsewhere this default leaves the GPU to pvg_lite. */
+__attribute__((weak)) int hv_pvg_external_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_t iosfc_pa, int gfx_irq,
+                                                 int iosfc_irq) {
+    (void)m, (void)gic, (void)gfx_pa, (void)iosfc_pa, (void)gfx_irq, (void)iosfc_irq;
+    return 0;
+}
+
 #include <errno.h>
 #ifdef __linux__
 #include "plat_linux.h"
@@ -312,7 +320,9 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
         hv_machine_add_mmio(m, VMAPPLE_GFX, 0x10000, NULL, NULL, NULL, "gfx-absent");
         hv_machine_add_mmio(m, VMAPPLE_IOSFC, 0x10000, NULL, NULL, NULL, "iosurface-absent");
     } else {
-        b->pvg = hv_pvg_lite_create(m, b->gic, VMAPPLE_GFX, VMAPPLE_IOSFC, 32 + 0x11, 32 + 0x10);
+        /* A host may run the whole device elsewhere (Android's Graphics: reims, android/pvg_reims.c). */
+        if (!hv_pvg_external_create(m, b->gic, VMAPPLE_GFX, VMAPPLE_IOSFC, 32 + 0x11, 32 + 0x10))
+            b->pvg = hv_pvg_lite_create(m, b->gic, VMAPPLE_GFX, VMAPPLE_IOSFC, 32 + 0x11, 32 + 0x10);
     }
     hv_machine_add_mmio(m, VMAPPLE_RTC_SELECT, 0x4000, b, rtc_select_read, rtc_select_write, "rtc-select");
     avp_regs_create(m, ram_size);

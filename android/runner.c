@@ -30,12 +30,14 @@ static void usage(void) {
             "   or: hengevm-android --mac FOLDER (exported from Henge on iOS) [options]\n"
             "   or: hengevm-android --rom AVPBooter.vmapple2.bin --disk Disk.img --aux AuxiliaryStorage\n"
             "                       --ecid N --seed N [--ram MB (4096)] [--cpus N (2)] [--log 0-3] [--jit-mb MB] [--net 0|1]\n"
-            "                       [--vnc PORT (5900, 0 = off)] [--gpu on|off|capture|vulkan] [--shader-dir DIR]\n"
+            "                       [--vnc PORT (5900, 0 = off)] [--gpu on|off|capture|vulkan|reims] [--shader-dir DIR]\n"
             "  --gpu off      no paravirtual GPU (experiment: macOS may fall back to a plain framebuffer)\n"
             "  --gpu capture  keep the GPU device and save every shader library and pipeline macOS uses\n"
             "                 (default DIR: shaders/ next to the disk), for building the Vulkan translation\n"
             "  --gpu vulkan   hand the GPU's commands to the Android app's Vulkan renderer through gpu.link\n"
-            "                 next to the disk (HV_GPU_LINK overrides); guest RAM stays a named file it maps\n");
+            "                 next to the disk (HV_GPU_LINK overrides); guest RAM stays a named file it maps\n"
+            "  --gpu reims    the GPU device is reims-vgpu in the Android app, on Vulkan, through gpu.reims next to\n"
+            "                 the disk (HV_GPU_REIMS overrides); guest RAM stays a named file it maps\n");
     exit(2);
 }
 
@@ -274,7 +276,7 @@ int main(int argc, char **argv) {
         /* The CPU runs on Gunyah (host/gunyah.c): every CPU asked for, each a vCPU. Guest RAM must be pinned
            and shared with the hypervisor: anonymous, unless the app's Vulkan renderer has to map it too
            (Graphics: Vulkan), when it is the RAM file in the app's folder (a long-term pin of a file's pages). */
-        if (strcmp(gpu, "vulkan") || vc.installer) setenv("HV_RAM_FILE", "", 1);
+        if ((strcmp(gpu, "vulkan") && strcmp(gpu, "reims")) || vc.installer) setenv("HV_RAM_FILE", "", 1);
         fprintf(stderr, "hengevm: engine: Gunyah (experimental), %d CPUs\n", vc.ncpus);
     }
     if (!install_dir && access(vc.rom, R_OK) != 0) { /* a Mac whose boot ROM went missing: put it back */
@@ -303,7 +305,17 @@ int main(int argc, char **argv) {
             setenv("HV_GPU_LINK", link, 1);
         }
         setenv("HV_RAM_KEEP", "1", 1);
-    } else if (strcmp(gpu, "on") && strcmp(gpu, "capture") && strcmp(gpu, "vulkan")) {
+    } else if (!strcmp(gpu, "reims") && !vc.installer) {
+        /* The GPU device itself is reims-vgpu in the app (android/pvg_reims.c, android/gpu/reims). */
+        static char path[1100];
+        if (!getenv("HV_GPU_REIMS")) {
+            snprintf(path, sizeof path, "%s", vc.disk);
+            char *slash = strrchr(path, '/');
+            snprintf(slash ? slash + 1 : path, sizeof path - (slash ? (size_t)(slash + 1 - path) : 0), "gpu.reims");
+            setenv("HV_GPU_REIMS", path, 1);
+        }
+        setenv("HV_RAM_KEEP", "1", 1);
+    } else if (strcmp(gpu, "on") && strcmp(gpu, "capture") && strcmp(gpu, "vulkan") && strcmp(gpu, "reims")) {
         usage();
     }
     setvbuf(stderr, NULL, _IONBF, 0);

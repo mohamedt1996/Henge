@@ -65,6 +65,23 @@ jobs:
       - name: Renderer self-test (Vulkan on lavapipe)
         run: android/gpu/replay/selftest.sh
 
+      - name: Cache reims-vgpu build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/reims-work/target
+          key: reims-${{ hashFiles('android/gpu/reims/build.sh', 'android/gpu/reims/android_port.py', 'android/gpu/reims/window_android.rs') }}
+
+      # Graphics: reims. Experimental: a failure here leaves the APK without it (the app says so).
+      - name: reims-vgpu for the tablet (Graphics: reims)
+        continue-on-error: true
+        env:
+          REIMS_WORK: /home/runner/reims-work
+          CARGO_TARGET_DIR: /home/runner/reims-work/target
+        run: android/gpu/reims/build.sh
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

@@ -924,15 +924,17 @@ public class MainActivity extends Activity {
             "Experimental: runs the Mac's instructions on this tablet's CPU through Qualcomm's Gunyah hypervisor. "
                     + "Needs root (su). Uses the CPUs setting. The log says how far it gets."};
     private String engineMode() { return prefs.getString("engine", "jit"); }
-    static final String[] GPU_MODES = {"on", "off", "capture", "vulkan"};
-    static final String[] GPU_LABELS = {"GPU", "Off", "Capture", "Vulkan"};
+    static final String[] GPU_MODES = {"on", "off", "capture", "vulkan", "reims"};
+    static final String[] GPU_LABELS = {"GPU", "Off", "Capture", "Vulkan", "reims"};
     static final String[] GPU_NOTES = {
             "macOS's GPU driver runs, but Android has no renderer for it yet: expect the boot screen, then black.",
             "Experiment: no GPU device, so macOS may fall back to a plain framebuffer and show a slow desktop.",
             "Saves every shader and pipeline macOS uses to Android/data/dev.henge.android/files/shaders, "
                     + "the inventory for the Vulkan renderer. Copy it to a computer over USB.",
             "Experimental: the app's Vulkan renderer shows the screen and draws on the GPU, translating macOS's shaders "
-                    + "on the tablet into Android/data/dev.henge.android/files/spirv. Blending and some draws are still guesses."};
+                    + "on the tablet into Android/data/dev.henge.android/files/spirv. Blending and some draws are still guesses.",
+            "Experimental: the whole GPU device is reims-vgpu running in this app, drawing macOS's Metal work on the "
+                    + "tablet's GPU through metal2vulkan, as a Mac's own paravirtual GPU would. Keep the app open while the Mac runs."};
 
     private String gpuMode() { return prefs.getString("gpu", "on"); }
 

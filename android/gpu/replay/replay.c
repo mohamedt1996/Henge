@@ -31,6 +31,7 @@ struct Replay {
     int dirty;
     uint8_t *frame;
     uint32_t fw, fh;
+    int external; /* Graphics: reims: frames come whole through replay_show_frame */
     /* the pointer */
     uint8_t *cursor;
     uint32_t cw, ch, cstride;
@@ -315,6 +316,7 @@ void replay_command(Replay *r, uint32_t ch, const uint32_t *cmd, uint32_t len) {
 /* ---------------------------------------------------------------- presenting -- */
 /* Copies the surface on screen into the frame, with the pointer over it. Lock held. */
 static int compose(Replay *r) {
+    if (r->external) return r->frame ? 0 : -1;
     Surface *s = r->mapping ? surface_get(&r->os, r->mapping) : NULL;
     if (!s || !s->w || !s->h || s->w > 8192 || s->h > 8192) return -1;
     if (r->fw != s->w || r->fh != s->h) {
@@ -359,6 +361,11 @@ void replay_present_now(Replay *r) {
     pthread_mutex_lock(&r->lock);
     int ok = compose(r) == 0;
     r->dirty = 0;
+    if (r->external) { /* replay_show_frame may replace the frame: show it under the lock */
+        if (ok && r->screen && screen_show(r->screen, r->frame, r->fw, r->fh) == 0) r->frames++;
+        pthread_mutex_unlock(&r->lock);
+        return;
+    }
     pthread_mutex_unlock(&r->lock);
     if (ok && r->screen && screen_show(r->screen, r->frame, r->fw, r->fh) == 0) r->frames++;
 }
@@ -392,9 +399,9 @@ static void *present_loop(void *arg) {
         if (until.tv_nsec >= 1000000000) until.tv_sec++, until.tv_nsec -= 1000000000;
         if (!r->dirty) pthread_cond_timedwait(&r->wake, &r->lock, &until);
         pthread_mutex_unlock(&r->lock);
-        uint32_t where = cursor_where(r);
+        uint32_t where = r->external ? 0 : cursor_where(r);
         if (where != r->cursor_at) r->cursor_at = where, r->dirty = 1;
-        if (r->dirty && r->screen && r->have_guest) replay_present_now(r);
+        if (r->dirty && r->screen && (r->have_guest || r->external)) replay_present_now(r);
         if (now_ns() - last_report > 10000000000ull) {
             uint64_t st[3], gs[4];
             shaders_stats(r->shaders, st);
@@ -540,6 +547,19 @@ void replay_stop(Replay *r) {
     free(r->frame);
     free(r->cursor);
     free(r);
+}
+
+void replay_show_frame(Replay *r, const uint8_t *rgba, uint32_t w, uint32_t h) {
+    pthread_mutex_lock(&r->lock);
+    r->external = 1;
+    if (r->fw != w || r->fh != h || !r->frame) {
+        free(r->frame);
+        r->frame = malloc((size_t)w * h * 4);
+        r->fw = r->frame ? w : 0, r->fh = r->frame ? h : 0;
+    }
+    if (r->frame) memcpy(r->frame, rgba, (size_t)w * h * 4), r->dirty = 1;
+    pthread_mutex_unlock(&r->lock);
+    pthread_cond_signal(&r->wake);
 }
 
 void replay_enable_draws(Replay *r, const char *tool, const char *cache) {
