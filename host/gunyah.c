@@ -39,6 +39,7 @@
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -427,14 +428,36 @@ int hv_gunyah_run(void) {
                                            .guest_phys_addr = BOOT_PA, .memory_size = BOOT_SIZE,
                                            .userspace_addr = (uintptr_t)boot};
     if (ioctl(vm_fd, GH_VM_SET_USER_MEM_REGION, &r) < 0) return fail("sharing the boot region");
+    /* Gunyah pins every page and keeps one kcalloc'd array entry per 4 KB page (plus one parcel entry per run),
+       so one 3 GB region needs a 6 MB+ physically contiguous kernel allocation and fails with ENOMEM. Large
+       regions are shared in chunks, halved on ENOMEM down to 8 MB. Root may also need a higher memlock limit. */
+    struct rlimit nolimit = {RLIM_INFINITY, RLIM_INFINITY};
+    if (setrlimit(RLIMIT_MEMLOCK, &nolimit) < 0) fprintf(stderr, "gunyah: raising the memlock limit: %s\n", strerror(errno));
     for (int i = 0; i < M->nram; i++) {
         HvRam *ram = &M->ram[i];
-        r = (struct gh_userspace_memory_region){.label = label++, .flags = GH_MEM_R | GH_MEM_W | GH_MEM_X,
-                                                .guest_phys_addr = ram->pa, .memory_size = ram->size,
-                                                .userspace_addr = (uintptr_t)ram->host};
         fprintf(stderr, "gunyah: memory %llx-%llx (%llu MB)\n", (unsigned long long)ram->pa,
                 (unsigned long long)(ram->pa + ram->size), (unsigned long long)(ram->size >> 20));
-        if (ioctl(vm_fd, GH_VM_SET_USER_MEM_REGION, &r) < 0) return fail("sharing guest memory");
+        madvise(ram->host, ram->size, MADV_HUGEPAGE); /* fewer, longer runs in the parcel; harmless if refused */
+        uint64_t chunk = 256ull << 20, done = 0;
+        int pieces = 0;
+        while (done < ram->size) {
+            uint64_t n = ram->size - done < chunk ? ram->size - done : chunk;
+            r = (struct gh_userspace_memory_region){.label = label, .flags = GH_MEM_R | GH_MEM_W | GH_MEM_X,
+                                                    .guest_phys_addr = ram->pa + done, .memory_size = n,
+                                                    .userspace_addr = (uintptr_t)ram->host + done};
+            if (ioctl(vm_fd, GH_VM_SET_USER_MEM_REGION, &r) == 0) {
+                label++, pieces++, done += n;
+                continue;
+            }
+            if (errno != ENOMEM || chunk <= (8ull << 20)) {
+                fprintf(stderr, "gunyah: shared %llu of %llu MB before this; lower the RAM setting if memory is short\n",
+                        (unsigned long long)(done >> 20), (unsigned long long)(ram->size >> 20));
+                return fail("sharing guest memory");
+            }
+            chunk >>= 1;
+        }
+        if (pieces > 1) fprintf(stderr, "gunyah:   shared as %d pieces (%llu MB each at the end)\n", pieces,
+                                (unsigned long long)(chunk >> 20));
     }
     struct gh_vm_dtb_config dtb = {.guest_phys_addr = BOOT_PA + DTB_OFF, .size = (dtb_len + 0xfff) & ~0xfffull};
     if (ioctl(vm_fd, GH_VM_SET_DTB_CONFIG, &dtb) < 0) return fail("setting the VM device tree");
