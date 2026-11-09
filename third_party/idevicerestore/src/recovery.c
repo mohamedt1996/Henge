@@ -129,6 +129,16 @@ int recovery_enter_restore(struct idevicerestore_client_t* client, plist_t build
     } else if (client->build_major >= 8) {
         client->restore_boot_args = strdup("rd=md0 nand-enable-reformat=1 -progress");
     }
+    /* HengeVM: extra boot-args for the restore OS (the Android app asks for its kernel log on the
+       serial console, so a slow or stuck boot shows where it is). Not signed, so nothing is patched. */
+    const char *extra = getenv("HV_RESTORE_BOOT_ARGS");
+    if (extra && *extra && client->restore_boot_args) {
+        char *ba = NULL;
+        if (asprintf(&ba, "%s %s", client->restore_boot_args, extra) > 0) {
+            free(client->restore_boot_args);
+            client->restore_boot_args = ba;
+        }
+    }
 
 	/* upload data to make device boot restore mode */
 
@@ -238,8 +248,16 @@ int recovery_enter_restore(struct idevicerestore_client_t* client, plist_t build
 		return -1;
 	}
 
-	logger(LL_DEBUG, "Waiting for device to disconnect...\n");
-	cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, HV_TIMEOUT(30000));
+	/* HengeVM: iBoot keeps the port until the restore OS's own USB driver takes it, so this
+	   covers a whole kernel boot; on a slow guest that is many minutes. Say so as it goes. */
+	logger(LL_INFO, "Waiting for the restore OS to take over USB...\n");
+	int waited = 0, limit = HV_TIMEOUT(120000);
+	while (client->mode == MODE_RECOVERY && !(client->flags & FLAG_QUIT) && waited < limit) {
+		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 60000);
+		waited += 60000;
+		if (client->mode == MODE_RECOVERY && waited < limit)
+			logger(LL_INFO, "still booting the restore OS (%d of %d min)\n", waited / 60000, limit / 60000);
+	}
 	if (client->mode == MODE_RECOVERY || (client->flags & FLAG_QUIT)) {
 		mutex_unlock(&client->device_event_mutex);
 		logger(LL_ERROR, "Failed to place device in restore mode\n");
@@ -515,8 +533,8 @@ int recovery_send_kernelcache(struct idevicerestore_client_t* client, plist_t bu
 
 	if (client->restore_boot_args) {
 		char setba[256];
-		strcpy(setba, "setenv boot-args ");
-		strcat(setba, client->restore_boot_args);
+		snprintf(setba, sizeof setba, "setenv boot-args %s", client->restore_boot_args);
+		logger(LL_INFO, "boot-args: %s\n", client->restore_boot_args);
 		recovery_error = irecv_send_command(client->recovery->client, setba);
 	}
 

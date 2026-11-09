@@ -193,6 +193,8 @@ int main(int argc, char **argv) {
            take over a minute between the kernelcache upload and dropping USB. Stretch the
            restore tools' waits so they don't give up on a machine that is still working. */
         setenv("HV_RESTORE_TIMEOUT_SCALE", "10", 0);
+        /* The restore OS's kernel log on the serial console (this log): where a long boot is, or why it stopped. */
+        setenv("HV_RESTORE_BOOT_ARGS", "serial=3 -v", 0);
     }
     if (!vc.rom || !vc.disk || !vc.aux) usage();
     if (!install_dir && access(vc.rom, R_OK) != 0) { /* a Mac whose boot ROM went missing: put it back */
