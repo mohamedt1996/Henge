@@ -56,6 +56,26 @@ int memfd_create(const char *name, unsigned int flags) {
 }
 
 static Host *H;
+static int log_fd = -1;
+
+/* To logcat (henge-gpu) and to the app's own log (henge.log), which the Log tab shows: the engine writes
+   there too, so this side's lines sit beside its own, in order. */
+#include <stdarg.h>
+static void hlog(const char *fmt, ...) {
+    char line[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof line - 1, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n > (int)sizeof line - 2) n = (int)sizeof line - 2;
+    rlog("%s", line);
+    if (log_fd >= 0) {
+        char out[1100];
+        int m = snprintf(out, sizeof out, "henge-gpu: %.*s\n", n, line);
+        if (m > 0) (void)!write(log_fd, out, (size_t)(m < (int)sizeof out ? m : (int)sizeof out - 1));
+    }
+}
 static pthread_mutex_t host_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t now_ns(void) {
@@ -70,7 +90,7 @@ static long futex(uint32_t *word, int op, uint32_t val, const struct timespec *t
 
 static void on_log(void *ctx, RvgLogLevel level, const char *target, size_t tl, const char *msg, size_t ml) {
     (void)ctx, (void)level;
-    rlog("reims %.*s: %.*s", (int)tl, target, (int)ml, msg);
+    hlog("reims %.*s: %.*s", (int)tl, target, (int)ml, msg);
 }
 
 /* ------------------------------------------------------------------ interrupts -- */
@@ -90,7 +110,7 @@ static void on_mode(void *ctx, uint16_t w, uint16_t hgt, uint32_t format) {
     h->mode_w = w, h->mode_h = hgt, h->mode_changed = 1, h->frame_pending = 1;
     pthread_cond_signal(&h->wake);
     pthread_mutex_unlock(&h->lock);
-    rlog("reims: mode %ux%u", w, hgt);
+    hlog("reims: mode %ux%u", w, hgt);
 }
 
 static void on_frame(void *ctx) {
@@ -157,7 +177,7 @@ static int make_target(Host *h, uint32_t w, uint32_t hgt) {
     if (h->target) rvg_frame_target_release(h->target), h->target = NULL;
     RvgFrameTargetConfig c = {sizeof c, w, hgt, RVG_PIXEL_FORMAT_RGBA8_UNORM};
     RvgStatus st = rvg_frame_target_create(h->dev, &c, &h->target);
-    if (st != RVG_OK) { rlog("reims: frame target %ux%u: %s", w, hgt, rvg_status_message(st)); return -1; }
+    if (st != RVG_OK) { hlog("reims: frame target %ux%u: %s", w, hgt, rvg_status_message(st)); return -1; }
     free(h->pixels), free(h->shown);
     h->pixels = calloc((size_t)w * hgt, 4), h->shown = calloc((size_t)w * hgt, 4);
     h->tw = w, h->th = hgt;
@@ -180,13 +200,13 @@ static void *render_loop(void *arg) {
         if (frame) {
             RvgFrame *f = NULL;
             RvgStatus st = rvg_display_encode_frame(h->disp, h->target, NULL, &f);
-            if (st != RVG_OK) { rlog("reims: encode: %s", rvg_status_message(st)); continue; }
+            if (st != RVG_OK) { hlog("reims: encode: %s", rvg_status_message(st)); continue; }
             rvg_frame_commit(f);
             rvg_frame_wait(f);
             rvg_frame_release(f);
             size_t stride = (size_t)h->tw * 4;
             st = rvg_frame_target_read_pixels(h->target, h->pixels, stride, stride * h->th);
-            if (st != RVG_OK) { rlog("reims: read pixels: %s", rvg_status_message(st)); continue; }
+            if (st != RVG_OK) { hlog("reims: read pixels: %s", rvg_status_message(st)); continue; }
             h->frames++;
         }
         pthread_mutex_lock(&h->lock);
@@ -232,7 +252,7 @@ static void *beat_loop(void *arg) {
         if (now_ns() - last > 10000000000ull && h->ready) {
             uint64_t guest = 0, host = 0;
             if (h->disp) rvg_display_present_counts(h->disp, &guest, &host);
-            rlog("reims: %llu MMIO accesses, %llu interrupts; %llu presents, %llu frames shown",
+            hlog("reims: %llu MMIO accesses, %llu interrupts; %llu presents, %llu frames shown",
                  (unsigned long long)h->mmio, (unsigned long long)h->h->irqs, (unsigned long long)guest, (unsigned long long)h->frames);
             last = now_ns();
         }
@@ -244,10 +264,10 @@ static void *beat_loop(void *arg) {
 static int bring_up(Host *h) {
     HvReimsHeader *x = h->h;
     h->ram_fd = open(x->ram_file, O_RDWR | O_CLOEXEC);
-    if (h->ram_fd < 0) { rlog("reims: guest RAM %s: %s", x->ram_file, strerror(errno)); return -1; }
+    if (h->ram_fd < 0) { hlog("reims: guest RAM %s: %s", x->ram_file, strerror(errno)); return -1; }
     h->ram_pa = x->ram_pa, h->ram_size = x->ram_size;
     h->ram = mmap(NULL, h->ram_size, PROT_READ | PROT_WRITE, MAP_SHARED, h->ram_fd, 0);
-    if (h->ram == MAP_FAILED) { h->ram = NULL; rlog("reims: mapping guest RAM: %s", strerror(errno)); return -1; }
+    if (h->ram == MAP_FAILED) { h->ram = NULL; hlog("reims: mapping guest RAM: %s", strerror(errno)); return -1; }
 
     RvgMemoryRange range = {h->ram_pa, h->ram_size, h->ram};
     RvgMemoryMap map = {&range, 1};
@@ -263,11 +283,11 @@ static int bring_up(Host *h) {
         .callbacks = &cb,
     };
     RvgStatus st = rvg_device_create(&dc, &h->dev);
-    if (st != RVG_OK) { rlog("reims: rvg_device_create: %s", rvg_status_message(st)); return -1; }
+    if (st != RVG_OK) { hlog("reims: rvg_device_create: %s", rvg_status_message(st)); return -1; }
     RvgIOSurfaceCallbacks ic = {.struct_size = sizeof ic, .ctx = h, .raise_interrupt = iosfc_raise};
     RvgIOSurfaceDeviceConfig icfg = {.struct_size = sizeof icfg, .memory_map = &map, .callbacks = &ic};
     st = rvg_iosurface_device_create(&icfg, &h->iosfc);
-    if (st != RVG_OK) { rlog("reims: rvg_iosurface_device_create: %s", rvg_status_message(st)); return -1; }
+    if (st != RVG_OK) { hlog("reims: rvg_iosurface_device_create: %s", rvg_status_message(st)); return -1; }
 
     uint32_t w = x->display_w ? x->display_w : 1920, hgt = x->display_h ? x->display_h : 1080;
     RvgDisplayCallbacks disp_cb = {.struct_size = sizeof disp_cb, .ctx = h, .mode_change = on_mode, .new_frame = on_frame,
@@ -277,7 +297,7 @@ static int bring_up(Host *h) {
                              .width_millimeters = w / (110.0 / 25.4), .height_millimeters = hgt / (110.0 / 25.4),
                              .callbacks = &disp_cb};
     st = rvg_display_create(h->dev, &disp, &h->disp);
-    if (st != RVG_OK) { rlog("reims: rvg_display_create: %s", rvg_status_message(st)); return -1; }
+    if (st != RVG_OK) { hlog("reims: rvg_display_create: %s", rvg_status_message(st)); return -1; }
     RvgDisplayMode modes[] = {{(uint16_t)w, (uint16_t)hgt, 0, 60.0}, {1920, 1080, 0, 60.0}, {1280, 800, 0, 60.0}};
     rvg_display_set_modes(h->disp, modes, w == 1920 && hgt == 1080 ? 2 : 3);
     h->mode_w = w, h->mode_h = hgt;
@@ -288,7 +308,7 @@ static int bring_up(Host *h) {
     h->ready = 1;
     x->app_pid = (uint32_t)getpid();
     __atomic_store_n(&x->app_ready, 1, __ATOMIC_RELEASE);
-    rlog("reims: the GPU is up: guest RAM %llu MB, display %ux%u", (unsigned long long)(h->ram_size >> 20), w, hgt);
+    hlog("reims: the GPU is up: guest RAM %llu MB, display %ux%u", (unsigned long long)(h->ram_size >> 20), w, hgt);
     return 0;
 }
 
@@ -304,7 +324,7 @@ static void *attach_loop(void *arg) {
             if (x != MAP_FAILED && __atomic_load_n(&x->magic, __ATOMIC_ACQUIRE) == HV_REIMS_MAGIC && x->version == HV_REIMS_VERSION) {
                 h->h = x;
                 pthread_create(&h->beat, NULL, beat_loop, h);
-                if (bring_up(h) != 0) rlog("reims: no GPU this run");
+                if (bring_up(h) != 0) hlog("reims: no GPU this run");
                 return NULL;
             }
             if (x != MAP_FAILED) munmap(x, HV_REIMS_FILE_BYTES);
@@ -316,12 +336,13 @@ static void *attach_loop(void *arg) {
     return NULL;
 }
 
-int reims_host_start(const char *path) {
+int reims_host_start(const char *path, const char *log_path) {
     pthread_mutex_lock(&host_lock);
     if (H) { pthread_mutex_unlock(&host_lock); return 0; }
     Host *h = calloc(1, sizeof *h);
     if (!h) { pthread_mutex_unlock(&host_lock); return -1; }
     snprintf(h->path, sizeof h->path, "%s", path);
+    if (log_fd < 0 && log_path && *log_path) log_fd = open(log_path, O_WRONLY | O_APPEND | O_CLOEXEC);
     h->ram_fd = -1;
     pthread_mutex_init(&h->lock, NULL);
     pthread_cond_init(&h->wake, NULL);
@@ -329,7 +350,7 @@ int reims_host_start(const char *path) {
     H = h;
     pthread_create(&h->attach, NULL, attach_loop, h);
     pthread_mutex_unlock(&host_lock);
-    rlog("reims: waiting for the engine at %s", path);
+    hlog("reims: waiting for the engine at %s", path);
     return 0;
 }
 

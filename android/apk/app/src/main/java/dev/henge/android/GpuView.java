@@ -53,6 +53,6 @@ public class GpuView extends SurfaceView implements SurfaceHolder.Callback {
     static native void nativeSurface(long handle, Object surface);
     static native void nativeStop(long handle);
     /** Graphics: reims: the paravirtual GPU device itself (reims-vgpu), for the VM VmService runs. */
-    static native boolean nativeReimsStart(String reimsPath);
+    static native boolean nativeReimsStart(String reimsPath, String logPath);
     static native void nativeReimsStop();
 }
