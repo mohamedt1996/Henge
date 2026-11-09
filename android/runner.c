@@ -21,6 +21,8 @@ static void curl_global_init_all(void) { curl_global_init(CURL_GLOBAL_ALL); }
 #include <string.h>
 #include <unistd.h>
 
+void hv_android_share_with_app(const char *path); /* pvg_android.c */
+
 static void usage(void) {
     fprintf(stderr,
             "usage (both forms also take --engine jit|gunyah): hengevm-android --install FOLDER [--release 15.6.1] [--ipsw FILE] [--disk-gb 64] [--rom FILE] [--cache DIR] [--ram MB] [--cpus N]\n"
@@ -234,11 +236,11 @@ int main(int argc, char **argv) {
     int gunyah = !strcmp(engine, "gunyah");
     if (!gunyah && strcmp(engine, "jit")) usage();
     if (gunyah) {
-        /* The CPU runs on Gunyah (host/gunyah.c): one vCPU for now, and guest RAM that can be pinned and shared
-           with the hypervisor (anonymous, not a file). */
-        vc.ncpus = 1;
-        setenv("HV_RAM_FILE", "", 1);
-        fprintf(stderr, "hengevm: engine: Gunyah (experimental)\n");
+        /* The CPU runs on Gunyah (host/gunyah.c): every CPU asked for, each a vCPU. Guest RAM must be pinned
+           and shared with the hypervisor: anonymous, unless the app's Vulkan renderer has to map it too
+           (Graphics: Vulkan), when it is the RAM file in the app's folder (a long-term pin of a file's pages). */
+        if (strcmp(gpu, "vulkan") || vc.installer) setenv("HV_RAM_FILE", "", 1);
+        fprintf(stderr, "hengevm: engine: Gunyah (experimental), %d CPUs\n", vc.ncpus);
     }
     if (!install_dir && access(vc.rom, R_OK) != 0) { /* a Mac whose boot ROM went missing: put it back */
         curl_global_init_all();
@@ -272,7 +274,7 @@ int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IOLBF, 0); /* the app's log is a file: block buffering held lines back until exit */
     /* Android has no swap to speak of: back guest RAM with a file unless told otherwise. */
-    if (!gunyah && !getenv("HV_RAM_FILE")) {
+    if (!getenv("HV_RAM_FILE")) {
         static char ram[1024];
         snprintf(ram, sizeof ram, "%s.ram", vc.disk);
         setenv("HV_RAM_FILE", ram, 0);
@@ -294,6 +296,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "hengevm: %s\n", err);
         return 1;
     }
+    if (getenv("HV_RAM_KEEP")) hv_android_share_with_app(getenv("HV_RAM_FILE")); /* the renderer opens it by name */
     if (vnc_port) {
         if (hv_vnc_start(vnc_port) == 0) fprintf(stderr, "hengevm: display on vnc://127.0.0.1:%d\n", vnc_port);
         else fprintf(stderr, "hengevm: vnc port %d unavailable\n", vnc_port);

@@ -912,7 +912,7 @@ public class MainActivity extends Activity {
     static final String[] ENGINE_NOTES = {
             "Translates the Mac's instructions: works on any tablet, but many times slower than a real Mac.",
             "Experimental: runs the Mac's instructions on this tablet's CPU through Qualcomm's Gunyah hypervisor. "
-                    + "Needs root (su). One CPU for now. The log says how far it gets."};
+                    + "Needs root (su). Uses the CPUs setting. The log says how far it gets."};
     private String engineMode() { return prefs.getString("engine", "jit"); }
     static final String[] GPU_MODES = {"on", "off", "capture", "vulkan"};
     static final String[] GPU_LABELS = {"GPU", "Off", "Capture", "Vulkan"};

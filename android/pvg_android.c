@@ -22,6 +22,22 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
+#include <libgen.h>
+
+/* Gunyah runs the engine as root (su): a file it makes for the app (gpu.link, the RAM file) would be root's and
+   carry su's SELinux label until the engine exits. Hand it to the app now: its uid, and its folder's label. */
+void hv_android_share_with_app(const char *path) {
+    const char *u = getenv("HENGE_APP_UID");
+    if (!u || !*u || geteuid() != 0 || !path || !*path) return;
+    uid_t uid = (uid_t)strtoul(u, NULL, 10);
+    if (chown(path, uid, uid) != 0) fprintf(stderr, "hengevm: giving %s to the app: %s\n", path, strerror(errno));
+    char dir[1100], label[256];
+    snprintf(dir, sizeof dir, "%s", path);
+    ssize_t n = getxattr(dirname(dir), "security.selinux", label, sizeof label);
+    if (n > 0 && setxattr(path, "security.selinux", label, (size_t)n, 0) != 0)
+        fprintf(stderr, "hengevm: labelling %s for the app: %s\n", path, strerror(errno));
+}
 
 enum { OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, MAX_TASKS = 512, MAX_REFS = 8192, SEEN_SLOTS = 1 << 14 };
 
@@ -298,6 +314,7 @@ static void *link_work(void *arg) {
 
 static HvLinkHeader *link_open(HvPvgLite *lite, const char *path) {
     int fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (fd >= 0) hv_android_share_with_app(path);
     if (fd < 0 || ftruncate(fd, HV_LINK_FILE_BYTES) != 0) {
         fprintf(stderr, "hengevm: gpu link %s: %s\n", path, strerror(errno));
         if (fd >= 0) close(fd);

@@ -156,7 +156,9 @@ public class VmService extends Service {
             if (gunyah()) {
                 StringBuilder q = new StringBuilder();
                 q.append("export HOME=").append(sq(files.getPath())).append(" TMPDIR=").append(sq(getCacheDir().getPath()))
-                 .append(" HENGE_PID=").append(sq(pidFile.getPath())).append(" GLIBC_TUNABLES=glibc.pthread.rseq=0; cd ")
+                 .append(" HENGE_PID=").append(sq(pidFile.getPath()))
+                 .append(" HENGE_APP_UID=").append(android.os.Process.myUid()) // files the renderer opens while it runs
+                 .append(" GLIBC_TUNABLES=glibc.pthread.rseq=0; cd ")
                  .append(sq(files.getPath())).append(" && ulimit -s 65520 2>/dev/null; touch engine.root; ");
                 for (String a : cmd.subList(3, cmd.size())) q.append(sq(a)).append(' ');
                 int uid = android.os.Process.myUid();

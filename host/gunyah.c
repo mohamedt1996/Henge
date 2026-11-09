@@ -21,7 +21,10 @@
      there forever. A scanner rewrites each `hvc #0; cbnz x0, .` pair it finds in guest memory to
      `mov x0, #0; nop` (and makes the CPU see it): the keys stay at their reset values, which every process then
      shares, which is what Henge's JIT does as well.
-   - One vCPU for now: Gunyah numbers the VM's CPUs itself, and vmapple's device tree has to match. */
+   - vCPUs: one per Henge CPU, each run by its own host thread (the VM's vCPUs are "proxy" scheduled: a vCPU runs
+     only while a thread sits in GH_VCPU_RUN for it). The resource manager's tree lists cpu@0..N with reg = i, the
+     same Aff0 values vmapple's config gives XNU, and Gunyah itself answers the guest's PSCI (method hvc): a
+     secondary's GH_VCPU_RUN returns to guest code once the kernel's CPU_ON powers it on. */
 #include "gunyah.h"
 
 #include <errno.h>
@@ -85,10 +88,12 @@ extern void (*hv_vm_stop_hook)(void);
 
 static HvMachine *M;
 static HvVmapple *B;
-static int vm_fd = -1, vcpu_fd = -1, dev_kick = -1;
-static struct gh_vcpu_run *run;
+static int vm_fd = -1, dev_kick = -1, nvcpu;
+static int vcpu_fd[HV_MAX_CPUS];
+static struct gh_vcpu_run *run[HV_MAX_CPUS];
 static volatile int stop_req, vm_reason = -1;
-static pthread_t vcpu_thread_id;
+static pthread_t vcpu_thread_id[HV_MAX_CPUS];
+static volatile uint64_t mmio_exits[HV_MAX_CPUS];
 static int irq_fd[NIRQ];
 static volatile uint8_t irq_level[NIRQ];
 
@@ -327,57 +332,63 @@ static void kick_devices(void) {
 static void on_sigusr(int s) { (void)s; }
 
 static void *vcpu_thread(void *arg) {
-    (void)arg;
-    uint64_t mmio_exits = 0, unknown = 0, gic_exits = 0;
+    int id = (int)(intptr_t)arg;
+    struct gh_vcpu_run *r = run[id];
+    uint64_t unknown = 0, gic_exits = 0;
     time_t last_report = time(NULL);
     while (!stop_req) {
-        if (ioctl(vcpu_fd, GH_VCPU_RUN, 0) < 0) {
-            if (errno == EINTR) continue;
-            fprintf(stderr, "gunyah: running the vCPU failed: %s\n", strerror(errno));
+        if (ioctl(vcpu_fd[id], GH_VCPU_RUN, 0) < 0) {
+            if (errno == EINTR || errno == EAGAIN) continue;
+            fprintf(stderr, "gunyah: running vCPU %d failed: %s\n", id, strerror(errno));
             vm_reason = HV_EXIT_UNSUPPORTED;
             break;
         }
-        if (run->exit_reason == GH_VCPU_EXIT_MMIO) {
-            uint64_t pa = run->mmio.phys_addr;
-            unsigned len = run->mmio.len > 8 ? 8 : run->mmio.len;
-            mmio_exits++;
+        if (r->exit_reason == GH_VCPU_EXIT_MMIO) {
+            uint64_t pa = r->mmio.phys_addr;
+            unsigned len = r->mmio.len > 8 ? 8 : r->mmio.len;
+            mmio_exits[id]++;
             if (pa >= VMAPPLE_GIC_DIST && pa < VMAPPLE_GIC_MSI && gic_exits++ < 4)
-                fprintf(stderr, "gunyah: the guest's GIC access at %llx came here: Gunyah did not put its GIC at "
-                                "vmapple's address\n", (unsigned long long)pa);
-            if (run->mmio.is_write) {
-                if (hv_phys_write(M, pa, run->mmio.data, len) != 0 && unknown++ < 16)
-                    fprintf(stderr, "gunyah: write to nothing at %llx\n", (unsigned long long)pa);
+                fprintf(stderr, "gunyah: vCPU %d's GIC access at %llx came here: Gunyah did not put its GIC at "
+                                "vmapple's address\n", id, (unsigned long long)pa);
+            /* Every vCPU goes through Henge's device dispatch, which takes the device lock itself. */
+            if (r->mmio.is_write) {
+                if (hv_phys_write(M, pa, r->mmio.data, len) != 0 && unknown++ < 16)
+                    fprintf(stderr, "gunyah: vCPU %d write to nothing at %llx\n", id, (unsigned long long)pa);
                 kick_devices();
             } else {
-                memset(run->mmio.data, 0, sizeof run->mmio.data);
-                if (hv_phys_read(M, pa, run->mmio.data, len) != 0 && unknown++ < 16)
-                    fprintf(stderr, "gunyah: read of nothing at %llx\n", (unsigned long long)pa);
+                memset(r->mmio.data, 0, sizeof r->mmio.data);
+                if (hv_phys_read(M, pa, r->mmio.data, len) != 0 && unknown++ < 16)
+                    fprintf(stderr, "gunyah: vCPU %d read of nothing at %llx\n", id, (unsigned long long)pa);
             }
-        } else if (run->exit_reason == GH_VCPU_EXIT_STATUS) {
+        } else if (r->exit_reason == GH_VCPU_EXIT_STATUS) {
             uint32_t reason = 0;
-            memcpy(&reason, run->status.reason, run->status.reason_size < 4 ? run->status.reason_size : 4);
-            fprintf(stderr, "gunyah: the VM stopped: status %u (1 load failed, 2 exited, 3 crashed), type %u, reason %#x\n",
-                    run->status.status, run->status.type, reason);
-            vm_reason = run->status.status == 2 ? 0 : HV_EXIT_UNSUPPORTED;
+            memcpy(&reason, r->status.reason, r->status.reason_size < 4 ? r->status.reason_size : 4);
+            fprintf(stderr, "gunyah: the VM stopped (seen by vCPU %d): status %u (1 load failed, 2 exited, 3 crashed), "
+                            "type %u, reason %#x\n", id, r->status.status, r->status.type, reason);
+            vm_reason = r->status.status == 2 ? 0 : HV_EXIT_UNSUPPORTED;
             break;
         } else {
-            fprintf(stderr, "gunyah: unknown vCPU exit %u\n", run->exit_reason);
+            fprintf(stderr, "gunyah: unknown exit %u on vCPU %d\n", r->exit_reason, id);
             vm_reason = HV_EXIT_UNSUPPORTED;
             break;
         }
-        if (time(NULL) - last_report >= 30) {
+        if (id == 0 && time(NULL) - last_report >= 30) {
             last_report = time(NULL);
-            fprintf(stderr, "gunyah: %llu device accesses so far\n", (unsigned long long)mmio_exits);
+            fprintf(stderr, "gunyah: device accesses so far:");
+            for (int i = 0; i < nvcpu; i++) fprintf(stderr, " vcpu%d %llu", i, (unsigned long long)mmio_exits[i]);
+            fputc('\n', stderr);
         }
     }
-    stop_req = 1;
+    hv_gunyah_stop(); /* one vCPU stopping (the VM exited or crashed) stops them all */
     return NULL;
 }
 
 void hv_gunyah_stop(void) {
     stop_req = 1;
-    if (run) run->immediate_exit = 1;
-    if (vcpu_thread_id) pthread_kill(vcpu_thread_id, SIGUSR1);
+    for (int i = 0; i < nvcpu; i++) {
+        if (run[i]) run[i]->immediate_exit = 1;
+        if (vcpu_thread_id[i] && !pthread_equal(vcpu_thread_id[i], pthread_self())) pthread_kill(vcpu_thread_id[i], SIGUSR1);
+    }
 }
 
 static int fail(const char *what) {
@@ -388,7 +399,10 @@ static int fail(const char *what) {
 int hv_gunyah_run(void) {
     M = hv_vm_machine();
     B = hv_vm_board();
-    if (hv_vm_ncpus() != 1) fprintf(stderr, "gunyah: running CPU 0 only\n");
+    nvcpu = hv_vm_ncpus();
+    if (nvcpu < 1) nvcpu = 1;
+    if (nvcpu > HV_MAX_CPUS) nvcpu = HV_MAX_CPUS;
+    for (int i = 0; i < HV_MAX_CPUS; i++) vcpu_fd[i] = -1;
     for (int i = 0; i < NIRQ; i++) irq_fd[i] = -1;
 
     int dev = open("/dev/gunyah", O_RDWR | O_CLOEXEC);
@@ -405,7 +419,7 @@ int hv_gunyah_run(void) {
         0xd61f0200u,                                              /* br x16 */
     };
     memcpy(boot, tramp, sizeof tramp);
-    size_t dtb_len = build_dtb(boot + DTB_OFF, BOOT_SIZE - DTB_OFF, 1);
+    size_t dtb_len = build_dtb(boot + DTB_OFF, BOOT_SIZE - DTB_OFF, nvcpu);
     if (!dtb_len) { fprintf(stderr, "gunyah: the VM device tree is too big\n"); return -1; }
 
     uint32_t label = 0;
@@ -443,16 +457,26 @@ int hv_gunyah_run(void) {
     }
     fprintf(stderr, "gunyah: %d interrupt doorbells\n", bells);
 
-    uint32_t id0 = 0;
-    struct gh_fn_desc fn = {.type = GH_FN_VCPU, .arg_size = sizeof id0, .arg = (uintptr_t)&id0};
-    vcpu_fd = ioctl(vm_fd, GH_VM_ADD_FUNCTION, &fn);
-    if (vcpu_fd < 0) return fail("adding the vCPU");
+    for (int i = 0; i < nvcpu; i++) {
+        uint32_t id = (uint32_t)i;
+        struct gh_fn_desc fn = {.type = GH_FN_VCPU, .arg_size = sizeof id, .arg = (uintptr_t)&id};
+        vcpu_fd[i] = ioctl(vm_fd, GH_VM_ADD_FUNCTION, &fn);
+        if (vcpu_fd[i] < 0) {
+            if (i == 0) return fail("adding the vCPU");
+            /* The VM was configured for nvcpu; fewer vCPUs would leave XNU waiting on CPUs that never come. */
+            fprintf(stderr, "gunyah: adding vCPU %d failed: %s; set the CPU count to %d\n", i, strerror(errno), i);
+            return -1;
+        }
+    }
     if (ioctl(vm_fd, GH_VM_START, 0) < 0) return fail("starting the VM");
-    long sz = ioctl(vcpu_fd, GH_VCPU_MMAP_SIZE, 0);
+    long sz = ioctl(vcpu_fd[0], GH_VCPU_MMAP_SIZE, 0);
     if (sz < 0) sz = ioctl(dev, GH_VCPU_MMAP_SIZE, 0);
     if (sz <= 0) return fail("asking the vCPU's run area size");
-    run = mmap(NULL, (size_t)sz, PROT_READ | PROT_WRITE, MAP_SHARED, vcpu_fd, 0);
-    if (run == MAP_FAILED) { run = NULL; return fail("mapping the vCPU's run area"); }
+    for (int i = 0; i < nvcpu; i++) {
+        run[i] = mmap(NULL, (size_t)sz, PROT_READ | PROT_WRITE, MAP_SHARED, vcpu_fd[i], 0);
+        if (run[i] == MAP_FAILED) { run[i] = NULL; return fail("mapping a vCPU's run area"); }
+    }
+    fprintf(stderr, "gunyah: %d vCPU%s\n", nvcpu, nvcpu == 1 ? "" : "s");
 
     dev_kick = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     hv_vm_stop_hook = hv_gunyah_stop;
@@ -466,9 +490,12 @@ int hv_gunyah_run(void) {
     pthread_detach(t);
     pthread_create(&t, NULL, pac_thread, NULL);
     pthread_detach(t);
-    pthread_create(&vcpu_thread_id, NULL, vcpu_thread, NULL);
-    pthread_join(vcpu_thread_id, NULL);
-    vcpu_thread_id = 0;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 8u << 20);
+    for (int i = 0; i < nvcpu; i++) pthread_create(&vcpu_thread_id[i], &attr, vcpu_thread, (void *)(intptr_t)i);
+    for (int i = 0; i < nvcpu; i++) pthread_join(vcpu_thread_id[i], NULL);
+    for (int i = 0; i < nvcpu; i++) vcpu_thread_id[i] = 0;
     stop_req = 1;
     usleep(20000);
     return vm_reason < 0 ? 0 : vm_reason;
