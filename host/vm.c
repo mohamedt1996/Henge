@@ -59,10 +59,10 @@ int hv_vm_ncpus(void) { return ncpus; }
 int hv_vm_boot_display(HvBootDisplay *d) {
     /* What the guest's GPU has drawn, once it has drawn anything. */
     HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
-    if (!pvg) return -1;
     const uint8_t *frame;
     uint32_t fw, fh;
-    if (hv_pvg_lite_frame(pvg, &frame, &fw, &fh) == 0) {
+    /* No pvg_lite (the GPU device is the host's, Android's Graphics: reims): the boot framebuffer only. */
+    if (pvg && hv_pvg_lite_frame(pvg, &frame, &fw, &fh) == 0) {
         d->pixels = (uint8_t *)frame;
         d->width = fw, d->height = fh, d->stride = fw * 4;
         return 0;

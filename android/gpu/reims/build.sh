@@ -70,6 +70,9 @@ export CC_aarch64_linux_android="$CLANG/$TARGET$API-clang"
 export AR_aarch64_linux_android="$CLANG/llvm-ar"
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$WORK/target}"
+# reims-vgpu's guest-memory atomics are LSE instructions (Apple's CPUs always have them); Android's
+# default target is plain ARMv8.0. The tablet's cores are ARMv9: ARMv8.2 with LSE and RCpc is safe.
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C target-feature=+v8.2a,+lse,+rcpc,+crc,+aes,+sha2"
 
 cd "$WORK/reims-vgpu"
 RUSTUP_TOOLCHAIN=$TOOLCHAIN cargo build --release --target "$TARGET" -p reims-vgpu-c --no-default-features --features vulkan
