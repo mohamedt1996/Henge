@@ -363,7 +363,7 @@ int restore_reboot(struct idevicerestore_client_t* client)
 
 	restored_client_free(client->restore->client);
 
-	cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 30000);
+	cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, HV_TIMEOUT(30000));
 	if (client->mode == MODE_RESTORE) {
 		mutex_unlock(&client->device_event_mutex);
 		return -1;
@@ -5358,14 +5358,14 @@ static int restore_wait_for_reconnect(struct idevicerestore_client_t* client)
 		idevice_free(client->restore->device);
 		client->restore->device = NULL;
 	}
-	for (i = 0; i < 10; i++) {
+	for (i = 0; i < 10 * hv_timeout_scale(); i++) {
 		sleep(1);
 		if (restore_open_with_timeout(client) == 0) {
 			logger(LL_INFO, "Device reappeared, reconnected to restored\n");
 			return 0;
 		}
 	}
-	logger(LL_ERROR, "Device did not reappear after 10 seconds\n");
+	logger(LL_ERROR, "Device did not reappear after %d seconds\n", 10 * hv_timeout_scale());
 	return -1;
 }
 #endif
@@ -5387,7 +5387,14 @@ int restore_device(struct idevicerestore_client_t* client, plist_t build_identit
 	restore_finished = 0;
 
 	// open our connection to the device and verify we're in restore mode
-	err = restore_open_with_timeout(client);
+	/* HengeVM: on a slow guest the restore OS shows up on USB well before
+	   restored listens; keep trying for 30 s (scaled) instead of once. */
+	for (int tries = 30 * hv_timeout_scale(); ; tries--) {
+		err = restore_open_with_timeout(client);
+		if (err == 0 || tries <= 1 || (client->flags & FLAG_QUIT)) break;
+		logger(LL_VERBOSE, "restored not answering yet, retrying...\n");
+		sleep(1);
+	}
 	if (err < 0) {
 		logger(LL_ERROR, "Unable to open device in restore mode\n");
 		return (err == -2) ? -1: -2;

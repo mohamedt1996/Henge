@@ -197,6 +197,11 @@ static uint64_t psci(HvCpu *cpu, uint64_t fn) {
         cpu->x[2] = 0x524f50; /* the values only name keys, and no key is ever used */
         cpu->x[3] = 0x4a4f50;
         return 0;
+    /* SMCCC OEM-service queries (call count, UID, revision): XNU asks which
+       hypervisor it runs on before using Apple's guest calls. NOT_SUPPORTED
+       says "not Apple's", which it takes in stride, so no log line. */
+    case 0x8300ff00: case 0x8300ff01: case 0x8300ff03:
+        return (uint64_t)-1;
     default:
         if (cpu->m->log) fprintf(stderr, "hengevm: unknown hypervisor call %#llx (x1 %#llx) at el%u\n",
                                  (unsigned long long)fn, (unsigned long long)cpu->x[1], cpu->el);

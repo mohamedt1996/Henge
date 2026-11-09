@@ -210,6 +210,12 @@ char* realpath(const char *filename, char *resolved_name);
 
 void get_user_input(char *buf, int maxlen, int secure);
 
+/* HengeVM: a virtual Mac under a JIT (Android) boots and answers many times
+   slower than real hardware, so every wait for the device is stretched by
+   HV_RESTORE_TIMEOUT_SCALE (default 1). */
+int hv_timeout_scale(void);
+#define HV_TIMEOUT(ms) ((ms) * hv_timeout_scale())
+
 const char* path_get_basename(const char* path);
 
 #ifdef __cplusplus

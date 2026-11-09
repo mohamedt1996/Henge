@@ -239,7 +239,7 @@ int recovery_enter_restore(struct idevicerestore_client_t* client, plist_t build
 	}
 
 	logger(LL_DEBUG, "Waiting for device to disconnect...\n");
-	cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 30000);
+	cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, HV_TIMEOUT(30000));
 	if (client->mode == MODE_RECOVERY || (client->flags & FLAG_QUIT)) {
 		mutex_unlock(&client->device_event_mutex);
 		logger(LL_ERROR, "Failed to place device in restore mode\n");

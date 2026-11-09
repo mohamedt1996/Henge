@@ -407,7 +407,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 	// check which mode the device is currently in so we know where to start
 	mutex_lock(&client->device_event_mutex);
 	if (client->mode == MODE_UNKNOWN) {
-		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 10000);
+		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, HV_TIMEOUT(10000));
 		if (client->mode == MODE_UNKNOWN || (client->flags & FLAG_QUIT)) {
 			mutex_unlock(&client->device_event_mutex);
 			logger(LL_ERROR, "Unable to discover device mode. Please make sure a device is attached.\n");
@@ -494,7 +494,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 
 		free(wtftmp);
 
-		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 10000);
+		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, HV_TIMEOUT(10000));
 		if (client->mode != MODE_DFU || (client->flags & FLAG_QUIT)) {
 			mutex_unlock(&client->device_event_mutex);
 			/* TODO: verify if it actually goes from 0x1222 -> 0x1227 */
@@ -708,7 +708,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 
 			// we need to refresh the current mode again
 			mutex_lock(&client->device_event_mutex);
-			cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 60000);
+			cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, HV_TIMEOUT(60000));
 			if (client->mode == MODE_UNKNOWN || (client->flags & FLAG_QUIT)) {
 				mutex_unlock(&client->device_event_mutex);
 				logger(LL_ERROR, "Unable to discover device mode. Please make sure a device is attached.\n");
@@ -838,7 +838,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		}
 
 		logger(LL_DEBUG, "Waiting for device to disconnect...\n");
-		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 5000);
+		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, HV_TIMEOUT(5000));
 		if (client->mode != MODE_UNKNOWN || (client->flags & FLAG_QUIT)) {
 			mutex_unlock(&client->device_event_mutex);
 
@@ -849,7 +849,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		}
 		dfu_client_free(client);
 		logger(LL_DEBUG, "Waiting for device to reconnect in DFU mode...\n");
-		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 20000);
+		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, HV_TIMEOUT(20000));
 		if (client->mode != MODE_DFU || (client->flags & FLAG_QUIT)) {
 			mutex_unlock(&client->device_event_mutex);
 			if (!(client->flags & FLAG_QUIT)) {
@@ -1459,7 +1459,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		recovery_client_free(client);
 
 		logger(LL_DEBUG, "Waiting for device to disconnect...\n");
-		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 60000);
+		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, HV_TIMEOUT(60000));
 		if (client->mode != MODE_UNKNOWN || (client->flags & FLAG_QUIT)) {
 			mutex_unlock(&client->device_event_mutex);
 
@@ -1470,7 +1470,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		}
 		recovery_client_free(client);
 		logger(LL_DEBUG, "Waiting for device to reconnect in recovery mode...\n");
-		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 60000);
+		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, HV_TIMEOUT(60000));
 		if (client->mode != MODE_RECOVERY || (client->flags & FLAG_QUIT)) {
 			mutex_unlock(&client->device_event_mutex);
 			if (!(client->flags & FLAG_QUIT)) {
@@ -1541,7 +1541,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 	if (client->mode != MODE_RESTORE) {
 		mutex_lock(&client->device_event_mutex);
 		logger(LL_INFO, "Waiting for device to enter restore mode...\n");
-		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, 300000);
+		cond_wait_timeout(&client->device_event_cond, &client->device_event_mutex, HV_TIMEOUT(300000));
 		if (client->mode != MODE_RESTORE || (client->flags & FLAG_QUIT)) {
 			mutex_unlock(&client->device_event_mutex);
 			logger(LL_ERROR, "Device failed to enter restore mode.\n");

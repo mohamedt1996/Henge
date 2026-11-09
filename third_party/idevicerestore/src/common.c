@@ -969,3 +969,14 @@ const char* path_get_basename(const char* path)
 	return p ? p + 1 : path;
 #endif
 }
+
+int hv_timeout_scale(void)
+{
+	static int scale = 0;
+	if (!scale) {
+		const char *v = getenv("HV_RESTORE_TIMEOUT_SCALE");
+		int n = v ? atoi(v) : 1;
+		scale = n < 1 ? 1 : (n > 100 ? 100 : n);
+	}
+	return scale;
+}

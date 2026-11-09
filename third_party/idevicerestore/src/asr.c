@@ -52,7 +52,7 @@
 int asr_open_with_timeout(idevice_t device, asr_client_t* asr, uint16_t port)
 {
 	int i = 0;
-	int attempts = 30;
+	int attempts = 30 * hv_timeout_scale();
 	idevice_connection_t connection = NULL;
 	idevice_error_t device_error = IDEVICE_E_SUCCESS;
 

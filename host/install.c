@@ -11,12 +11,14 @@
 #include "install.h"
 
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "idevicerestore/src/idevicerestore.h"
+#include "idevicerestore/src/log.h"
 #include "usb_host.h"
 
 int usbmuxd_main(int argc, char **argv);
@@ -26,6 +28,18 @@ static void *g_progress_user;
 static char g_ipsw[1024], g_cache[1024], g_mux[64];
 static uint64_t g_ecid;
 static volatile int g_result = 1; /* 1 running, 0 done, < 0 failed */
+static FILE *g_log;
+extern enum loglevel print_level;
+
+/* idevicerestore built as a library has no print function and falls back to
+   stdout, which the Android app never shows. With one set, every line goes
+   to stderr (the app's log) with its timestamp, and here to install.log. */
+static void log_line(enum loglevel level, const char *fmt, va_list ap) {
+    (void)level;
+    if (!g_log) return;
+    vfprintf(g_log, fmt, ap);
+    fflush(g_log);
+}
 
 static void *mux_thread(void *arg) {
     (void)arg;
@@ -56,6 +70,12 @@ static void *restore_thread(void *arg) {
     }
     int flags = FLAG_ERASE;
     if (getenv("HV_INSTALL_LOG")) flags |= FLAG_DEBUG;
+    char path[1100];
+    snprintf(path, sizeof path, "%s/install.log", g_cache);
+    g_log = fopen(path, "w");
+    if (g_log) fprintf(stderr, "install: restore log in %s\n", path);
+    print_level = LL_DEBUG; /* the file keeps whatever log_level lets through */
+    logger_set_print_func(log_line);
     idevicerestore_set_flags(c, flags);
     idevicerestore_set_ipsw(c, g_ipsw);
     idevicerestore_set_cache_path(c, g_cache);
@@ -63,6 +83,7 @@ static void *restore_thread(void *arg) {
     idevicerestore_set_progress_callback(c, progress, NULL);
     int r = idevicerestore_start(c);
     fprintf(stderr, "install: restore finished: %d\n", r);
+    if (g_log) fprintf(g_log, "restore finished: %d\n", r), fflush(g_log); /* left open: other threads may still log */
     idevicerestore_client_free(c);
     g_result = r == 0 ? 0 : -1;
     if (g_progress) g_progress(r == 0 ? HV_INSTALL_DONE : HV_INSTALL_FAILED, 1.0, g_progress_user);
