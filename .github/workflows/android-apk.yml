@@ -75,7 +75,7 @@ jobs:
           key: reims-${{ hashFiles('android/gpu/reims/build.sh', 'android/gpu/reims/android_port.py', 'android/gpu/reims/window_android.rs') }}
 
       # Graphics: reims. Experimental: a failure here leaves the APK without it (the app says so).
-      - name: reims-vgpu for the tablet (Graphics: reims)
+      - name: "reims-vgpu for the tablet (Graphics: reims)"
         continue-on-error: true
         env:
           REIMS_WORK: /home/runner/reims-work
