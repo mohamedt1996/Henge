@@ -10,7 +10,7 @@ The engine (arm64 JIT, MMU, vmapple devices) builds for Linux/Android arm64 and 
   shows the boot framebuffer and forwards pointer and keys. The macOS desktop itself is drawn by Apple-GPU
   shader binaries that only Apple's Metal stack can load, so it does not render here.
 - **Install on the device:** `--install FOLDER` fetches the boot ROM from Apple (under 1 MB), downloads the
-  macOS restore image (resumable), and restores it with the vendored idevicerestore/usbmuxd stack
+  macOS restore image (resumable; 8 parallel connections in 32 MB chunks, `HV_DL_CONNECTIONS` to change), and restores it with the vendored idevicerestore/usbmuxd stack
   (`android/build_restore.sh`), as the iOS app does. About 45 GB free: 17 GB image (deletable after), ~26 GB Mac.
   `--cache DIR` keeps the image and boot ROM there: a reinstall reuses them, and a `--mac` run whose boot
   ROM is missing restores it from there (or Apple). The app keeps downloads in Henge/ on shared storage when

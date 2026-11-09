@@ -328,7 +328,10 @@ public class MainActivity extends Activity {
             return "Fetching the boot ROM from Apple" + (m.find() ? " · " + m.group(1) + " / " + m.group(2) + " KB" : "");
         }
         Matcher m = Pattern.compile("([0-9.]+) / ([0-9.]+) GB \\([0-9]+%\\) ([0-9.]+) MB/s").matcher(lastMatch(log, "henge: downloading macOS "));
-        if (m.find()) return "macOS · " + m.group(1) + " of " + m.group(2) + " GB · " + m.group(3) + " MB/s";
+        Matcher n = Pattern.compile("over ([0-9]+) connections").matcher(log);
+        String conns = "";
+        while (n.find()) conns = " · " + n.group(1) + " connections";
+        if (m.find()) return "macOS · " + m.group(1) + " of " + m.group(2) + " GB · " + m.group(3) + " MB/s" + conns;
         String r = lastMatch(log, "henge: download interrupted");
         return r.isEmpty() ? "Starting the macOS download" : "Reconnecting…";
     }
@@ -496,8 +499,8 @@ public class MainActivity extends Activity {
         c.addView(infoRow("Engine", VmService.busy() ? "Running" : VmService.state));
         page.addView(c);
 
-        downloads(page);
         tablet(page);
+        downloads(page);
 
         page.addView(heading("Log"));
         LinearLayout l = card(22);
@@ -654,6 +657,8 @@ public class MainActivity extends Activity {
             t.setTextIsSelectable(true);
             c.addView(t);
             c.addView(gap(10));
+            c.addView(link("Open full screen", v -> showCheck()));
+            c.addView(gap(10));
             c.addView(link("Copy", v -> {
                 getSystemService(android.content.ClipboardManager.class)
                         .setPrimaryClip(android.content.ClipData.newPlainText("Henge device check", checkResult));
@@ -669,6 +674,7 @@ public class MainActivity extends Activity {
                 String r = DeviceCheck.run(getApplicationContext());
                 checkResult = r;
                 checking = false;
+                ui.post(() -> { if (!isFinishing()) { render(true); showCheck(); } });
             }, "device-check").start();
         }));
         TextView note = text("Asks for root (su) to read the hypervisor devices; saved to Android/data/dev.henge.android/files/device-check.txt.",
@@ -676,6 +682,26 @@ public class MainActivity extends Activity {
         note.setPadding(0, dp(10), 0, 0);
         c.addView(note);
         page.addView(c);
+    }
+
+    /** The check's result over the app, scrollable and selectable, with Copy. */
+    private void showCheck() {
+        TextView t = text(checkResult.trim(), 12, TEXT, false, Typeface.MONOSPACE);
+        t.setTextIsSelectable(true);
+        t.setPadding(dp(20), dp(12), dp(20), dp(12));
+        android.widget.HorizontalScrollView h = new android.widget.HorizontalScrollView(this);
+        h.addView(t);
+        ScrollView v = new ScrollView(this);
+        v.addView(h);
+        new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("This tablet")
+                .setView(v)
+                .setPositiveButton("Copy", (d, w) -> {
+                    getSystemService(android.content.ClipboardManager.class)
+                            .setPrimaryClip(android.content.ClipData.newPlainText("Henge device check", checkResult));
+                    android.widget.Toast.makeText(this, "Copied", android.widget.Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("Close", null).show();
     }
 
     // MARK: Engine

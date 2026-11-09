@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -251,11 +252,260 @@ static int dl_progress(void *u, curl_off_t total, curl_off_t now, curl_off_t ut,
     return 0;
 }
 
+/* ---- parallel: the image in 32 MB chunks over several connections (one connection to Apple's CDN
+   is often held to a fraction of the line). Progress per chunk is kept in <path>.part.map, so it
+   resumes; a .part from the single-connection download counts as its first bytes. ---- */
+
+enum { CHUNK = 32 << 20 };
+typedef struct { char magic[4]; uint32_t chunks; uint64_t total, chunk; } MapHead;
+typedef struct Par Par;
+typedef struct { Par *p; CURL *e; int chunk, checked, attempt; off_t pos, end; } Slot;
+struct Par {
+    int fd, mapfd, conns;
+    uint64_t total, *done;
+    uint32_t chunks;
+    uint8_t *active;
+    time_t *retry_at;
+    int failed; /* the server refused the range: fall back */
+};
+
+static uint64_t chunk_len(const Par *p, uint32_t i) {
+    uint64_t start = (uint64_t)i * CHUNK;
+    return p->total - start < CHUNK ? p->total - start : CHUNK;
+}
+
+static void save_map(Par *p) {
+    MapHead h = {{'H', 'D', 'L', '1'}, p->chunks, p->total, CHUNK};
+    fdatasync(p->fd); /* the bytes before the record that says they are there */
+    if (pwrite(p->mapfd, &h, sizeof h, 0) == (ssize_t)sizeof h)
+        (void)!pwrite(p->mapfd, p->done, p->chunks * sizeof *p->done, sizeof h);
+}
+
+static size_t par_write(char *d, size_t sz, size_t n, void *u) {
+    Slot *s = u;
+    size_t k = sz * n;
+    if (!s->checked) { /* 200 would be the whole file from byte 0: never write that into a chunk */
+        long status = 0;
+        curl_easy_getinfo(s->e, CURLINFO_RESPONSE_CODE, &status);
+        if (status != 206) { s->p->failed = 1; return 0; }
+        s->checked = 1;
+    }
+    if (s->pos + (off_t)k > s->end) return 0;
+    for (size_t w = 0; w < k;) {
+        ssize_t r = pwrite(s->p->fd, d + w, k - w, s->pos + (off_t)w);
+        if (r <= 0) return 0;
+        w += (size_t)r;
+    }
+    s->pos += (off_t)k;
+    s->p->done[s->chunk] = (uint64_t)s->pos - (uint64_t)s->chunk * CHUNK;
+    return k;
+}
+
+static void slot_start(CURLM *m, Slot *s, const char *url, int chunk) {
+    Par *p = s->p;
+    s->chunk = chunk, s->checked = 0;
+    s->pos = (off_t)((uint64_t)chunk * CHUNK + p->done[chunk]);
+    s->end = (off_t)((uint64_t)chunk * CHUNK + chunk_len(p, (uint32_t)chunk));
+    char range[64];
+    snprintf(range, sizeof range, "%lld-%lld", (long long)s->pos, (long long)s->end - 1);
+    s->e = curl_easy_init();
+    curl_easy_setopt(s->e, CURLOPT_URL, url);
+    curl_easy_setopt(s->e, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(s->e, CURLOPT_RANGE, range);
+    curl_easy_setopt(s->e, CURLOPT_WRITEFUNCTION, par_write);
+    curl_easy_setopt(s->e, CURLOPT_WRITEDATA, s);
+    curl_easy_setopt(s->e, CURLOPT_PRIVATE, s);
+    timeouts(s->e);
+    pick_dns(s->e, ++s->attempt);
+    p->active[chunk] = 1;
+    curl_multi_add_handle(m, s->e);
+}
+
+static size_t probe_header(char *d, size_t sz, size_t n, void *u) {
+    size_t k = sz * n;
+    char line[256];
+    size_t l = k < sizeof line - 1 ? k : sizeof line - 1;
+    memcpy(line, d, l), line[l] = 0;
+    const char *slash;
+    if (!strncasecmp(line, "content-range:", 14) && (slash = strchr(line, '/'))) *(uint64_t *)u = strtoull(slash + 1, NULL, 10);
+    return k;
+}
+static size_t discard(char *d, size_t sz, size_t n, void *u) { (void)d, (void)u; return sz * n; }
+
+/* The image's size (from a one-byte range) and where its redirects end, or 0 when ranges aren't offered. */
+static uint64_t probe(const char *url, char *final, size_t cap) {
+    for (int attempt = 1; attempt <= 6; attempt++) {
+        uint64_t total = 0;
+        CURL *c = curl_easy_init();
+        curl_easy_setopt(c, CURLOPT_URL, url);
+        curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(c, CURLOPT_RANGE, "0-0");
+        curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, probe_header);
+        curl_easy_setopt(c, CURLOPT_HEADERDATA, &total);
+        curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, discard);
+        timeouts(c);
+        pick_dns(c, attempt);
+        CURLcode rc = curl_easy_perform(c);
+        long status = 0;
+        char *eff = NULL;
+        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+        curl_easy_getinfo(c, CURLINFO_EFFECTIVE_URL, &eff);
+        snprintf(final, cap, "%s", eff ? eff : url);
+        curl_easy_cleanup(c);
+        if (rc == CURLE_OK) return status == 206 ? total : 0;
+        sleep((unsigned)attempt);
+    }
+    return 0;
+}
+
+/* 1 done, 0 not possible here (use one connection), -1 failed. */
+static int download_parallel(const char *url, const char *path, const char *part) {
+    const char *env = getenv("HV_DL_CONNECTIONS");
+    int conns = env ? atoi(env) : 8;
+    if (conns > 16) conns = 16;
+    char where[2048], mapname[1100];
+    snprintf(mapname, sizeof mapname, "%s.map", part);
+    uint64_t total = conns > 1 ? probe(url, where, sizeof where) : 0;
+    if (!total) {
+        /* one connection from here: a chunked .part has holes, so it can't be appended to */
+        if (access(mapname, F_OK) == 0) unlink(part), unlink(mapname);
+        return 0;
+    }
+    Par p = {.conns = conns, .total = total, .chunks = (uint32_t)((total + CHUNK - 1) / CHUNK)};
+    p.done = calloc(p.chunks, sizeof *p.done);
+    p.active = calloc(p.chunks, 1);
+    p.retry_at = calloc(p.chunks, sizeof *p.retry_at);
+    Slot *slots = calloc((size_t)conns, sizeof *slots);
+    p.fd = open(part, O_RDWR | O_CREAT, 0644);
+    p.mapfd = open(mapname, O_RDWR | O_CREAT, 0644);
+    int result = -1;
+    if (p.fd < 0 || p.mapfd < 0 || !p.done || !p.active || !p.retry_at || !slots) goto out;
+    MapHead h;
+    struct stat st;
+    fstat(p.fd, &st);
+    if (pread(p.mapfd, &h, sizeof h, 0) == (ssize_t)sizeof h && !memcmp(h.magic, "HDL1", 4) && h.total == total &&
+        h.chunk == CHUNK && h.chunks == p.chunks) {
+        if (pread(p.mapfd, p.done, p.chunks * sizeof *p.done, sizeof h) != (ssize_t)(p.chunks * sizeof *p.done))
+            memset(p.done, 0, p.chunks * sizeof *p.done);
+    } else { /* a single-connection .part: its bytes are the start of the file */
+        uint64_t have = (uint64_t)st.st_size < total ? (uint64_t)st.st_size : total;
+        for (uint32_t i = 0; i < p.chunks; i++) {
+            uint64_t start = (uint64_t)i * CHUNK;
+            p.done[i] = have <= start ? 0 : have - start < chunk_len(&p, i) ? have - start : chunk_len(&p, i);
+        }
+    }
+    for (uint32_t i = 0; i < p.chunks; i++) if (p.done[i] > chunk_len(&p, i)) p.done[i] = 0;
+    if ((uint64_t)st.st_size != total && ftruncate(p.fd, (off_t)total) != 0) goto out;
+    save_map(&p);
+    fprintf(stderr, "henge: downloading over %d connections\n", conns);
+
+    CURLM *m = curl_multi_init();
+    curl_multi_setopt(m, CURLMOPT_MAX_HOST_CONNECTIONS, (long)conns);
+    for (int i = 0; i < conns; i++) slots[i].p = &p;
+    uint32_t next = 0;
+    int running = 0, stuck = 0;
+    time_t last = 0, mark_t = 0, saved = time(NULL);
+    uint64_t mark = 0;
+    double rate = 0;
+    for (;;) {
+        time_t now = time(NULL);
+        /* idle slots take the next unfinished chunk that isn't in flight or waiting out a failure */
+        for (int i = 0; i < conns; i++) {
+            if (slots[i].e) continue;
+            for (uint32_t k = 0; k < p.chunks; k++) {
+                uint32_t c = (next + k) % p.chunks;
+                if (p.done[c] < chunk_len(&p, c) && !p.active[c] && p.retry_at[c] <= now) {
+                    slot_start(m, &slots[i], where, (int)c);
+                    next = c + 1;
+                    break;
+                }
+            }
+        }
+        uint64_t got = 0;
+        int left = 0;
+        for (uint32_t c = 0; c < p.chunks; c++) {
+            got += p.done[c];
+            left += p.done[c] < chunk_len(&p, c);
+        }
+        if (!left) break;
+        curl_multi_perform(m, &running);
+        CURLMsg *msg;
+        int q;
+        while ((msg = curl_multi_info_read(m, &q))) {
+            if (msg->msg != CURLMSG_DONE) continue;
+            Slot *s;
+            curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, (char **)&s);
+            long status = 0;
+            curl_easy_getinfo(s->e, CURLINFO_RESPONSE_CODE, &status);
+            CURLcode rc = msg->data.result;
+            curl_multi_remove_handle(m, s->e);
+            curl_easy_cleanup(s->e);
+            s->e = NULL;
+            p.active[s->chunk] = 0;
+            if (p.failed) goto stop;
+            if (rc == CURLE_OK && status == 206 && s->pos == s->end) { stuck = 0; continue; }
+            if (status >= 400 && status != 416 && status != 429 && status < 500) {
+                fprintf(stderr, "\nhenge: download failed (HTTP %ld)\n", status);
+                goto stop;
+            }
+            if (rc == CURLE_PEER_FAILED_VERIFICATION || rc == CURLE_SSL_CACERT_BADFILE) {
+                fprintf(stderr, "\nhenge: download failed (%s)\n", curl_easy_strerror(rc));
+                goto stop;
+            }
+            fprintf(stderr, "\nhenge: download interrupted (%s, HTTP %ld); resuming\n", curl_easy_strerror(rc), status);
+            p.retry_at[s->chunk] = now + 2;
+            if (++stuck > 40 * conns) { fprintf(stderr, "henge: download keeps failing; run again to resume\n"); goto stop; }
+        }
+        if (now != last) {
+            last = now;
+            if (!mark_t) mark_t = now, mark = got;
+            else if (now - mark_t >= 3) {
+                double r = (double)(got - mark) / (double)(now - mark_t);
+                rate = rate ? rate * 0.6 + r * 0.4 : r;
+                if (got > mark) stuck = 0;
+                mark_t = now, mark = got;
+            }
+            fprintf(stderr, "\rhenge: downloading macOS %.1f / %.1f GB (%.0f%%) %.1f MB/s   ", got / 1e9, total / 1e9,
+                    100.0 * (double)got / (double)total, rate / 1e6);
+            if (now - saved >= 2) save_map(&p), saved = now;
+        }
+        curl_multi_poll(m, NULL, 0, 250, NULL);
+    }
+    fprintf(stderr, "\rhenge: downloading macOS %.1f / %.1f GB (100%%)   \n", total / 1e9, total / 1e9);
+    result = fsync(p.fd) == 0 ? 1 : -1;
+    goto done;
+stop:
+    result = p.failed ? 0 : -1;
+done:
+    for (int i = 0; i < conns; i++)
+        if (slots[i].e) curl_multi_remove_handle(m, slots[i].e), curl_easy_cleanup(slots[i].e);
+    curl_multi_cleanup(m);
+    save_map(&p);
+out:
+    if (p.fd >= 0) close(p.fd);
+    if (p.mapfd >= 0) close(p.mapfd);
+    if (result == 1) {
+        unlink(mapname);
+        result = rename(part, path) == 0 ? 1 : -1;
+    } else if (result == 0) {
+        unlink(mapname); /* back to one connection; a map-less .part is read as contiguous, so start clean */
+        if (p.chunks && p.done) {
+            int contiguous = 1;
+            for (uint32_t i = 0; i + 1 < p.chunks; i++) if (p.done[i] < chunk_len(&p, i) && p.done[i + 1]) contiguous = 0;
+            if (!contiguous) unlink(part);
+        }
+    }
+    free(p.done), free(p.active), free(p.retry_at), free(slots);
+    return result;
+}
+
 int hv_download(const char *url, const char *path) {
     char part[1100];
     snprintf(part, sizeof part, "%s.part", path);
     struct stat st;
     if (stat(path, &st) == 0 && st.st_size > 0) return 0;
+    int par = download_parallel(url, path, part);
+    if (par != 0) return par == 1 ? 0 : -1;
     for (int attempt = 1; attempt <= 20; attempt++) {
         Dl dl = {0};
         dl.f = fopen(part, "ab");
