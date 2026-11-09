@@ -273,10 +273,17 @@ int main(int argc, char **argv) {
     int gunyah = !strcmp(engine, "gunyah");
     if (!gunyah && strcmp(engine, "jit")) usage();
     if (gunyah) {
-        /* The CPU runs on Gunyah (host/gunyah.c): every CPU asked for, each a vCPU. Guest RAM must be pinned
-           and shared with the hypervisor: anonymous, unless the app's Vulkan renderer has to map it too
-           (Graphics: Vulkan), when it is the RAM file in the app's folder (a long-term pin of a file's pages). */
-        if ((strcmp(gpu, "vulkan") && strcmp(gpu, "reims")) || vc.installer) setenv("HV_RAM_FILE", "", 1);
+        /* The CPU runs on Gunyah (host/gunyah.c): every CPU asked for, each a vCPU. Guest RAM is pinned for the
+           hypervisor, so it must be anonymous: a long-term pin of a file's pages (the RAM file Graphics: Vulkan
+           and reims share with the app) leaves them dirty under the file system's writeback, which on this
+           kernel (no FOLL_LONGTERM refusal for file pages before Linux 6.5) can panic and reboot the tablet.
+           So those two run only with the JIT engine for now; Gunyah gets pvg_lite. */
+        if (!strcmp(gpu, "vulkan") || !strcmp(gpu, "reims")) {
+            fprintf(stderr, "hengevm: Graphics %s needs the JIT engine for now (Gunyah cannot pin a file's pages "
+                            "safely); using GPU instead\n", gpu);
+            gpu = "on";
+        }
+        setenv("HV_RAM_FILE", "", 1);
         fprintf(stderr, "hengevm: engine: Gunyah (experimental), %d CPUs\n", vc.ncpus);
     }
     if (!install_dir && access(vc.rom, R_OK) != 0) { /* a Mac whose boot ROM went missing: put it back */
