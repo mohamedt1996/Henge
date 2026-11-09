@@ -105,6 +105,7 @@ public class VmService extends Service {
         wake.acquire();
         boolean deleteImage = intent.getBooleanExtra("deleteImage", false);
         String gpu = intent.getStringExtra("gpu");
+        engineMode = "gunyah".equals(intent.getStringExtra("engine")) ? "gunyah" : "jit";
         new Thread(() -> run(mode, ram, cpus, release == null ? "15.6.1" : release, deleteImage,
                 gpu == null ? "on" : gpu), "engine").start();
         return START_NOT_STICKY;
@@ -136,11 +137,29 @@ public class VmService extends Service {
             cmd.add("--cache"); cmd.add(lib.getPath()); // a missing boot ROM comes back from here
             if ("capture".equals(gpu)) { cmd.add("--shader-dir"); cmd.add(shaderDir(this).getPath()); }
         }
-        cmd.add("--ram"); cmd.add(Integer.toString(ram));
+        cmd.add("--ram"); cmd.add(Integer.toString(gunyah() ? Math.min(ram, 3072) : ram));
         cmd.add("--cpus"); cmd.add(Integer.toString(cpus));
+        if (gunyah()) { cmd.add("--engine"); cmd.add("gunyah"); }
         int code = -1;
         try {
-            ProcessBuilder pb = new ProcessBuilder(cmd);
+            // Gunyah: /dev/gunyah is closed to apps, so the engine runs as root through su; afterwards everything it
+            // made in the app's folder is handed back to the app.
+            List<String> launch = cmd;
+            if (gunyah()) {
+                StringBuilder q = new StringBuilder();
+                q.append("export HOME=").append(sq(files.getPath())).append(" TMPDIR=").append(sq(getCacheDir().getPath()))
+                 .append(" HENGE_PID=").append(sq(pidFile.getPath())).append(" GLIBC_TUNABLES=glibc.pthread.rseq=0; cd ")
+                 .append(sq(files.getPath())).append(" && ulimit -s 65520 2>/dev/null; touch engine.root; ");
+                for (String a : cmd.subList(3, cmd.size())) q.append(sq(a)).append(' ');
+                int uid = android.os.Process.myUid();
+                // In the background so the shell can tidy up after it; the pid file names the engine itself.
+                q.append("& echo $! > \"$HENGE_PID\"; wait $!; code=$?; chown -R ").append(uid).append(':').append(uid).append(' ').append(sq(files.getPath()))
+                 .append(' ').append(sq(getCacheDir().getPath())).append("; restorecon -RF ").append(sq(files.getPath()))
+                 .append(" 2>/dev/null; rm -f engine.root; exit $code");
+                launch = new ArrayList<>();
+                launch.add("su"); launch.add("-c"); launch.add(q.toString());
+            }
+            ProcessBuilder pb = new ProcessBuilder(launch);
             pb.directory(files);
             pb.environment().put("HOME", files.getPath());
             pb.environment().put("TMPDIR", getCacheDir().getPath());
@@ -185,10 +204,18 @@ public class VmService extends Service {
         stopSelf();
     }
 
+    static volatile String engineMode = "jit";
+    static boolean gunyah() { return "gunyah".equals(engineMode); }
+    static String sq(String s) { return "'" + s.replace("'", "'\\''") + "'"; }
+
     /** SIGTERM: the engine stops the Mac at the next block and flushes its disks. */
     public static void stop(Context c) {
         try {
             String pid = new String(Files.readAllBytes(new File(c.getFilesDir(), "engine.pid").toPath())).trim();
+            if (gunyah() || new File(c.getFilesDir(), "engine.root").exists()) { // a root process: only root may signal it
+                new ProcessBuilder("su", "-c", "kill -15 " + Integer.parseInt(pid)).start();
+                return;
+            }
             android.os.Process.sendSignal(Integer.parseInt(pid), 15);
         } catch (Exception e) {
             Process p = process;

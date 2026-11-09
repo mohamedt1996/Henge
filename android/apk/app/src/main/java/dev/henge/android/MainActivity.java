@@ -536,6 +536,12 @@ public class MainActivity extends Activity {
         gnote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(gnote);
         c.addView(hairline());
+        c.addView(choiceRow("CPU engine", ENGINE_LABELS, java.util.Arrays.asList(ENGINE_MODES).indexOf(engineMode()),
+                i -> { prefs.edit().putString("engine", ENGINE_MODES[i]).apply(); render(true); }));
+        TextView enote = text(ENGINE_NOTES[Math.max(0, java.util.Arrays.asList(ENGINE_MODES).indexOf(engineMode()))], 13, DIM, false);
+        enote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(enote);
+        c.addView(hairline());
         c.addView(infoRow("Display", "VNC on 127.0.0.1:5900"));
         c.addView(hairline());
         c.addView(infoRow("Engine", VmService.busy() ? "Running" : VmService.state));
@@ -756,6 +762,7 @@ public class MainActivity extends Activity {
         i.putExtra(VmService.EXTRA_RELEASE, RELEASES[releaseIndex()]);
         i.putExtra("deleteImage", prefs.getBoolean("deleteAfter", false));
         i.putExtra("gpu", gpuMode());
+        i.putExtra("engine", engineMode());
         if ("install".equals(mode)) prefs.edit().putInt("installedRelease", releaseIndex()).apply();
         startForegroundService(i);
         if ("run".equals(mode)) ui.postDelayed(() -> startActivity(new Intent(this, ScreenActivity.class)), 1500);
@@ -909,6 +916,13 @@ public class MainActivity extends Activity {
         return b;
     }
 
+    static final String[] ENGINE_MODES = {"jit", "gunyah"};
+    static final String[] ENGINE_LABELS = {"JIT", "Gunyah"};
+    static final String[] ENGINE_NOTES = {
+            "Translates the Mac's instructions: works on any tablet, but many times slower than a real Mac.",
+            "Experimental: runs the Mac's instructions on this tablet's CPU through Qualcomm's Gunyah hypervisor. "
+                    + "Needs root (su). One CPU for now. The log says how far it gets."};
+    private String engineMode() { return prefs.getString("engine", "jit"); }
     static final String[] GPU_MODES = {"on", "off", "capture", "vulkan"};
     static final String[] GPU_LABELS = {"GPU", "Off", "Capture", "Vulkan"};
     static final String[] GPU_NOTES = {

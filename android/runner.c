@@ -5,6 +5,7 @@
 #include "vnc.h"
 #include "fetch.h"
 #include "install.h"
+#include "gunyah.h"
 #include "machine.h"
 #include "cpu.h"
 #include "vmapple.h"
@@ -22,7 +23,7 @@ static void curl_global_init_all(void) { curl_global_init(CURL_GLOBAL_ALL); }
 
 static void usage(void) {
     fprintf(stderr,
-            "usage: hengevm-android --install FOLDER [--release 15.6.1] [--ipsw FILE] [--disk-gb 64] [--rom FILE] [--cache DIR] [--ram MB] [--cpus N]\n"
+            "usage (both forms also take --engine jit|gunyah): hengevm-android --install FOLDER [--release 15.6.1] [--ipsw FILE] [--disk-gb 64] [--rom FILE] [--cache DIR] [--ram MB] [--cpus N]\n"
             "   or: hengevm-android --mac FOLDER (exported from Henge on iOS) [options]\n"
             "   or: hengevm-android --rom AVPBooter.vmapple2.bin --disk Disk.img --aux AuxiliaryStorage\n"
             "                       --ecid N --seed N [--ram MB (4096)] [--cpus N (2)] [--log 0-3] [--jit-mb MB] [--net 0|1]\n"
@@ -91,6 +92,7 @@ static void *install_watchdog(void *arg) {
 /* While installing: every 30 s, where each guest CPU is and who owns the USB port. A boot that gives no serial
    output still shows here whether the kernel runs (EL1 PCs at 0xfffffe..., blocks climbing), spins in one place,
    sleeps (blocks flat), stopped (halted), and whether its USB driver ever touched the port. */
+static int heartbeat_no_cpus; /* Gunyah runs the CPU: its state is not ours to read */
 static void *install_heartbeat(void *arg) {
     (void)arg;
     uint64_t last[HV_MAX_CPUS] = {0};
@@ -98,7 +100,7 @@ static void *install_heartbeat(void *arg) {
         sleep(30);
         HvVirtioUsb *u = hv_vm_board()->vusb;
         fprintf(stderr, "henge: guest %d s:", t);
-        for (int i = 0; i < hv_vm_ncpus(); i++) {
+        for (int i = 0; i < hv_vm_ncpus() && !heartbeat_no_cpus; i++) {
             HvCpu *c = hv_vm_cpu(i);
             uint64_t n = c->icount;
             if (c->halted) fprintf(stderr, " cpu%d stopped at %llx", i, (unsigned long long)c->pc);
@@ -145,7 +147,7 @@ static void on_signal(int sig) {
 
 int main(int argc, char **argv) {
     int vnc_port = 5900;
-    const char *gpu = "on", *shader_dir = NULL;
+    const char *gpu = "on", *shader_dir = NULL, *engine = "jit";
     const char *install_dir = NULL, *release = "15.6.1", *ipsw = NULL, *cache = NULL;
     uint64_t disk_gb = 64;
     HvVmConfig vc = {.aux_offset = 16384, .ram_mb = 4096, .ncpus = 2, .log = 1, .no_net = 0, .no_sound = 1};
@@ -169,6 +171,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--log")) vc.log = atoi(v);
         else if (!strcmp(a, "--vnc")) vnc_port = atoi(v);
         else if (!strcmp(a, "--gpu")) gpu = v;
+        else if (!strcmp(a, "--engine")) engine = v;
         else if (!strcmp(a, "--shader-dir")) shader_dir = v;
         else if (!strcmp(a, "--net")) vc.no_net = !atoi(v);
         else if (!strcmp(a, "--jit-mb")) vc.jit_bytes = (size_t)atoi(v) << 20;
@@ -227,6 +230,15 @@ int main(int argc, char **argv) {
         setenv("HV_PSCI_LOG", "1", 0); /* CPUs started, stopped, the machine reset or powered off: all in the log */
     }
     if (!vc.rom || !vc.disk || !vc.aux) usage();
+    int gunyah = !strcmp(engine, "gunyah");
+    if (!gunyah && strcmp(engine, "jit")) usage();
+    if (gunyah) {
+        /* The CPU runs on Gunyah (host/gunyah.c): one vCPU for now, and guest RAM that can be pinned and shared
+           with the hypervisor (anonymous, not a file). */
+        vc.ncpus = 1;
+        setenv("HV_RAM_FILE", "", 1);
+        fprintf(stderr, "hengevm: engine: Gunyah (experimental)\n");
+    }
     if (!install_dir && access(vc.rom, R_OK) != 0) { /* a Mac whose boot ROM went missing: put it back */
         curl_global_init_all();
         fprintf(stderr, "henge: %s is missing; restoring it\n", vc.rom);
@@ -259,7 +271,7 @@ int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IOLBF, 0); /* the app's log is a file: block buffering held lines back until exit */
     /* Android has no swap to speak of: back guest RAM with a file unless told otherwise. */
-    if (!getenv("HV_RAM_FILE")) {
+    if (!gunyah && !getenv("HV_RAM_FILE")) {
         static char ram[1024];
         snprintf(ram, sizeof ram, "%s.ram", vc.disk);
         setenv("HV_RAM_FILE", ram, 0);
@@ -289,6 +301,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "henge: the installer could not start\n");
         return 1;
     }
+    heartbeat_no_cpus = gunyah;
     if (install_dir) {
         pthread_t hb;
         if (pthread_create(&hb, NULL, install_heartbeat, NULL) == 0) pthread_detach(hb);
@@ -298,7 +311,7 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_signal);
     fprintf(stderr, "hengevm: %d CPUs, %llu MB, network %s, no sound yet\n", hv_vm_ncpus(),
             (unsigned long long)vc.ram_mb, vc.no_net ? "off" : "on (NAT)");
-    int reason = hv_vm_run_cpu0();
+    int reason = gunyah ? hv_gunyah_run() : hv_vm_run_cpu0();
     hv_vm_flush_disks();
     fprintf(stderr, "hengevm: stopped: %s\n", hv_vm_reason_name(reason));
     if (install_dir) {

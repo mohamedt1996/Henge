@@ -386,7 +386,12 @@ void hv_gicv3_update(HvGic *g) {
     pthread_mutex_unlock(&g->mu);
 }
 
+/* Set when another GIC owns the guest's interrupts (Gunyah's virtual GIC, host/gunyah.c): device lines go
+   there instead. edge: a one-off pending interrupt (hv_gicv3_pend). */
+void (*hv_gic_external)(int intid, int level, int edge);
+
 void hv_gicv3_set_irq(HvGic *g, int intid, int level) {
+    if (hv_gic_external) { hv_gic_external(intid, level, 0); return; }
     pthread_mutex_lock(&g->mu);
     hv_gicv3_set_irq_body(g, intid, level);
     pthread_mutex_unlock(&g->mu);
@@ -404,6 +409,7 @@ void hv_gicv3_set_ppi(HvGic *g, int c, int intid, int level) {
 }
 
 void hv_gicv3_pend(HvGic *g, int intid) {
+    if (hv_gic_external) { hv_gic_external(intid, 1, 1); return; }
     pthread_mutex_lock(&g->mu);
     hv_gicv3_pend_body(g, intid);
     pthread_mutex_unlock(&g->mu);

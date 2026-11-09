@@ -47,6 +47,7 @@ typedef struct HvGic {
 HvGic *hv_gicv3_create(HvMachine *m, uint64_t dist_pa, uint64_t redist_pa);
 /* Drive an SPI's input line (32+). */
 void hv_gicv3_set_irq(HvGic *g, int intid, int level);
+extern void (*hv_gic_external)(int intid, int level, int edge); /* another GIC has the interrupts (gunyah.c) */
 /* Drive one CPU's PPI (16-31). */
 void hv_gicv3_set_ppi(HvGic *g, int cpu, int intid, int level);
 /* Make an SPI pending, as an MSI write does. */

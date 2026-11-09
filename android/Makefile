@@ -77,7 +77,7 @@ $(B)/gunyah-probe: android/tools/gunyah_probe.c android/tools/gunyah_probe_blobs
 $(B)/libhengerestore.a: android/build_restore.sh host/install.c host/libusb_shim.c
 	DEPS=$(DEPS) android/build_restore.sh
 RESTORE_LIBS = $(B)/libhengerestore.a $(DEPS)/libzip/lib/libzip.a -L$(DEPS)/lib -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz
-$(B)/hengevm-android: $(B)/seccomp_compat.o $(B)/runner.o $(B)/curl_android.o $(B)/fetch.o $(LZFSE_OBJ) $(B)/vm.o $(B)/usb_host.o $(B)/net_slirp.o $(B)/vnc.o $(B)/host_stubs.o $(B)/libhengevm.a $(B)/libhengerestore.a
+$(B)/hengevm-android: $(B)/seccomp_compat.o $(B)/runner.o $(B)/gunyah.o $(B)/curl_android.o $(B)/fetch.o $(LZFSE_OBJ) $(B)/vm.o $(B)/usb_host.o $(B)/net_slirp.o $(B)/vnc.o $(B)/host_stubs.o $(B)/libhengevm.a $(B)/libhengerestore.a
 	$(CC) $(CFLAGS) $(filter-out $(B)/libhengerestore.a,$^) $(RESTORE_LIBS) $(SLIRP_LIBS) $(LIBS) -Wl,--wrap=curl_easy_init -o $@
 	python3 android/nosyscall.py $@
 

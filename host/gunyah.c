@@ -1,0 +1,475 @@
+/* The virtual Mac's CPUs on Gunyah (see gunyah.h). Linux/Android only.
+
+   How the vmapple machine is laid onto a Gunyah VM:
+   - Memory: every RAM range the machine has (boot ROM at 0x100000, the config window, guest RAM at 0x70000000)
+     is shared with the VM at the same address. Henge keeps its own mapping, so its devices DMA as before.
+   - Boot: Gunyah starts an unauthenticated VM at the base of the memory region that holds its device tree, with
+     x0 = the tree. That region (BOOT_PA) starts with a five-instruction trampoline to the boot ROM, so AVPBooter
+     starts as on Apple's hypervisor: EL1, MMU off, x0-x3 zero.
+   - The device tree here is only for Gunyah's resource manager (gunyah-vm-config: vCPUs, the GIC, doorbells);
+     the Mac never reads it (iBoot builds the kernel's device tree from the config device, as always).
+   - GIC and timer: Gunyah's virtual GICv3, placed at vmapple's addresses, and the CPU's own virtual timer.
+     Henge's emulated GIC is left in place but unused; its MMIO never exits here unless Gunyah put its GIC
+     elsewhere, which this logs.
+   - Device interrupts: one Gunyah doorbell (irqfd) per vmapple SPI, raised from Henge's GIC entry points through
+     hv_gic_external. Level lines are re-raised while the device still holds them.
+   - MMIO: each exit goes to hv_phys_read/hv_phys_write, Henge's device dispatch, under the same device lock.
+   - Devices: a thread runs the machine's tick (virtio queues, USB, network, display) every millisecond and
+     right after any MMIO write.
+   - Paravirtualized PAC: vmapple's XNU asks Apple's hypervisor to program PAC keys (hvc #0 with x0 =
+     0xc100000x, then `cbnz x0, .`). Gunyah answers those itself with NOT_SUPPORTED, and the guest would spin
+     there forever. A scanner rewrites each `hvc #0; cbnz x0, .` pair it finds in guest memory to
+     `mov x0, #0; nop` (and makes the CPU see it): the keys stay at their reset values, which every process then
+     shares, which is what Henge's JIT does as well.
+   - One vCPU for now: Gunyah numbers the VM's CPUs itself, and vmapple's device tree has to match. */
+#include "gunyah.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <poll.h>
+#include <sys/eventfd.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "cpu.h"
+#include "gicv3.h"
+#include "machine.h"
+#include "vm.h"
+#include "vmapple.h"
+
+/* Android common kernel include/uapi/linux/gunyah.h (android14-6.1). */
+#define GH_IOCTL_TYPE 'G'
+#define GH_CREATE_VM _IO(GH_IOCTL_TYPE, 0x0)
+struct gh_userspace_memory_region { uint32_t label, flags; uint64_t guest_phys_addr, memory_size, userspace_addr; };
+#define GH_VM_SET_USER_MEM_REGION _IOW(GH_IOCTL_TYPE, 0x1, struct gh_userspace_memory_region)
+struct gh_vm_dtb_config { uint64_t guest_phys_addr, size; };
+#define GH_VM_SET_DTB_CONFIG _IOW(GH_IOCTL_TYPE, 0x2, struct gh_vm_dtb_config)
+#define GH_VM_START _IO(GH_IOCTL_TYPE, 0x3)
+struct gh_fn_desc { uint32_t type, arg_size; uint64_t arg; };
+#define GH_VM_ADD_FUNCTION _IOW(GH_IOCTL_TYPE, 0x4, struct gh_fn_desc)
+#define GH_VCPU_RUN _IO(GH_IOCTL_TYPE, 0x5)
+#define GH_VCPU_MMAP_SIZE _IO(GH_IOCTL_TYPE, 0x6)
+#define GH_FN_VCPU 1
+#define GH_FN_IRQFD 2
+struct gh_fn_irqfd_arg { uint32_t fd, label, flags, padding; };
+#define GH_IRQFD_FLAGS_LEVEL 1u
+#define GH_MEM_R 1u
+#define GH_MEM_W 2u
+#define GH_MEM_X 4u
+enum { GH_VCPU_EXIT_UNKNOWN, GH_VCPU_EXIT_MMIO, GH_VCPU_EXIT_STATUS };
+struct gh_vcpu_run {
+    uint8_t immediate_exit, padding[7];
+    uint32_t exit_reason;
+    union {
+        struct { uint64_t phys_addr; uint8_t data[8]; uint32_t len; uint8_t is_write; } mmio;
+        struct { uint32_t status; uint16_t type, pad; uint32_t reason_size; uint8_t reason[8]; } status;
+    };
+};
+
+#define BOOT_PA 0x00800000ull   /* trampoline + the VM's device tree: unused space in vmapple's map */
+#define BOOT_SIZE 0x10000ull
+#define DTB_OFF 0x1000ull
+#define SPI_LOW_FIRST 32        /* UART, RTC, GPIO, AES, graphics: INTIDs 33..63 */
+#define SPI_LOW_LAST 67         /* and PCIe INTx 64..67 */
+#define NIRQ 160
+
+extern void (*hv_vm_stop_hook)(void);
+
+static HvMachine *M;
+static HvVmapple *B;
+static int vm_fd = -1, vcpu_fd = -1, dev_kick = -1;
+static struct gh_vcpu_run *run;
+static volatile int stop_req, vm_reason = -1;
+static pthread_t vcpu_thread_id;
+static int irq_fd[NIRQ];
+static volatile uint8_t irq_level[NIRQ];
+
+/* ---- a minimal flattened device tree writer ---- */
+
+typedef struct { uint8_t s[16384]; size_t n; char str[2048]; size_t ns; } Fdt;
+
+static void be32(Fdt *f, uint32_t v) { f->s[f->n++] = v >> 24; f->s[f->n++] = v >> 16; f->s[f->n++] = v >> 8; f->s[f->n++] = v; }
+static void pad4(Fdt *f) { while (f->n & 3) f->s[f->n++] = 0; }
+static void begin(Fdt *f, const char *name) {
+    be32(f, 1);
+    size_t l = strlen(name) + 1;
+    memcpy(f->s + f->n, name, l);
+    f->n += l;
+    pad4(f);
+}
+static void end(Fdt *f) { be32(f, 2); }
+static uint32_t stroff(Fdt *f, const char *name) {
+    for (size_t i = 0; i < f->ns; i += strlen(f->str + i) + 1)
+        if (!strcmp(f->str + i, name)) return (uint32_t)i;
+    size_t l = strlen(name) + 1, at = f->ns;
+    memcpy(f->str + f->ns, name, l);
+    f->ns += l;
+    return (uint32_t)at;
+}
+static void prop(Fdt *f, const char *name, const void *v, size_t len) {
+    be32(f, 3);
+    be32(f, (uint32_t)len);
+    be32(f, stroff(f, name));
+    memcpy(f->s + f->n, v, len);
+    f->n += len;
+    pad4(f);
+}
+static void prop_str(Fdt *f, const char *name, const char *v) { prop(f, name, v, strlen(v) + 1); }
+static void prop_u32s(Fdt *f, const char *name, const uint32_t *v, int count) {
+    uint8_t b[64 * 4];
+    for (int i = 0; i < count; i++) b[4 * i] = v[i] >> 24, b[4 * i + 1] = v[i] >> 16, b[4 * i + 2] = v[i] >> 8, b[4 * i + 3] = v[i];
+    prop(f, name, b, (size_t)count * 4);
+}
+static void prop_u32(Fdt *f, const char *name, uint32_t v) { prop_u32s(f, name, &v, 1); }
+
+static int irq_wanted(int intid) {
+    return (intid >= SPI_LOW_FIRST + 1 && intid <= SPI_LOW_LAST) ||
+           (intid >= VMAPPLE_MSI_BASE && intid < VMAPPLE_MSI_BASE + VMAPPLE_MSI_COUNT);
+}
+static int irq_is_msi(int intid) { return intid >= VMAPPLE_MSI_BASE; }
+
+/* The VM's configuration for Gunyah's resource manager, in the shape crosvm gives it. */
+static size_t build_dtb(uint8_t *out, size_t cap, int ncpus) {
+    static Fdt f;
+    memset(&f, 0, sizeof f);
+    const uint32_t GIC = 1;
+    begin(&f, "");
+    prop_u32(&f, "#address-cells", 2);
+    prop_u32(&f, "#size-cells", 2);
+    prop_str(&f, "compatible", "linux,dummy-virt");
+    prop_u32(&f, "interrupt-parent", GIC);
+    for (int i = 0; i < M->nram; i++) {
+        char n[48];
+        snprintf(n, sizeof n, "memory@%llx", (unsigned long long)M->ram[i].pa);
+        begin(&f, n);
+        prop_str(&f, "device_type", "memory");
+        uint32_t reg[4] = {(uint32_t)(M->ram[i].pa >> 32), (uint32_t)M->ram[i].pa, (uint32_t)(M->ram[i].size >> 32),
+                           (uint32_t)M->ram[i].size};
+        prop_u32s(&f, "reg", reg, 4);
+        end(&f);
+    }
+    begin(&f, "cpus");
+    prop_u32(&f, "#address-cells", 1);
+    prop_u32(&f, "#size-cells", 0);
+    for (int i = 0; i < ncpus; i++) {
+        char n[16];
+        snprintf(n, sizeof n, "cpu@%d", i);
+        begin(&f, n);
+        prop_str(&f, "device_type", "cpu");
+        prop_str(&f, "compatible", "arm,armv8");
+        prop_u32(&f, "reg", (uint32_t)i);
+        prop_str(&f, "enable-method", "psci");
+        end(&f);
+    }
+    end(&f);
+    begin(&f, "psci");
+    prop_str(&f, "compatible", "arm,psci-1.0");
+    prop_str(&f, "method", "hvc");
+    end(&f);
+    begin(&f, "intc@10000000");
+    prop_str(&f, "compatible", "arm,gic-v3");
+    prop_u32(&f, "#interrupt-cells", 3);
+    prop(&f, "interrupt-controller", NULL, 0);
+    prop_u32(&f, "#address-cells", 2);
+    prop_u32(&f, "#size-cells", 2);
+    uint32_t gic[8] = {0, (uint32_t)VMAPPLE_GIC_DIST, 0, 0x10000, 0, (uint32_t)VMAPPLE_GIC_REDIST, 0, 0x20000u * (uint32_t)ncpus};
+    prop_u32s(&f, "reg", gic, 8);
+    prop_u32(&f, "phandle", GIC);
+    end(&f);
+    begin(&f, "timer");
+    prop_str(&f, "compatible", "arm,armv8-timer");
+    uint32_t ppis[12] = {1, 13, 0x104, 1, 14, 0x104, 1, 11, 0x104, 1, 10, 0x104};
+    prop_u32s(&f, "interrupts", ppis, 12);
+    prop(&f, "always-on", NULL, 0);
+    end(&f);
+    begin(&f, "gunyah-vm-config");
+    prop_str(&f, "image-name", "henge-vmapple");
+    prop_str(&f, "os-type", "linux");
+    begin(&f, "memory");
+    prop_u32(&f, "#address-cells", 2);
+    prop_u32(&f, "#size-cells", 2);
+    uint32_t base[2] = {(uint32_t)(BOOT_PA >> 32), (uint32_t)BOOT_PA};
+    prop_u32s(&f, "base-address", base, 2);
+    end(&f);
+    begin(&f, "interrupts");
+    prop_u32(&f, "config", GIC);
+    end(&f);
+    begin(&f, "vcpus");
+    prop_str(&f, "affinity", "proxy");
+    end(&f);
+    begin(&f, "vdevices");
+    prop_str(&f, "generate", "/hypervisor");
+    for (int id = 0; id < NIRQ; id++) {
+        if (!irq_wanted(id)) continue;
+        char n[32], path[48];
+        snprintf(n, sizeof n, "bell-%x", id);
+        snprintf(path, sizeof path, "/hypervisor/bell-%x", id);
+        begin(&f, n);
+        prop_str(&f, "vdevice-type", "doorbell");
+        prop_str(&f, "generate", path);
+        prop_u32(&f, "label", (uint32_t)id);
+        prop(&f, "peer-default", NULL, 0);
+        uint32_t irq[3] = {0, (uint32_t)(id - 32), irq_is_msi(id) ? 1u : 4u}; /* SPI, edge for MSIs, level otherwise */
+        prop_u32s(&f, "interrupts", irq, 3);
+        end(&f);
+    }
+    end(&f);
+    end(&f);
+    end(&f);
+    be32(&f, 9);
+
+    size_t hdr = 40, rsv = 16, total = hdr + rsv + f.n + f.ns;
+    if (total > cap) return 0;
+    uint32_t h[10] = {0xd00dfeed, (uint32_t)total, (uint32_t)(hdr + rsv), (uint32_t)(hdr + rsv + f.n), (uint32_t)hdr,
+                      17, 16, 0, (uint32_t)f.ns, (uint32_t)f.n};
+    for (int i = 0; i < 10; i++) out[4 * i] = h[i] >> 24, out[4 * i + 1] = h[i] >> 16, out[4 * i + 2] = h[i] >> 8, out[4 * i + 3] = h[i];
+    memset(out + hdr, 0, rsv);
+    memcpy(out + hdr + rsv, f.s, f.n);
+    memcpy(out + hdr + rsv + f.n, f.str, f.ns);
+    return total;
+}
+
+/* ---- interrupts ---- */
+
+static void raise_line(int intid) {
+    if (intid < 0 || intid >= NIRQ || irq_fd[intid] < 0) return;
+    uint64_t one = 1;
+    if (write(irq_fd[intid], &one, sizeof one) < 0) { /* the counter is full: it is pending anyway */ }
+}
+
+/* Henge's GIC entry points come here while Gunyah owns the GIC. */
+static void gic_external(int intid, int level, int edge) {
+    static int warned[NIRQ];
+    if (intid < 32) return; /* PPIs (Henge's emulated timer): Gunyah has the real ones */
+    if (intid >= NIRQ || irq_fd[intid] < 0) {
+        if (intid < NIRQ && !warned[intid]++) fprintf(stderr, "gunyah: interrupt %d has no doorbell\n", intid);
+        return;
+    }
+    if (edge) { raise_line(intid); return; }
+    uint8_t was = irq_level[intid];
+    irq_level[intid] = level != 0;
+    if (level && !was) raise_line(intid);
+}
+
+/* ---- the paravirtualized-PAC rewrite ---- */
+
+#define HVC0 0xd4000002u
+#define CBNZ_X0_SELF 0xb5000000u
+#define MOV_X0_0 0xd2800000u
+#define NOP 0xd503201fu
+
+static uint64_t pac_patched;
+
+static void pac_scan(void) {
+    for (int r = 0; r < M->nram; r++) {
+        uint32_t *w = (uint32_t *)M->ram[r].host;
+        size_t n = M->ram[r].size / 4;
+        for (size_t i = 0; i + 1 < n; i++) {
+            if (w[i] != HVC0 || w[i + 1] != CBNZ_X0_SELF) continue;
+            /* The cbnz first: a CPU already spinning on it leaves at once, with x0 whatever it is. */
+            __atomic_store_n(&w[i + 1], NOP, __ATOMIC_RELEASE);
+            __atomic_store_n(&w[i], MOV_X0_0, __ATOMIC_RELEASE);
+            __builtin___clear_cache((char *)&w[i], (char *)&w[i + 2]);
+            if (pac_patched++ < 8)
+                fprintf(stderr, "gunyah: PAC hypercall at pa %llx rewritten\n",
+                        (unsigned long long)(M->ram[r].pa + i * 4));
+        }
+    }
+}
+
+static void *pac_thread(void *arg) {
+    (void)arg;
+    uint64_t reported = 0;
+    while (!stop_req) {
+        pac_scan();
+        if (pac_patched != reported) {
+            fprintf(stderr, "gunyah: %llu PAC hypercalls rewritten so far\n", (unsigned long long)pac_patched);
+            reported = pac_patched;
+        }
+        usleep(pac_patched ? 2000000 : 300000);
+    }
+    return NULL;
+}
+
+/* ---- devices ---- */
+
+static void *device_thread(void *arg) {
+    (void)arg;
+    HvCpu *cpu0 = hv_vm_cpu(0);
+    struct pollfd p = {.fd = dev_kick, .events = POLLIN};
+    uint64_t n = 0;
+    while (!stop_req) {
+        if (poll(&p, 1, 1) > 0) { uint64_t v; if (read(dev_kick, &v, sizeof v) < 0) { } }
+        if (M->tick) M->tick(M, cpu0);
+        /* Lines a device still holds high: ring again, in case the guest finished with the last ring. */
+        if ((++n & 1) == 0)
+            for (int i = 32; i < NIRQ; i++)
+                if (irq_level[i] && !irq_is_msi(i)) raise_line(i);
+    }
+    return NULL;
+}
+
+static void kick_devices(void) {
+    uint64_t one = 1;
+    if (write(dev_kick, &one, sizeof one) < 0) { }
+}
+
+/* ---- the vCPU ---- */
+
+static void on_sigusr(int s) { (void)s; }
+
+static void *vcpu_thread(void *arg) {
+    (void)arg;
+    uint64_t mmio_exits = 0, unknown = 0, gic_exits = 0;
+    time_t last_report = time(NULL);
+    while (!stop_req) {
+        if (ioctl(vcpu_fd, GH_VCPU_RUN, 0) < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "gunyah: running the vCPU failed: %s\n", strerror(errno));
+            vm_reason = HV_EXIT_UNSUPPORTED;
+            break;
+        }
+        if (run->exit_reason == GH_VCPU_EXIT_MMIO) {
+            uint64_t pa = run->mmio.phys_addr;
+            unsigned len = run->mmio.len > 8 ? 8 : run->mmio.len;
+            mmio_exits++;
+            if (pa >= VMAPPLE_GIC_DIST && pa < VMAPPLE_GIC_MSI && gic_exits++ < 4)
+                fprintf(stderr, "gunyah: the guest's GIC access at %llx came here: Gunyah did not put its GIC at "
+                                "vmapple's address\n", (unsigned long long)pa);
+            if (run->mmio.is_write) {
+                if (hv_phys_write(M, pa, run->mmio.data, len) != 0 && unknown++ < 16)
+                    fprintf(stderr, "gunyah: write to nothing at %llx\n", (unsigned long long)pa);
+                kick_devices();
+            } else {
+                memset(run->mmio.data, 0, sizeof run->mmio.data);
+                if (hv_phys_read(M, pa, run->mmio.data, len) != 0 && unknown++ < 16)
+                    fprintf(stderr, "gunyah: read of nothing at %llx\n", (unsigned long long)pa);
+            }
+        } else if (run->exit_reason == GH_VCPU_EXIT_STATUS) {
+            uint32_t reason = 0;
+            memcpy(&reason, run->status.reason, run->status.reason_size < 4 ? run->status.reason_size : 4);
+            fprintf(stderr, "gunyah: the VM stopped: status %u (1 load failed, 2 exited, 3 crashed), type %u, reason %#x\n",
+                    run->status.status, run->status.type, reason);
+            vm_reason = run->status.status == 2 ? 0 : HV_EXIT_UNSUPPORTED;
+            break;
+        } else {
+            fprintf(stderr, "gunyah: unknown vCPU exit %u\n", run->exit_reason);
+            vm_reason = HV_EXIT_UNSUPPORTED;
+            break;
+        }
+        if (time(NULL) - last_report >= 30) {
+            last_report = time(NULL);
+            fprintf(stderr, "gunyah: %llu device accesses so far\n", (unsigned long long)mmio_exits);
+        }
+    }
+    stop_req = 1;
+    return NULL;
+}
+
+void hv_gunyah_stop(void) {
+    stop_req = 1;
+    if (run) run->immediate_exit = 1;
+    if (vcpu_thread_id) pthread_kill(vcpu_thread_id, SIGUSR1);
+}
+
+static int fail(const char *what) {
+    fprintf(stderr, "gunyah: %s failed: %s (errno %d)\n", what, strerror(errno), errno);
+    return -1;
+}
+
+int hv_gunyah_run(void) {
+    M = hv_vm_machine();
+    B = hv_vm_board();
+    if (hv_vm_ncpus() != 1) fprintf(stderr, "gunyah: running CPU 0 only\n");
+    for (int i = 0; i < NIRQ; i++) irq_fd[i] = -1;
+
+    int dev = open("/dev/gunyah", O_RDWR | O_CLOEXEC);
+    if (dev < 0) return fail("opening /dev/gunyah (it needs root)");
+    vm_fd = ioctl(dev, GH_CREATE_VM, 0);
+    if (vm_fd < 0) return fail("creating the VM");
+
+    /* The boot region: trampoline to the ROM, then the resource manager's device tree. */
+    uint8_t *boot = mmap(NULL, BOOT_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+    if (boot == MAP_FAILED) return fail("mapping the boot region");
+    const uint32_t tramp[] = {
+        0xd2a00010u | ((uint32_t)(VMAPPLE_FIRMWARE >> 16) << 5), /* movz x16, #(ROM >> 16), lsl #16 */
+        0xaa1f03e0u, 0xaa1f03e1u, 0xaa1f03e2u, 0xaa1f03e3u,       /* mov x0..x3, xzr */
+        0xd61f0200u,                                              /* br x16 */
+    };
+    memcpy(boot, tramp, sizeof tramp);
+    size_t dtb_len = build_dtb(boot + DTB_OFF, BOOT_SIZE - DTB_OFF, 1);
+    if (!dtb_len) { fprintf(stderr, "gunyah: the VM device tree is too big\n"); return -1; }
+
+    uint32_t label = 0;
+    struct gh_userspace_memory_region r = {.label = label++, .flags = GH_MEM_R | GH_MEM_W | GH_MEM_X,
+                                           .guest_phys_addr = BOOT_PA, .memory_size = BOOT_SIZE,
+                                           .userspace_addr = (uintptr_t)boot};
+    if (ioctl(vm_fd, GH_VM_SET_USER_MEM_REGION, &r) < 0) return fail("sharing the boot region");
+    for (int i = 0; i < M->nram; i++) {
+        HvRam *ram = &M->ram[i];
+        r = (struct gh_userspace_memory_region){.label = label++, .flags = GH_MEM_R | GH_MEM_W | GH_MEM_X,
+                                                .guest_phys_addr = ram->pa, .memory_size = ram->size,
+                                                .userspace_addr = (uintptr_t)ram->host};
+        fprintf(stderr, "gunyah: memory %llx-%llx (%llu MB)\n", (unsigned long long)ram->pa,
+                (unsigned long long)(ram->pa + ram->size), (unsigned long long)(ram->size >> 20));
+        if (ioctl(vm_fd, GH_VM_SET_USER_MEM_REGION, &r) < 0) return fail("sharing guest memory");
+    }
+    struct gh_vm_dtb_config dtb = {.guest_phys_addr = BOOT_PA + DTB_OFF, .size = (dtb_len + 0xfff) & ~0xfffull};
+    if (ioctl(vm_fd, GH_VM_SET_DTB_CONFIG, &dtb) < 0) return fail("setting the VM device tree");
+
+    int bells = 0;
+    for (int id = 0; id < NIRQ; id++) {
+        if (!irq_wanted(id)) continue;
+        int efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        if (efd < 0) return fail("eventfd");
+        struct gh_fn_irqfd_arg a = {.fd = (uint32_t)efd, .label = (uint32_t)id,
+                                    .flags = irq_is_msi(id) ? 0 : GH_IRQFD_FLAGS_LEVEL};
+        struct gh_fn_desc fn = {.type = GH_FN_IRQFD, .arg_size = sizeof a, .arg = (uintptr_t)&a};
+        if (ioctl(vm_fd, GH_VM_ADD_FUNCTION, &fn) < 0) {
+            fprintf(stderr, "gunyah: doorbell for interrupt %d: %s\n", id, strerror(errno));
+            close(efd);
+            continue;
+        }
+        irq_fd[id] = efd;
+        bells++;
+    }
+    fprintf(stderr, "gunyah: %d interrupt doorbells\n", bells);
+
+    uint32_t id0 = 0;
+    struct gh_fn_desc fn = {.type = GH_FN_VCPU, .arg_size = sizeof id0, .arg = (uintptr_t)&id0};
+    vcpu_fd = ioctl(vm_fd, GH_VM_ADD_FUNCTION, &fn);
+    if (vcpu_fd < 0) return fail("adding the vCPU");
+    if (ioctl(vm_fd, GH_VM_START, 0) < 0) return fail("starting the VM");
+    long sz = ioctl(vcpu_fd, GH_VCPU_MMAP_SIZE, 0);
+    if (sz < 0) sz = ioctl(dev, GH_VCPU_MMAP_SIZE, 0);
+    if (sz <= 0) return fail("asking the vCPU's run area size");
+    run = mmap(NULL, (size_t)sz, PROT_READ | PROT_WRITE, MAP_SHARED, vcpu_fd, 0);
+    if (run == MAP_FAILED) { run = NULL; return fail("mapping the vCPU's run area"); }
+
+    dev_kick = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    hv_vm_stop_hook = hv_gunyah_stop;
+    hv_gic_external = gic_external; /* from here Henge's devices ring doorbells instead of its own GIC */
+    struct sigaction sa = {.sa_handler = on_sigusr}; /* no SA_RESTART: a stop breaks GH_VCPU_RUN */
+    sigaction(SIGUSR1, &sa, NULL);
+    fprintf(stderr, "gunyah: VM started; the boot ROM runs on the CPU itself\n");
+
+    pthread_t t;
+    pthread_create(&t, NULL, device_thread, NULL);
+    pthread_detach(t);
+    pthread_create(&t, NULL, pac_thread, NULL);
+    pthread_detach(t);
+    pthread_create(&vcpu_thread_id, NULL, vcpu_thread, NULL);
+    pthread_join(vcpu_thread_id, NULL);
+    vcpu_thread_id = 0;
+    stop_req = 1;
+    usleep(20000);
+    return vm_reason < 0 ? 0 : vm_reason;
+}

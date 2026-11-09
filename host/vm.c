@@ -364,7 +364,10 @@ void hv_vm_start(int cpu0, void (*on_exit)(int reason)) {
     pthread_create(&t, NULL, kicker_thread, NULL);
 }
 
+void (*hv_vm_stop_hook)(void); /* another engine runs the CPUs (gunyah.c): stop it too */
+
 void hv_vm_stop(void) {
+    if (hv_vm_stop_hook) hv_vm_stop_hook();
     for (int i = 0; i < ncpus; i++) cpus[i].halted = 3; /* the dispatchers stop at the next block */
     hv_machine_kick_all(&m);
     for (int i = 0; i < ncpus; i++) hv_cpu_wake(&cpus[i]);
