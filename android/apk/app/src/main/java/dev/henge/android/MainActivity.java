@@ -29,6 +29,8 @@ import android.widget.TextView;
 
 import java.io.File;
 import java.io.RandomAccessFile;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -923,11 +925,25 @@ public class MainActivity extends Activity {
         return f;
     }
 
+    private static final Pattern PROGRESS = Pattern.compile("\\s*(.*?):\\s*\\d{1,3}(?:\\.\\d)?%\\s*");
+
     private TextView logView(int lines) {
         String all = read(VmService.logFile(this), Math.max(0, VmService.logFile(this).length() - 24 * 1024));
-        String[] ls = all.split("\n");
+        // A progress bar redrawn with \r, or printed as "Label: 93.1%" line after line, shows as its latest value.
+        List<String> ls = new ArrayList<>();
+        for (String raw : all.split("\n")) {
+            int cr = raw.lastIndexOf('\r', raw.length() - 2);
+            String line = (cr >= 0 ? raw.substring(cr + 1) : raw).replace("\r", "").replaceAll("\u001B\\[[0-9;]*[A-Za-z]", "");
+            if (line.trim().isEmpty()) continue;
+            Matcher pm = PROGRESS.matcher(line);
+            if (pm.matches() && !ls.isEmpty()) {
+                Matcher prev = PROGRESS.matcher(ls.get(ls.size() - 1));
+                if (prev.matches() && prev.group(1).equals(pm.group(1))) { ls.set(ls.size() - 1, line); continue; }
+            }
+            ls.add(line);
+        }
         StringBuilder b = new StringBuilder();
-        for (int i = Math.max(0, ls.length - lines); i < ls.length; i++) if (!ls[i].trim().isEmpty()) b.append(ls[i]).append('\n');
+        for (int i = Math.max(0, ls.size() - lines); i < ls.size(); i++) b.append(ls.get(i)).append('\n');
         TextView t = text(b.length() == 0 ? "Nothing yet." : b.toString().trim(), 10, DIM, false, Typeface.MONOSPACE);
         t.setTextIsSelectable(true);
         return t;

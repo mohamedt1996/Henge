@@ -9,6 +9,7 @@
 #include <curl/curl.h>
 static void curl_global_init_all(void) { curl_global_init(CURL_GLOBAL_ALL); }
 
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,6 +75,15 @@ static int ensure_rom(const char *path, const char *cache) {
 }
 
 static volatile int install_done = -2;
+/* A failed install leaves nothing worth flushing, and the engine must not linger as "Running"
+   with the restore tools' last lines unwritten: if the Mac has not stopped in 20 s, leave. */
+static void *install_watchdog(void *arg) {
+    (void)arg;
+    sleep(20);
+    fprintf(stderr, "henge: the engine did not stop after the failed install; exiting\n");
+    fflush(stdout);
+    _exit(1);
+}
 static void on_install(int step, double p, void *user) {
     (void)user;
     static const char *names[] = {"detecting", "preparing", "sending the system", "verifying", "flashing firmware",
@@ -82,6 +92,11 @@ static void on_install(int step, double p, void *user) {
     if (step == HV_INSTALL_DONE || step == HV_INSTALL_FAILED) {
         install_done = step == HV_INSTALL_DONE ? 0 : -1;
         fprintf(stderr, "\nhenge: install %s\n", step == HV_INSTALL_DONE ? "finished" : "FAILED");
+        fflush(stdout);
+        if (step == HV_INSTALL_FAILED) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, install_watchdog, NULL) == 0) pthread_detach(t);
+        }
         hv_vm_stop();
         return;
     }
@@ -210,6 +225,7 @@ int main(int argc, char **argv) {
         usage();
     }
     setvbuf(stderr, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IOLBF, 0); /* the app's log is a file: block buffering held lines back until exit */
     /* Android has no swap to speak of: back guest RAM with a file unless told otherwise. */
     if (!getenv("HV_RAM_FILE")) {
         static char ram[1024];

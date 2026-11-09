@@ -157,6 +157,15 @@ public class VmService extends Service {
         } catch (Exception e) {
             appendLog(log, "henge app: could not start the engine: " + e);
         }
+        if (install) {
+            // The restore tools' own log sits in the app's private files; put a copy where a computer
+            // sees it over USB: Android/data/dev.henge.android/files/install.log.
+            File rlog = new File(mac, "restore/install.log"), ext = getExternalFilesDir(null);
+            if (rlog.exists() && ext != null) {
+                try { Files.copy(rlog.toPath(), new File(ext, "install.log").toPath(),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING); } catch (Exception ignored) { }
+            }
+        }
         if (install && code == 0) {
             try { new File(files, "installed").createNewFile(); } catch (Exception ignored) { }
             // The restore image is 17 GB; kept by default so a reinstall needs no download.
