@@ -312,6 +312,12 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_signal);
     fprintf(stderr, "hengevm: %d CPUs, %llu MB, network %s, no sound yet\n", hv_vm_ncpus(),
             (unsigned long long)vc.ram_mb, vc.no_net ? "off" : "on (NAT)");
+    if (!gunyah) {
+        /* CPUs 1 and up need their own threads (parked until PSCI CPU_ON) and the 1 ms kicker. Without them
+           XNU's CPU_ON for cpu1 waits forever for a thread that was never started: cpu0 stuck, +0 blocks. */
+        hv_vm_start(0, NULL);
+        hv_vm_cpu_qos(); /* this thread runs CPU 0: its own signal stack, like the others */
+    }
     int reason = gunyah ? hv_gunyah_run() : hv_vm_run_cpu0();
     hv_vm_flush_disks();
     fprintf(stderr, "hengevm: stopped: %s\n", hv_vm_reason_name(reason));

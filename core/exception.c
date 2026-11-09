@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "machine.h"
 #include "dispatch.h"
@@ -158,7 +159,16 @@ static uint64_t psci(HvCpu *cpu, uint64_t fn) {
         HvCpu *t = cpu_by_mpidr(cpu->m, cpu->x[1]);
         if (!t) return (uint64_t)-2;                         /* INVALID_PARAMETERS */
         if (!t->off) return (uint64_t)-4;                    /* ALREADY_ON */
-        while (!__atomic_load_n(&t->parked_off, __ATOMIC_SEQ_CST)) sched_yield(); /* still on its way out of CPU_OFF */
+        /* Still on its way out of CPU_OFF (or not parked yet). Bounded: a CPU with no thread to run it must
+           fail the call, not hang the caller in here forever. */
+        for (uint32_t spins = 0; !__atomic_load_n(&t->parked_off, __ATOMIC_SEQ_CST); spins++) {
+            if (spins < 1000) { sched_yield(); continue; }
+            if (spins > 1000 + 2000) {                       /* ~2 s */
+                fprintf(stderr, "hengevm: CPU_ON: cpu %u never parked (no thread running it?)\n", t->index);
+                return (uint64_t)-6;                         /* INTERNAL_FAILURE */
+            }
+            usleep(1000);
+        }
         uint64_t mpidr = t->mpidr, entry = cpu->x[2], context = cpu->x[3];
         if ((uint32_t)fn == 0x84000003) entry = (uint32_t)entry, context = (uint32_t)context;
         /* As at reset: EL1h, MMU and caches off, everything masked. Its thread
