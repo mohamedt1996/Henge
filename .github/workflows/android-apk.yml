@@ -44,6 +44,9 @@ jobs:
           mkdir -p android/apk/app/src/main/jniLibs/arm64-v8a
           cp build/android/hengevm-android android/apk/app/src/main/jniLibs/arm64-v8a/libhengevm.so
           aarch64-linux-gnu-strip android/apk/app/src/main/jniLibs/arm64-v8a/libhengevm.so
+          make -f android/Makefile build/android/gunyah-probe
+          cp build/android/gunyah-probe android/apk/app/src/main/jniLibs/arm64-v8a/libghprobe.so
+          aarch64-linux-gnu-strip android/apk/app/src/main/jniLibs/arm64-v8a/libghprobe.so
 
       - name: Cache air2spv dependencies (LLVM 22, Mesa's NIR for arm64)
         uses: actions/cache@v4

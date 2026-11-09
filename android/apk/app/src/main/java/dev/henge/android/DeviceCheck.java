@@ -58,6 +58,11 @@ final class DeviceCheck {
         String lib = c.getApplicationInfo().nativeLibraryDir;
         line(b, "engine", new File(lib, "libhengevm.so").canExecute() ? "ok" : "missing");
         line(b, "air2spv", new File(lib, "libair2spv.so").canExecute() ? "ok" : "missing");
+        // Whether the guest could run on Gunyah instead of the JIT: a tiny VM made through /dev/gunyah (root only).
+        File probe = new File(lib, "libghprobe.so");
+        if (root && new File("/dev/gunyah").exists() && probe.canExecute()) {
+            b.append("\nGunyah probe:\n").append(sh(true, probe.getPath() + " 2>&1")).append('\n');
+        }
         String out = b.toString();
         File ext = c.getExternalFilesDir(null);
         if (ext != null) try (FileOutputStream o = new FileOutputStream(new File(ext, "device-check.txt"))) {
