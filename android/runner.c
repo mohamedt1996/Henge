@@ -227,7 +227,8 @@ int main(int argc, char **argv) {
         setenv("HV_RESTORE_TIMEOUT_SCALE", "10", 0);
         /* The restore OS's kernel log on the serial console (this log): where a long boot is, or why it stopped. */
         setenv("HV_RESTORE_BOOT_ARGS", "serial=3 -v", 0);
-        setenv("HV_PSCI_LOG", "1", 0); /* CPUs started, stopped, the machine reset or powered off: all in the log */
+        setenv("HV_PSCI_LOG", "1", 0);
+        setenv("HV_INSTALL_LOG", "1", 0); /* the restore tools' debug lines too: the app's normal log view hides them */ /* CPUs started, stopped, the machine reset or powered off: all in the log */
     }
     if (!vc.rom || !vc.disk || !vc.aux) usage();
     int gunyah = !strcmp(engine, "gunyah");

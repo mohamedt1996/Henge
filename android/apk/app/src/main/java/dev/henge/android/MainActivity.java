@@ -431,9 +431,7 @@ public class MainActivity extends Activity {
         page.addView(toggle);
         if (details) {
             page.addView(gap(10));
-            LinearLayout d = card(22);
-            d.addView(logView(14));
-            page.addView(d);
+            page.addView(logCard(14, false));
         }
     }
 
@@ -449,9 +447,7 @@ public class MainActivity extends Activity {
         c.addView(primary("Back", true, v -> { VmService.state = "idle"; render(true); }));
         page.addView(c);
         page.addView(heading("Log"));
-        LinearLayout l = card(22);
-        l.addView(logView(14));
-        page.addView(l);
+        page.addView(logCard(14, false));
     }
 
     private void finished(LinearLayout page) {
@@ -551,12 +547,7 @@ public class MainActivity extends Activity {
         downloads(page);
 
         page.addView(heading("Log"));
-        LinearLayout l = card(22);
-        l.addView(logView(40));
-        l.addView(gap(10));
-        l.addView(link("Clear log", v -> { VmService.logFile(this).delete(); prefs.edit().putLong("installStart", 0).apply();
-            installStart = 0; render(true); }));
-        page.addView(l);
+        page.addView(logCard(40, true));
     }
 
     // MARK: Downloads
@@ -981,14 +972,58 @@ public class MainActivity extends Activity {
 
     private static final Pattern PROGRESS = Pattern.compile("\\s*(.*?):\\s*\\d{1,3}(?:\\.\\d)?%\\s*");
 
-    private TextView logView(int lines) {
-        String all = read(VmService.logFile(this), Math.max(0, VmService.logFile(this).length() - 24 * 1024));
+    /** Two views of one file: henge.log keeps everything the engine prints (the verbose log); the normal view leaves
+     *  out the machinery (iBoot's trace, debug lines, plist dumps, PSCI calls, heartbeats), which verbose shows. */
+    private boolean verboseLog() { return prefs.getBoolean("logVerbose", false); }
+
+    private static final Pattern NOISE = Pattern.compile(
+            "^(?:[0-9a-f]{10,16}:\\d+"                           // iBoot's trace: hash:line
+            + "|psci 0x.*"                                         // PSCI calls (HV_PSCI_LOG)
+            + "|.*<Debug>.*"                                       // the restore tools' debug lines
+            + "|\\s*<(?:\\?xml|!DOCTYPE|/?(?:plist|dict|key|string|integer|data|array|true|false|real|date)\\b).*" // plist dumps
+            + "|henge: guest \\d+ s:.*"                            // the install heartbeat
+            + "|gunyah: \\d+ device accesses.*"
+            + "|hengevm: (?:read of|write to) implementation-defined.*"
+            + "|hengevm: unknown hypervisor call.*"
+            + "|mmio (?:read|write) .*"
+            + ")$");
+
+    private LinearLayout logCard(int lines, boolean clear) {
+        LinearLayout l = card(22);
+        l.setPadding(0, dp(4), 0, dp(14));
+        l.addView(choiceRow("Log", new String[]{"Normal", "Verbose"}, verboseLog() ? 1 : 0,
+                i -> { prefs.edit().putBoolean("logVerbose", i == 1).apply(); render(true); }));
+        LinearLayout body = column();
+        body.setPadding(dp(17), dp(4), dp(17), 0);
+        body.addView(logView(verboseLog() ? lines * 3 : lines, verboseLog()));
+        body.addView(gap(10));
+        body.addView(link("Copy the verbose log", v -> {
+            File f = VmService.logFile(this);
+            String all = read(f, Math.max(0, f.length() - 256 * 1024));
+            getSystemService(android.content.ClipboardManager.class)
+                    .setPrimaryClip(android.content.ClipData.newPlainText("Henge verbose log", all));
+            VmService.exportLog(this);
+            android.widget.Toast.makeText(this, "Copied the last 256 KB. The whole log is in "
+                    + "Android/data/dev.henge.android/files/verbose.log", android.widget.Toast.LENGTH_LONG).show();
+        }));
+        if (clear) {
+            body.addView(gap(10));
+            body.addView(link("Clear log", v -> { VmService.logFile(this).delete(); prefs.edit().putLong("installStart", 0).apply();
+                installStart = 0; render(true); }));
+        }
+        l.addView(body);
+        return l;
+    }
+
+    private TextView logView(int lines, boolean verbose) {
+        String all = read(VmService.logFile(this), Math.max(0, VmService.logFile(this).length() - (verbose ? 96 : 48) * 1024));
         // A progress bar redrawn with \r, or printed as "Label: 93.1%" line after line, shows as its latest value.
         List<String> ls = new ArrayList<>();
         for (String raw : all.split("\n")) {
             int cr = raw.lastIndexOf('\r', raw.length() - 2);
             String line = (cr >= 0 ? raw.substring(cr + 1) : raw).replace("\r", "").replaceAll("\u001B\\[[0-9;]*[A-Za-z]", "");
             if (line.trim().isEmpty()) continue;
+            if (!verbose && NOISE.matcher(line).matches()) continue;
             Matcher pm = PROGRESS.matcher(line);
             if (pm.matches() && !ls.isEmpty()) {
                 Matcher prev = PROGRESS.matcher(ls.get(ls.size() - 1));

@@ -40,6 +40,14 @@ public class VmService extends Service {
     }
     public static File logFile(Context c) { return new File(c.getFilesDir(), "henge.log"); }
 
+    /** The verbose log where a computer sees it over USB: Android/data/dev.henge.android/files/verbose.log. */
+    static void exportLog(Context c) {
+        File ext = c.getExternalFilesDir(null), log = logFile(c);
+        if (ext == null || !log.exists()) return;
+        try { Files.copy(log.toPath(), new File(ext, "verbose.log").toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING); }
+        catch (Exception ignored) { }
+    }
+
     /** Where downloads are kept (restore images, the boot ROM): Henge/ on the tablet's storage when the app has
      *  all-files access, so they outlive an uninstall; else the app's own folder, which outlives updates. */
     public static File libraryDir(Context c) {
@@ -185,6 +193,7 @@ public class VmService extends Service {
                         java.nio.file.StandardCopyOption.REPLACE_EXISTING); } catch (Exception ignored) { }
             }
         }
+        exportLog(this);
         if (install && code == 0) {
             try { new File(files, "installed").createNewFile(); } catch (Exception ignored) { }
             // The restore image is 17 GB; kept by default so a reinstall needs no download.
