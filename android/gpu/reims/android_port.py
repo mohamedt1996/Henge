@@ -102,6 +102,37 @@ def main() -> None:
         end = t.index('            return;\n        }\n', at) + len('            return;\n        }\n')
         t = t[:end] + rounding + t[end:]
         regs.write_text(t)
+    # The IOSurface mapper device sizes its descriptor table, its page mappings and the features it
+    # offers by the HOST's page size (sysconf), which equals the guest's on every host the library
+    # supports (Apple silicon: 16 KiB both; x86-64 Linux: 4 KiB both). Android arm64 is 4 KiB host
+    # pages under a 16 KiB-page macOS guest: the 4 KiB table mapping died in the memory map
+    # ("memory.map.mapping_length_unaligned", the tablet, 2026-11-09, right after the mapper wrote its
+    # descriptor table base), and the guest was offered v1 descriptors. The device's pages are the
+    # guest's: APV_PAGE_SIZE and APV_PAGE_SHIFT, whole host pages either way.
+    device = reims / 'crates' / 'reims-vgpu-core' / 'src' / 'iosurface' / 'device.rs'
+    descriptor = reims / 'crates' / 'reims-vgpu-core' / 'src' / 'iosurface' / 'descriptor.rs'
+    for path, edits in [
+        (device, [
+            ('        let page = platform.vm().page_size();\n        let table_len = page /',
+             '        let page = crate::guest::records::APV_PAGE_SIZE; // Henge: the guest\'s page\n        let table_len = page /'),
+            ('    pub(super) fn page_size(&self) -> u64 {\n        self.platform.vm().page_size()\n    }',
+             '    pub(super) fn page_size(&self) -> u64 {\n        crate::guest::records::APV_PAGE_SIZE // Henge\'s Android port: the guest\'s page, not the host\'s\n    }'),
+            ('    pub(super) fn page_shift(&self) -> u32 {\n        self.platform.vm().page_shift()\n    }',
+             '    pub(super) fn page_shift(&self) -> u32 {\n        crate::guest::records::APV_PAGE_SHIFT // Henge\'s Android port: the guest\'s page, not the host\'s\n    }'),
+        ]),
+        (descriptor, [
+            ('    let page = p.vm().page_size();\n    spec.client_address_ranges',
+             '    let _ = p; // Henge\'s Android port: the guest\'s page, not the host\'s\n    let page = crate::guest::records::APV_PAGE_SIZE;\n    spec.client_address_ranges'),
+        ]),
+    ]:
+        t = path.read_text()
+        for old, new in edits:
+            if new in t:
+                continue
+            if t.count(old) != 1:
+                sys.exit(f'android_port: {path}: {old.splitlines()[0].strip()!r} not found once; upstream changed')
+            t = t.replace(old, new)
+        path.write_text(t)
     print(f'android_port: {total} Linux-only places now take Android')
 
 

@@ -47,8 +47,14 @@ Second run (same day): device, IOSurface device and display came up, and the app
 wrote a ring size whose length (size x 16 bytes) is not whole 16 KiB pages, which the library
 treats as host death (its docs 6.23). `android_port.py` now rounds the ring's mapping up to whole
 pages (the ring's index math keeps the guest's size), `host.c` logs the mapper's setup registers,
-and the engine's reims MMIO is self-locked so a GPU access no longer stalls the other devices. What
-to expect next, in order:
+and the engine's reims MMIO is self-locked so a GPU access no longer stalls the other devices.
+
+Third run: the mapper's register log showed the death follows the descriptor table write, not a
+ring size. The IOSurface device sizes its descriptor table, page mappings and features by the host's
+page size (sysconf), equal to the guest's on every host the library supports (Apple silicon 16 KiB
+both, x86-64 Linux 4 KiB both); Android arm64 has 4 KiB host pages under a 16 KiB-page guest, so the
+4 KiB table mapping died in the map. `android_port.py` makes the device's pages the guest's
+(`APV_PAGE_SIZE`). What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
   `reims` lines in `adb logcat -s henge-gpu`, and a `reims-vgpu: fatal` line ends the app's process;
