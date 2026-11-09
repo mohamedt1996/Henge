@@ -65,7 +65,14 @@ metal2vulkan uses to wrap guest pages as GPU memory, and without it its Importer
 nothing, so every no-copy buffer and IOSurface texture takes the runtime's existing copy path
 (`copied-host-pages`: a copy of the pages, compared on the CPU at each commit). Slower than imports,
 and the first thing to revisit (Turnip has the extension; a bundled Turnip is the long-term route).
-What to expect next, in order:
+
+Fifth run: the copy path works. 1034 presents, 6466 interrupts, macOS's 1920x1080 mode set, two
+minutes of GPU work; then WindowServer's `inplace_copy_lph` pipeline needed framebuffer fetch
+(programmable blending), which metal2vulkan builds through `VK_EXT_rasterization_order_attachment_access`
+or `VK_EXT_fragment_shader_interlock`, and Qualcomm's driver has neither. `m2v_unordered_fetch.py`
+emits the input-attachment form without the order flags on Android (a tiler shades one pixel's
+fragments in order in practice; the extension promises what the hardware does). Where the bet is
+wrong the picture is wrong, not the process. What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
   `reims` lines in `adb logcat -s henge-gpu`, and a `reims-vgpu: fatal` line ends the app's process;

@@ -137,6 +137,9 @@ def main() -> None:
     # copies, not a refusal that ends the app at the first IOSurface texture (m2v_no_host_import.py).
     import subprocess
     subprocess.run([sys.executable, '-I', str(HERE / 'm2v_no_host_import.py'), str(m2v)], check=True)
+    # Framebuffer fetch on a device with neither ordered form (Qualcomm): input attachments without the
+    # order flags, best effort (m2v_unordered_fetch.py), instead of refusing WindowServer's pipelines.
+    subprocess.run([sys.executable, '-I', str(HERE / 'm2v_unordered_fetch.py'), str(m2v)], check=True)
     print(f'android_port: {total} Linux-only places now take Android')
 
 
