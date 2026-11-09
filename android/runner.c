@@ -5,6 +5,10 @@
 #include "vnc.h"
 #include "fetch.h"
 #include "install.h"
+#include "machine.h"
+#include "cpu.h"
+#include "vmapple.h"
+#include "virtio_usb.h"
 #include <sys/stat.h>
 #include <curl/curl.h>
 static void curl_global_init_all(void) { curl_global_init(CURL_GLOBAL_ALL); }
@@ -83,6 +87,31 @@ static void *install_watchdog(void *arg) {
     fprintf(stderr, "henge: the engine did not stop after the failed install; exiting\n");
     fflush(stdout);
     _exit(1);
+}
+/* While installing: every 30 s, where each guest CPU is and who owns the USB port. A boot that gives no serial
+   output still shows here whether the kernel runs (EL1 PCs at 0xfffffe..., blocks climbing), spins in one place,
+   sleeps (blocks flat), stopped (halted), and whether its USB driver ever touched the port. */
+static void *install_heartbeat(void *arg) {
+    (void)arg;
+    uint64_t last[HV_MAX_CPUS] = {0};
+    for (int t = 30; install_done == -2; t += 30) {
+        sleep(30);
+        HvVirtioUsb *u = hv_vm_board()->vusb;
+        fprintf(stderr, "henge: guest %d s:", t);
+        for (int i = 0; i < hv_vm_ncpus(); i++) {
+            HvCpu *c = hv_vm_cpu(i);
+            uint64_t n = c->icount;
+            if (c->halted) fprintf(stderr, " cpu%d stopped at %llx", i, (unsigned long long)c->pc);
+            else if (c->off) fprintf(stderr, " cpu%d off", i);
+            else fprintf(stderr, " cpu%d EL%u %llx +%llu", i, c->el, (unsigned long long)c->pc,
+                         (unsigned long long)(n - last[i]));
+            last[i] = n;
+        }
+        if (u) fprintf(stderr, " | usb: %s, kernel driver %s (status %#x)", u->rom_on ? "iBoot has it" : "iBoot let go",
+                       u->pci_on ? "on" : "not started", u->vio.status);
+        fputc('\n', stderr);
+    }
+    return NULL;
 }
 static void on_install(int step, double p, void *user) {
     (void)user;
@@ -195,6 +224,7 @@ int main(int argc, char **argv) {
         setenv("HV_RESTORE_TIMEOUT_SCALE", "10", 0);
         /* The restore OS's kernel log on the serial console (this log): where a long boot is, or why it stopped. */
         setenv("HV_RESTORE_BOOT_ARGS", "serial=3 -v", 0);
+        setenv("HV_PSCI_LOG", "1", 0); /* CPUs started, stopped, the machine reset or powered off: all in the log */
     }
     if (!vc.rom || !vc.disk || !vc.aux) usage();
     if (!install_dir && access(vc.rom, R_OK) != 0) { /* a Mac whose boot ROM went missing: put it back */
@@ -258,6 +288,10 @@ int main(int argc, char **argv) {
     if (install_dir && hv_install_start(hv_vm_board()->vusb, ipsw, work, vc.ecid, on_install, NULL) != 0) {
         fprintf(stderr, "henge: the installer could not start\n");
         return 1;
+    }
+    if (install_dir) {
+        pthread_t hb;
+        if (pthread_create(&hb, NULL, install_heartbeat, NULL) == 0) pthread_detach(hb);
     }
     if (install_dir) usleep(500000); /* usbmuxd installs its own handlers; take SIGINT and SIGTERM back */
     signal(SIGINT, on_signal);
