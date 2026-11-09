@@ -13,6 +13,9 @@
 #include "pvg_lite.h"
 #include <sys/stat.h>
 #include <curl/curl.h>
+/* Graphics: reims (pvg_reims.c): what crossed to the app's GPU device. */
+void hv_pvg_reims_activity(uint64_t *requests, uint64_t *irqs);
+
 static void curl_global_init_all(void) { curl_global_init(CURL_GLOBAL_ALL); }
 
 #include <pthread.h>
@@ -133,9 +136,15 @@ static void *install_heartbeat(void *arg) {
         }
         uint64_t disk = (b->root_blk ? b->root_blk->requests : 0) + (b->aux_blk ? b->aux_blk->requests : 0);
         uint64_t cmds = 0, swaps = 0;
-        hv_pvg_lite_activity(b->pvg, &cmds, &swaps);
-        fprintf(stderr, " | disk +%llu | gpu +%llu cmds, %llu frames", (unsigned long long)(disk - last_disk),
-                (unsigned long long)(cmds - last_gpu), (unsigned long long)swaps);
+        if (b->pvg) {
+            hv_pvg_lite_activity(b->pvg, &cmds, &swaps);
+            fprintf(stderr, " | disk +%llu | gpu +%llu cmds, %llu frames", (unsigned long long)(disk - last_disk),
+                    (unsigned long long)(cmds - last_gpu), (unsigned long long)swaps);
+        } else { /* Graphics: reims: the device is the app's; count what crosses to it */
+            hv_pvg_reims_activity(&cmds, &swaps);
+            fprintf(stderr, " | disk +%llu | gpu (reims) +%llu register accesses, %llu interrupts",
+                    (unsigned long long)(disk - last_disk), (unsigned long long)(cmds - last_gpu), (unsigned long long)swaps);
+        }
         if (disk != last_disk || cmds != last_gpu) moved = 1;
         last_disk = disk, last_gpu = cmds;
         if (u) fprintf(stderr, " | usb: %s, kernel driver %s (status %#x)", u->rom_on ? "iBoot has it" : "iBoot let go",
