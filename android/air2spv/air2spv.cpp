@@ -166,6 +166,8 @@ struct SpvLayout {
   std::map<int, nir_variable *> tex, smp, img, fb;     // by T# / S# / image / colour attachment
   int maxPushSlot = -1;
   bool usesConstData = false;
+  int pushBase = 0; // ABI v2: the fragment stage's slots follow the vertex stage's in one push block
+  int set = 0;      // ABI v2: vertex resources in set 1, so texture(0) of each stage has its own binding
 };
 
 static nir_def *pushAddr(nir_builder *b, int slot) {
@@ -194,7 +196,7 @@ static bool lowerBuffers(nir_shader *s, SpvLayout &L) {
     L.maxPushSlot = std::max(L.maxPushSlot, slot);
     unsigned align = nir_intrinsic_align_mul(in);
     if (nir_intrinsic_align_offset(in)) align = 1u << (ffs(nir_intrinsic_align_offset(in)) - 1);
-    nir_def *addr = nir_iadd(b, pushAddr(b, slot), nir_u2u64(b, off));
+    nir_def *addr = nir_iadd(b, pushAddr(b, L.pushBase + slot), nir_u2u64(b, off));
     nir_def *v = nir_build_load_global(b, in->def.num_components, in->def.bit_size, addr,
                                        .align_mul = std::max(align, in->def.bit_size / 8u));
     nir_def_replace(&in->def, v);
@@ -226,10 +228,11 @@ static glsl_base_type baseOfAlu(nir_alu_type t) {
   }
 }
 
-static nir_variable *uniformVar(nir_shader *s, const glsl_type *t, int binding, const char *name) {
+static nir_variable *uniformVar(nir_shader *s, const glsl_type *t, int binding, const char *name, int set) {
   nir_variable *v = nir_variable_create(s, nir_var_uniform, t, name);
-  v->data.descriptor_set = 0;
+  v->data.descriptor_set = set;
   v->data.binding = binding;
+  v->data.driver_location = binding; /* nir_to_spirv binds a bare sampler by driver_location */
   return v;
 }
 
@@ -249,7 +252,7 @@ static bool lowerTextures(nir_shader *s, SpvLayout &L) {
       if (t->op == nir_texop_txs || t->op == nir_texop_query_levels || t->op == nir_texop_texture_samples) bt = GLSL_TYPE_FLOAT;
       const glsl_type *tt = glsl_texture_type(t->sampler_dim, t->is_array, bt);
       nir_variable *&tv = L.tex[ti];
-      if (!tv) tv = uniformVar(s, tt, AIR2SPV_BINDING_TEXTURE + ti, ("texture" + std::to_string(ti)).c_str());
+      if (!tv) tv = uniformVar(s, tt, AIR2SPV_BINDING_TEXTURE + ti, ("texture" + std::to_string(ti)).c_str(), L.set);
       else if (tv->type != tt) {
         // one Metal texture argument has one type; a size query is typeless
         if (t->op != nir_texop_txs && t->op != nir_texop_query_levels && t->op != nir_texop_texture_samples)
@@ -261,7 +264,7 @@ static bool lowerTextures(nir_shader *s, SpvLayout &L) {
       if (needSampler) {
         if (si < 0 || si >= 16) die("sampler index " + std::to_string(si));
         nir_variable *&sv = L.smp[si];
-        if (!sv) sv = uniformVar(s, glsl_bare_sampler_type(), AIR2SPV_BINDING_SAMPLER + si, ("sampler" + std::to_string(si)).c_str());
+        if (!sv) sv = uniformVar(s, glsl_bare_sampler_type(), AIR2SPV_BINDING_SAMPLER + si, ("sampler" + std::to_string(si)).c_str(), L.set);
         nir_tex_instr_add_src(t, nir_tex_src_sampler_deref, &nir_build_deref_var(&b, sv)->def);
       }
       t->texture_index = 0; t->sampler_index = 0;
@@ -293,7 +296,7 @@ static bool lowerImages(nir_shader *s, SpvLayout &L) {
     const glsl_type *it = glsl_image_type(nir_intrinsic_image_dim(in), nir_intrinsic_image_array(in), baseOfAlu(ty));
     nir_variable *&v = L.img[n];
     if (!v) {
-      v = uniformVar(b->shader, it, AIR2SPV_BINDING_IMAGE + n, ("image" + std::to_string(n)).c_str());
+      v = uniformVar(b->shader, it, AIR2SPV_BINDING_IMAGE + n, ("image" + std::to_string(n)).c_str(), L.set);
       v->data.mode = nir_var_image;
       v->data.image.format = PIPE_FORMAT_NONE;
       v->data.access = ACCESS_NON_READABLE;
@@ -328,7 +331,7 @@ static bool lowerFbFetch(nir_shader *s, SpvLayout &L) {
     if (bt != GLSL_TYPE_INT && bt != GLSL_TYPE_UINT) bt = GLSL_TYPE_FLOAT;
     if (!fv) {
       fv = uniformVar(b->shader, glsl_image_type(GLSL_SAMPLER_DIM_SUBPASS, false, bt), AIR2SPV_BINDING_FBFETCH + rt,
-                      ("fbfetch" + std::to_string(rt)).c_str());
+                      ("fbfetch" + std::to_string(rt)).c_str(), L.set);
       fv->data.mode = nir_var_image;
       fv->data.index = rt;     // InputAttachmentIndex
       fv->data.image.format = PIPE_FORMAT_NONE;
@@ -351,7 +354,9 @@ static void assignLocations(nir_shader *s) {
     int loc = v->data.location;
     if (s->info.stage == MESA_SHADER_VERTEX && v->data.mode == nir_var_shader_in && loc >= VERT_ATTRIB_GENERIC0)
       v->data.driver_location = loc - VERT_ATTRIB_GENERIC0;
-    else if (loc >= VARYING_SLOT_VAR0 && !(s->info.stage == MESA_SHADER_FRAGMENT && v->data.mode == nir_var_shader_out))
+    else if (s->info.stage == MESA_SHADER_FRAGMENT && v->data.mode == nir_var_shader_out)
+      v->data.driver_location = loc >= FRAG_RESULT_DATA0 ? loc - FRAG_RESULT_DATA0 : 0; /* [[color(n)]] is Location n */
+    else if (loc >= VARYING_SLOT_VAR0)
       v->data.driver_location = loc - VARYING_SLOT_VAR0;
     else
       v->data.driver_location = 0;
@@ -391,7 +396,61 @@ static void usePhysicalAddressing(std::vector<uint32_t> &w) {
 // ------------------------------------------------------------------------------- compile --
 static std::string jstr(const std::string &s) { return "\"" + jesc(s) + "\""; }
 
-struct SpvOut { std::vector<uint32_t> words; std::vector<uint8_t> constData; std::string json, nirText; };
+// The replay's view of the sidecar (android/gpu/replay/draw.c reads it): one item a line, push slots
+// absolute in the 32-slot block.
+static const char *baseName(glsl_base_type t) { return t == GLSL_TYPE_INT ? "i" : t == GLSL_TYPE_UINT ? "u" : "f"; }
+
+static std::string layoutText(const AirFrontendResult &R, const SpvLayout &L, nir_shader *s, size_t constBytes) {
+  std::string t = "air2spv-layout " + std::to_string(AIR2SPV_ABI_VERSION) + "\n";
+  t += std::string("stage ") + (R.stage == MESA_SHADER_VERTEX ? "vertex" : R.stage == MESA_SHADER_FRAGMENT ? "fragment" : "kernel") + "\n";
+  char line[256];
+  bool table = false;
+  for (auto &b : R.bindings) {
+    if (!b.used) continue;
+    if (b.kind == "ubo") snprintf(line, sizeof line, "push %d cbuf %d\n", L.pushBase + b.slot, b.metal_index), t += line;
+    else if (b.kind == "device_buffer") {
+      snprintf(line, sizeof line, "dbuf %d %d %s\n", b.metal_index, b.slot, b.access.empty() ? "rw" : b.access.c_str()), t += line;
+      table = true;
+    } else if (b.kind == "threadgroup_buffer") table = true;
+  }
+  if (table) snprintf(line, sizeof line, "push %d table\n", L.pushBase + R.driver_table_ubo), t += line;
+  if (L.usesConstData) snprintf(line, sizeof line, "push %d const %zu\n", L.pushBase + AIR2SPV_CONST_DATA_SLOT, constBytes), t += line;
+  auto metalOf = [&](const char *kind, int slot) {
+    for (auto &b : R.bindings) if (b.kind == kind && b.slot == slot) return b.metal_index;
+    return slot;
+  };
+  for (auto &kv : L.tex) {
+    const glsl_type *ty = kv.second->type;
+    snprintf(line, sizeof line, "tex %d %d %d %d %d %s\n", metalOf("texture", kv.first), L.set, AIR2SPV_BINDING_TEXTURE + kv.first,
+             (int)glsl_get_sampler_dim(ty), glsl_sampler_type_is_array(ty) ? 1 : 0, baseName(glsl_get_sampler_result_type(ty)));
+    t += line;
+  }
+  for (auto &kv : L.smp) {
+    const AirBinding *cs = nullptr;
+    for (auto &b : R.bindings) if (b.kind == "constexpr_sampler" && b.slot == kv.first) cs = &b;
+    if (cs) {
+      air_sampler as; air_sampler_decode(cs->sampler_word, &as);
+      snprintf(line, sizeof line, "csmp %d %d %d %u %u %u %u %u %u %u %u %u %u %g %g\n", kv.first, L.set, AIR2SPV_BINDING_SAMPLER + kv.first,
+               as.s_address, as.t_address, as.r_address, as.mag_linear, as.min_linear, as.mip_filter, as.pixel_coords, as.compare,
+               as.aniso, as.border, as.lod_min, as.lod_max);
+    } else snprintf(line, sizeof line, "smp %d %d %d\n", metalOf("sampler", kv.first), L.set, AIR2SPV_BINDING_SAMPLER + kv.first);
+    t += line;
+  }
+  for (auto &kv : L.img) {
+    const glsl_type *ty = kv.second->type;
+    snprintf(line, sizeof line, "img %d %d %d %d %d %s\n", metalOf("texture", kv.first), L.set, AIR2SPV_BINDING_IMAGE + kv.first,
+             (int)glsl_get_sampler_dim(ty), glsl_sampler_type_is_array(ty) ? 1 : 0, baseName(glsl_get_sampler_result_type(ty)));
+    t += line;
+  }
+  for (auto &kv : L.fb) snprintf(line, sizeof line, "fbf %d %d %d\n", kv.first, L.set, AIR2SPV_BINDING_FBFETCH + kv.first), t += line;
+  for (auto &a : R.attributes) snprintf(line, sizeof line, "attr %d %u %u %s\n", a.index, a.comps, a.bits, a.base.c_str()), t += line;
+  for (auto &r : R.render_targets)
+    if (r.written) snprintf(line, sizeof line, "rt %d %u %s\n", r.index, r.comps, r.base.c_str()), t += line;
+  (void)s;
+  return t;
+}
+
+struct SpvOut { std::vector<uint32_t> words; std::vector<uint8_t> constData; std::string json, nirText, layout; };
 
 static SpvOut compileSpv(const void *air, size_t size, const AirOptions &o, bool wantNir) {
   AirFrontendResult R = air_frontend_mem(air, size, o, spvNirOptions());
@@ -404,13 +463,15 @@ static SpvOut compileSpv(const void *air, size_t size, const AirOptions &o, bool
     NIR_PASS(_, s, nir_lower_compute_system_values, &csv);
   }
   SpvLayout L;
+  if (s->info.stage == MESA_SHADER_FRAGMENT) L.pushBase = AIR2SPV_PUSH_SLOTS;
+  if (s->info.stage == MESA_SHADER_VERTEX) L.set = 1;
   NIR_PASS(_, s, lowerBuffers, L);
   NIR_PASS(_, s, lowerTextures, L);
   NIR_PASS(_, s, lowerImages, L);
   if (s->info.stage == MESA_SHADER_FRAGMENT) NIR_PASS(_, s, lowerFbFetch, L);
   if (L.maxPushSlot >= 0) {
     glsl_struct_field f = {};
-    f.type = glsl_array_type(glsl_uint_type(), AIR2SPV_PUSH_SLOTS * 2, 4);
+    f.type = glsl_array_type(glsl_uint_type(), AIR2SPV_PUSH_SLOTS * 2 * 2, 4); /* both stages' slots */
     f.name = "addr"; f.offset = 0; f.location = -1;
     nir_variable *pc = nir_variable_create(s, nir_var_mem_push_const, glsl_struct_type(&f, 1, "air2spv_push", false), "push");
     pc->data.location = INT_MAX;
@@ -448,7 +509,8 @@ static SpvOut compileSpv(const void *air, size_t size, const AirOptions &o, bool
   std::string d = "[";
   auto desc = [&](const char *kind, int metal, int binding, const char *extra = "") {
     if (d.size() > 1) d += ",";
-    d += std::string("{\"kind\":\"") + kind + "\",\"index\":" + std::to_string(metal) + ",\"set\":0,\"binding\":" + std::to_string(binding) + extra + "}";
+    d += std::string("{\"kind\":\"") + kind + "\",\"index\":" + std::to_string(metal) + ",\"set\":" + std::to_string(L.set) +
+         ",\"binding\":" + std::to_string(binding) + extra + "}";
   };
   for (auto &kv : L.tex) desc("sampled_image", kv.first, AIR2SPV_BINDING_TEXTURE + kv.first);
   for (auto &kv : L.smp) desc((R.constexpr_sampler_mask >> kv.first) & 1 ? "constexpr_sampler" : "sampler", kv.first, AIR2SPV_BINDING_SAMPLER + kv.first);
@@ -465,9 +527,11 @@ static SpvOut compileSpv(const void *air, size_t size, const AirOptions &o, bool
   if (L.usesConstData) { if (slots.size() > 1) slots += ","; slots += "{\"slot\":" + std::to_string(AIR2SPV_CONST_DATA_SLOT) + ",\"what\":\"constant data\",\"bytes\":" + std::to_string(out.constData.size()) + "}"; }
   slots += "]";
   out.json = "{\"air2spv_abi\":" + std::to_string(AIR2SPV_ABI_VERSION) + ",\"spirv_words\":" + std::to_string(out.words.size()) +
-             ",\"push_constants\":{\"bytes\":" + std::to_string(AIR2SPV_PUSH_BYTES) + ",\"used\":" + (L.maxPushSlot >= 0 ? "true" : "false") +
+             ",\"push_constants\":{\"bytes\":" + std::to_string(AIR2SPV_PUSH_BYTES) + ",\"first_slot\":" + std::to_string(L.pushBase) +
+             ",\"used\":" + (L.maxPushSlot >= 0 ? "true" : "false") +
              ",\"slots\":" + slots + "},\"descriptors\":" + d + ",\"reflection\":" + air_reflection_json(R) +
              ",\"report\":" + jstr(R.report) + "}";
+  out.layout = layoutText(R, L, s, out.constData.size());
   return out;
 }
 
@@ -523,12 +587,13 @@ static std::vector<double> parseVals(const char *s) {
 }
 
 int main(int argc, char **argv) {
-  AirOptions o; const char *in = nullptr, *outPath = nullptr, *jsonPath = nullptr; bool nir = false;
+  AirOptions o; const char *in = nullptr, *outPath = nullptr, *jsonPath = nullptr, *layoutPath = nullptr; bool nir = false;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     auto next = [&]() -> const char * { if (i + 1 >= argc) { fprintf(stderr, "air2spv: %s needs a value\n", a.c_str()); exit(1); } return argv[++i]; };
     if (a == "-o") outPath = next();
     else if (a == "--json") jsonPath = next();
+    else if (a == "--layout") layoutPath = next();
     else if (a == "--entry") o.entry = next();
     else if (a == "--nir") nir = true;
     else if (a == "--stage") { std::string s = next(); o.expectStage = s == "vertex" ? MESA_SHADER_VERTEX : s == "fragment" ? MESA_SHADER_FRAGMENT : MESA_SHADER_COMPUTE; }
@@ -538,7 +603,7 @@ int main(int argc, char **argv) {
     else if (a == "--tex-class") { std::string s = next(); auto eq = s.find('='); o.texClass[atoi(s.substr(0, eq).c_str()) & 15] = (uint8_t)atoi(s.c_str() + eq + 1); }
     else if (a[0] == '-') {
       fprintf(stderr, "usage: air2spv [--entry name] [--stage vertex|fragment|kernel] [--fc idx=v[,v]] [--fc-name name=v[,v]]\n"
-                      "               [--rt-class n=c] [--tex-class n=c] [--nir] [--json out.json] [-o out.spv] function.bc\n");
+                      "               [--rt-class n=c] [--tex-class n=c] [--nir] [--json out.json] [--layout out.layout] [-o out.spv] function.bc\n");
       return 1;
     } else in = argv[i];
   }
@@ -557,6 +622,7 @@ int main(int argc, char **argv) {
       f = fopen(cp.c_str(), "wb"); fwrite(r.constData.data(), 1, r.constData.size(), f); fclose(f);
     }
     if (jsonPath) { f = fopen(jsonPath, "w"); fputs(r.json.c_str(), f); fputc('\n', f); fclose(f); }
+    if (layoutPath) { f = fopen(layoutPath, "w"); fputs(r.layout.c_str(), f); fclose(f); }
     fprintf(stderr, "air2spv: %s -> %s (%zu words)\n", in, op.c_str(), r.words.size());
     return 0;
   } catch (const std::exception &e) {

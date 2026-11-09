@@ -18,6 +18,7 @@ struct Replay {
     Objects os;
     pthread_mutex_t lock; /* objects and surfaces: the ring thread and the presenter */
     Shaders *shaders;
+    Gpu *gpu;
     Screen *screen;
     int test_screen;
     void *window, *new_window;
@@ -243,22 +244,31 @@ static void exec(Replay *r, const uint32_t *a, uint32_t n) {
             memcpy(&seglen, p, 4), memcpy(&inf, p + 4, 4);
             p += 8;
         }
-        uint32_t type = inf & 0xff;
+        uint32_t type = inf & 0xff, cont = (inf >> 8) & 0xff, more = (inf >> 16) & 0xff;
         if (p + seglen < end) end = p + seglen;
+        /* A render encoder runs on across buffers while each says it continues; the pass ends with it. */
+        if (!cont || type != 0) gpu_pass_end(r->gpu);
         while (p + 8 <= end) {
             uint32_t tag, size;
             memcpy(&tag, p, 4), memcpy(&size, p + 4, 4);
             if (size < 8 || p + size > end) break;
             Rec rc = {p + 8, size - 8};
             if (type == 0) {
-                if (tag == 26) begin_pass(r, rc, task);
-                else if (is_draw(tag)) r->draws++;
+                if (tag == 26) {
+                    gpu_pass_end(r->gpu);
+                    begin_pass(r, rc, task); /* the clears, on the CPU; a pass that draws clears again on the GPU */
+                    gpu_pass_begin(r->gpu, task, rc.p, rc.size);
+                } else if (gpu_record(r->gpu, tag, rc.p, rc.size)) {
+                    if (is_draw(tag)) r->draws++;
+                } else if (is_draw(tag)) r->draws++;
             } else if (type == 2) blit(r, tag, rc, task);
             else if (type == 4) info(r, tag, rc, task);
             p += size;
         }
+        if (!more) gpu_pass_end(r->gpu);
         free(copy);
     }
+    gpu_pass_end(r->gpu);
 }
 
 /* ---------------------------------------------------------------- commands -- */
@@ -379,14 +389,17 @@ static void *present_loop(void *arg) {
         if (where != r->cursor_at) r->cursor_at = where, r->dirty = 1;
         if (r->dirty && r->screen && r->have_guest) replay_present_now(r);
         if (now_ns() - last_report > 10000000000ull) {
-            uint64_t st[3];
+            uint64_t st[3], gs[4];
             shaders_stats(r->shaders, st);
-            rlog("%llu commands, %llu execs, %llu passes, %llu clears, %llu blits, %llu draws skipped, %llu swaps, %llu frames, "
-                 "%llu not done; shaders %llu translated, %llu refused, %llu waiting",
-                 (unsigned long long)r->commands, (unsigned long long)r->execs, (unsigned long long)r->passes,
-                 (unsigned long long)r->clears, (unsigned long long)r->blits, (unsigned long long)r->draws,
-                 (unsigned long long)r->swaps, (unsigned long long)r->frames, (unsigned long long)r->unknown,
-                 (unsigned long long)st[0], (unsigned long long)st[1], (unsigned long long)st[2]);
+            pthread_mutex_lock(&r->lock);
+            gpu_stats(r->gpu, gs);
+            pthread_mutex_unlock(&r->lock);
+            rlog("%llu commands, %llu execs, %llu passes (%llu on the GPU), %llu clears, %llu blits, %llu draws: %llu drawn, %llu skipped; "
+                 "%llu pipelines, %llu swaps, %llu frames, %llu not done; shaders %llu translated, %llu refused, %llu waiting",
+                 (unsigned long long)r->commands, (unsigned long long)r->execs, (unsigned long long)r->passes, (unsigned long long)gs[0],
+                 (unsigned long long)r->clears, (unsigned long long)r->blits, (unsigned long long)r->draws, (unsigned long long)gs[1],
+                 (unsigned long long)gs[2], (unsigned long long)gs[3], (unsigned long long)r->swaps, (unsigned long long)r->frames,
+                 (unsigned long long)r->unknown, (unsigned long long)st[0], (unsigned long long)st[1], (unsigned long long)st[2]);
             last_report = now_ns();
         }
     }
@@ -478,6 +491,7 @@ Replay *replay_start(const char *link_path, void *window, const char *tool, cons
     if (!r) return NULL;
     snprintf(r->link_path, sizeof r->link_path, "%s", link_path);
     r->shaders = shaders_create(tool, cache);
+    r->gpu = r->shaders ? gpu_create(&r->os, r->shaders) : NULL;
     r->new_window = window, r->window_changed = 1;
     if (pthread_create(&r->presenter, NULL, present_loop, r) || pthread_create(&r->ring, NULL, ring_loop, r)) {
         rlog("no threads");
@@ -513,11 +527,17 @@ void replay_stop(Replay *r) {
     if (r->window) ANativeWindow_release(r->window);
     if (r->window_changed && r->new_window) ANativeWindow_release(r->new_window);
 #endif
+    gpu_destroy(r->gpu);
     shaders_destroy(r->shaders);
     if (r->have_guest || r->g.link) { reset_objects(r); if (!r->own_guest) guest_close(&r->g); }
     free(r->frame);
     free(r->cursor);
     free(r);
+}
+
+void replay_enable_draws(Replay *r, const char *tool, const char *cache) {
+    r->shaders = shaders_create(tool, cache);
+    r->gpu = r->shaders ? gpu_create(&r->os, r->shaders) : NULL;
 }
 
 Replay *replay_for_test(Guest *g, Screen *screen) {

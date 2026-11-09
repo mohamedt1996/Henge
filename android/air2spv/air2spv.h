@@ -11,14 +11,15 @@
 extern "C" {
 #endif
 
-#define AIR2SPV_ABI_VERSION 1
+#define AIR2SPV_ABI_VERSION 2
 
-/* Push-constant block: one u64 buffer address per slot. */
+/* Push-constant block: one u64 buffer address per slot, 16 slots a stage. The vertex (and kernel) stage
+   uses slots 0-15, the fragment stage 16-31: 256 bytes in all. */
 #define AIR2SPV_PUSH_SLOTS 16
-#define AIR2SPV_PUSH_BYTES (AIR2SPV_PUSH_SLOTS * 8)
+#define AIR2SPV_PUSH_BYTES (AIR2SPV_PUSH_SLOTS * 8 * 2)
 #define AIR2SPV_CONST_DATA_SLOT 15 /* the function's constant tables */
 
-/* Descriptor set 0 bindings. */
+/* Bindings, in set 0 for fragment and kernel functions and set 1 for vertex functions. */
 #define AIR2SPV_BINDING_TEXTURE 0  /* + Metal texture(n), sampled or read */
 #define AIR2SPV_BINDING_SAMPLER 16 /* + S# n (API sampler(n) or constexpr sampler slot) */
 #define AIR2SPV_BINDING_IMAGE 32   /* + Metal texture(n), access::write */

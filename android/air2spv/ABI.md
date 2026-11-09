@@ -34,7 +34,7 @@ and bitcode hash, which is the substitution table of VULKAN.md step 1 filled by 
 than by hand. `libair2spv.a` and `air2spv.h` are the same compiler as a library, for when the
 replay compiles at pipeline creation; that needs LLVM and Mesa built with the NDK.
 
-## Layout (ABI version 1)
+## Layout (ABI version 2)
 
 SPIR-V 1.5, Vulkan 1.2 or later. Required: `bufferDeviceAddress`, `shaderInt64`; for shaders that
 use them, `shaderFloat16`, `storageBuffer16BitAccess`, `shaderStorageImageWriteWithoutFormat`,
@@ -42,9 +42,9 @@ demote-to-helper (Vulkan 1.3 core).
 
 | Metal | Vulkan |
 | --- | --- |
-| `constant T& x [[buffer(n)]]` | Push-constant slot n: the buffer's device address (plus the Metal offset). Loads are `PhysicalStorageBuffer` loads. |
+| `constant T& x [[buffer(n)]]` | Push-constant slot n (vertex and kernel functions) or 16 + n (fragment functions): the buffer's device address (plus the Metal offset). Loads are `PhysicalStorageBuffer` loads. |
 | `device T* x [[buffer(n)]]` | The driver table: a buffer whose u64 at byte `8*n` is that buffer's address. The table's own address goes in push slot `driver_table_ubo` (= 1 + the highest constant buffer the function declares). Threadgroup offsets at byte `256 + 4*n`, as in BINDING-ABI.md 3.8. |
-| constant tables (`constant` globals) | Push slot 15: address of a buffer holding the function's constant data (`<out>.spv.const`, or `constant_data` from the library). |
+| constant tables (`constant` globals) | Push slot 15 (fragment: 31): address of a buffer holding the function's constant data (`<out>.spv.const`, or `constant_data` from the library). |
 | `texture(n)`, sample or read | Set 0, binding n: sampled image. |
 | `sampler(n)` and constexpr samplers | Set 0, binding 16 + n: sampler. A constexpr sampler's state is in the sidecar (`reflection.bindings[]` with kind `constexpr_sampler`, `state`). |
 | `texture(n)`, write | Set 0, binding 32 + n: storage image, format unknown. |
@@ -53,8 +53,17 @@ demote-to-helper (Vulkan 1.3 core).
 | `[[user(name)]]` varyings | `Location` = rank of the name in sorted order (both stages). |
 | `[[color(n)]]` output | Fragment output `Location` n. |
 
-Push constants: 128 bytes, 16 little-endian u64 addresses, all stages. A function whose constant
-buffers or driver table reach slot 15 is refused when it also has constant data.
+Descriptor bindings are in set 0 for fragment and kernel functions and set 1 for vertex functions,
+so `texture(0)` of each stage has its own binding.
+
+Push constants: 256 bytes, 32 little-endian u64 addresses, visible to all stages: slots 0-15 belong
+to the vertex (or kernel) function, 16-31 to the fragment function. A function whose constant
+buffers or driver table reach its slot 15 is refused when it also has constant data.
+
+`--layout FILE` writes the same facts one per line for the replay (android/gpu/replay/draw.c):
+`push <slot> cbuf <n>` / `push <slot> table` / `push <slot> const <bytes>`, `dbuf <n> <table offset>
+<access>`, `tex <n> <set> <binding> <dim> <array> <f|i|u>`, `smp <n> <set> <binding>`, `csmp ...` (a
+constexpr sampler's decoded state), `img`, `fbf`, `attr <index> <components> <bits> <type>`, `rt`.
 
 The sidecar (`--json`) lists the descriptors (`descriptors[]`, set and binding), the push slots in
 use (`push_constants.slots[]`), and air2ir3's reflection of the function (varyings, attributes,

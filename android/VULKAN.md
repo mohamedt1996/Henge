@@ -43,7 +43,8 @@ serialized format. There is no AIR → SPIR-V translator. Two ways in, in order:
       (`gpu/replay`): passes, blits, object queries, swaps, the pointer. See [gpu/README.md](gpu/README.md).
 - [x] Vulkan device, swapchain on ScreenActivity's Surface (GpuView), buffers/textures/surfaces over guest memory.
 - [x] air2spv on the tablet (static arm64, `libair2spv.so`): shaders translated as macOS loads them.
-- [ ] Draws: Vulkan pipelines and the passes that draw moved onto the GPU.
+- [x] Draws: passes that draw run on the GPU, with pipelines from air2spv's SPIR-V (gpu/README.md).
+- [ ] Decode the serialized pipeline description (blend state, vertex layout); compute; resident GPU objects.
 - [ ] Pipeline deserializer (Metal's private format) for the fields Vulkan needs: functions, vertex
       layout, blend, formats.
 - [x] `android/air2spv`: AIR → SPIR-V compiler, with a Vulkan resource layout (ABI.md) and a sidecar per

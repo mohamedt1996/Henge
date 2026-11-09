@@ -90,6 +90,19 @@ typedef struct Obj {
     Surface *surface;
     struct Obj *parent;
     uint64_t unique_id;
+    /* a function: its stage (0 vertex, 1 fragment, 2 kernel, -1 unknown) and AIR bitcode */
+    int fn_stage;
+    uint8_t *fn_bc;
+    uint32_t fn_len;
+    uint64_t fn_hash;
+    char fn_name[96];
+    /* a serialized object (pipeline, sampler, depth-stencil state): {tag, size, ref, ...} as sent */
+    uint32_t ser_tag;
+    uint8_t *ser;
+    uint32_t ser_len;
+    /* a render pipeline: the functions found in its description (draw.c) */
+    int scanned;
+    uint32_t vs_ref, fs_ref, fn_candidates;
     struct Obj *next; /* hash chain */
 } Obj;
 
@@ -108,6 +121,8 @@ void obj_forget_task(Objects *os, uint32_t task);
 /* Re-reads a buffer's or texture's pages if the guest moved them. */
 void obj_refresh(Objects *os, Obj *o);
 Surface *surface_get(Objects *os, uint32_t mapping);
+/* The type of a ref's object (OBJ_*), from the task's object list, without making the object. */
+uint32_t obj_type(Objects *os, uint32_t task, uint32_t ref);
 /* A buffer's bytes (a heap buffer's, inside its heap). */
 uint8_t *obj_bytes(Obj *o, uint64_t *len);
 
@@ -135,6 +150,26 @@ void shaders_destroy(Shaders *s);
 /* A .metallib the guest uploaded: each function translated once, in the background. */
 void shaders_library(Shaders *s, const uint8_t *lib, uint32_t len);
 void shaders_stats(Shaders *s, uint64_t out[3]); /* translated, refused, pending */
+/* The first function of a .metallib: its bitcode (pointing into lib), stage (0 vertex, 1 fragment, 2 kernel,
+   -1 other) and name. Returns 0 if there is one. */
+int metallib_first(const uint8_t *lib, uint32_t n, const uint8_t **bc, uint32_t *len, int *stage, char name[96]);
+uint64_t shaders_hash(const void *d, size_t n);
+/* A function's SPIR-V and layout (air2spv's --layout text), translating it now if it is not in the cache.
+   Returns 0 and malloc'd copies, or -1 if air2spv refused it or is not there. */
+int shaders_get(Shaders *s, const uint8_t *bc, uint32_t len, uint8_t **spv, size_t *spv_len, char **layout, uint8_t **cdata, size_t *clen);
+
+/* ------------------------------------------------------------------ draws (draw.c) -- */
+/* Render passes with draws run on the GPU: the attachments and everything the draws read are copied in
+   from guest memory, and what the pass stores is copied back, so guest memory stays the truth. */
+typedef struct Gpu Gpu;
+Gpu *gpu_create(Objects *os, Shaders *shaders);
+void gpu_destroy(Gpu *g);
+/* A render encoder's records: 26 begins a pass, the rest set state and draw. Returns 1 if the record was taken. */
+void gpu_pass_begin(Gpu *g, uint32_t task, const uint8_t *rec, uint32_t size);
+int gpu_record(Gpu *g, uint32_t tag, const uint8_t *rec, uint32_t size);
+/* Ends the open pass: runs it if it drew, else returns 0 so the caller clears on the CPU. */
+int gpu_pass_end(Gpu *g);
+void gpu_stats(Gpu *g, uint64_t out[4]); /* passes on the GPU, draws done, draws skipped, pipelines */
 
 /* ---------------------------------------------------------------- the replay (replay.c) -- */
 typedef struct Replay Replay;
@@ -146,5 +181,6 @@ void replay_command(Replay *r, uint32_t channel, const uint32_t *cmd, uint32_t l
 /* Tests: build a replay over an open guest without the ring thread. */
 Replay *replay_for_test(Guest *g, Screen *screen);
 void replay_present_now(Replay *r);
+void replay_enable_draws(Replay *r, const char *air2spv, const char *cache_dir);
 
 #endif

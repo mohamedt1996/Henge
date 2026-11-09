@@ -109,6 +109,8 @@ static void unref(Obj *o) {
     if (!o || --o->refs) return;
     if (o->mem_owned) guest_unmap(o->mem, (o->length + GPAGE - 1) / GPAGE);
     free(o->host);
+    free(o->fn_bc);
+    free(o->ser);
     free(o->pages);
     unref(o->parent);
     free(o);
@@ -118,6 +120,14 @@ static Obj *lookup(Objects *os, uint32_t task, uint32_t ref) {
     for (Obj *o = os->table[slot_of(task, ref)]; o; o = o->next)
         if (o->task == task && o->ref == ref) return o;
     return NULL;
+}
+
+uint32_t obj_type(Objects *os, uint32_t task, uint32_t ref) {
+    if (!ref || task >= HV_LINK_TASKS || ref >= 1u << 20) return 0;
+    uint64_t list = os->g->link->task_objects[task];
+    uint32_t e0;
+    if (!list || guest_task_read(os->g, task, list + (uint64_t)ref * 12, &e0, 4)) return 0;
+    return e0 & 0xff;
 }
 
 void obj_forget(Objects *os, uint32_t task, uint32_t ref) {
@@ -310,10 +320,26 @@ Obj *obj_get(Objects *os, uint32_t task, uint32_t ref) {
     case OBJ_MAPPED_TEXTURE: make_mapped(os, o, at); break;
     case OBJ_FUNCTION: { /* {offset, length, tag, size} of a .metallib */
         struct __attribute__((packed)) { uint64_t off; uint32_t len, tag, size; } f;
-        if (guest_task_read(os->g, task, at, &f, sizeof f) || !f.len || f.len > (64u << 20) || !os->on_function) break;
+        if (guest_task_read(os->g, task, at, &f, sizeof f) || !f.len || f.len > (64u << 20)) break;
         uint8_t *lib = malloc(f.len);
-        if (lib && guest_task_read(os->g, task, f.off, lib, f.len) == 0) os->on_function(os->ctx, task, lib, f.len);
+        if (lib && guest_task_read(os->g, task, f.off, lib, f.len) == 0) {
+            const uint8_t *bc;
+            uint32_t bl;
+            o->fn_stage = -1;
+            if (metallib_first(lib, f.len, &bc, &bl, &o->fn_stage, o->fn_name) == 0 && (o->fn_bc = malloc(bl))) {
+                memcpy(o->fn_bc, bc, bl);
+                o->fn_len = bl, o->fn_hash = shaders_hash(bc, bl);
+            }
+            if (os->on_function) os->on_function(os->ctx, task, lib, f.len);
+        }
         free(lib);
+        break;
+    }
+    case 7: { /* serialized: {tag, size, ref, ...}; the entry's size is the whole record */
+        if (size < 12 || size > (4u << 20) || !(o->ser = malloc(size))) break;
+        if (guest_task_read(os->g, task, at, o->ser, size)) { free(o->ser); o->ser = NULL; break; }
+        o->ser_len = size;
+        memcpy(&o->ser_tag, o->ser, 4);
         break;
     }
     default: break;
