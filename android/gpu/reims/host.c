@@ -402,6 +402,8 @@ int reims_host_start(const char *path, const char *log_path) {
     if (!h) { pthread_mutex_unlock(&host_lock); return -1; }
     snprintf(h->path, sizeof h->path, "%s", path);
     if (log_fd < 0 && log_path && *log_path) log_fd = open(log_path, O_WRONLY | O_APPEND | O_CLOEXEC);
+    /* reims-vgpu reports a panic on stderr and aborts; an app's stderr is /dev/null, so the reason was lost. */
+    if (log_fd >= 0) dup2(log_fd, 2);
     h->ram_fd = -1;
     pthread_mutex_init(&h->lock, NULL);
     pthread_cond_init(&h->wake, NULL);

@@ -159,6 +159,23 @@ public class VmService extends Service {
         state = install ? "installing" : "running";
         File files = getFilesDir(), mac = macDir(this), log = logFile(this), pidFile = new File(files, "engine.pid");
         gatherImages(this);
+        // A run whose app process died (native crash, low-memory kill) writes no exit line, and the next start
+        // must not walk into the same crash: "run.active" holds the GPU mode of a run still going.
+        File active = new File(files, "run.active");
+        if (active.exists()) {
+            String last = "";
+            try { last = new String(Files.readAllBytes(active.toPath()), StandardCharsets.UTF_8).trim(); } catch (Exception ignored) { }
+            appendLog(log, "henge app: the last run ended with this app killed (a crash or Android's low-memory killer) "
+                    + "and the engine with it; no exit code was seen");
+            if ("reims".equals(last) && "reims".equals(gpu) && !"install".equals(mode)) {
+                gpu = "on";
+                appendLog(log, "henge app: reims took the app down last time (its \"reims:\" lines above say where); "
+                        + "this run uses Graphics: GPU. The next start tries reims again");
+            }
+        }
+        try (FileOutputStream o = new FileOutputStream(active)) {
+            o.write(("install".equals(mode) ? "install" : gpu).getBytes(StandardCharsets.UTF_8));
+        } catch (Exception ignored) { }
         File lib = libraryDir(this), image = findImage(this, release);
         String engine = getApplicationInfo().nativeLibraryDir + "/libhengevm.so";
         List<String> cmd = new ArrayList<>();
@@ -200,11 +217,7 @@ public class VmService extends Service {
         }
         // The last run's gpu.reims is stale: the app must attach only to the one this engine is about to make.
         if (reims) new File(mac, "gpu.reims").delete();
-        // A run whose app process died (native crash, low-memory kill) writes no exit line: say so on the next start.
-        File active = new File(files, "run.active");
-        if (active.exists()) appendLog(log, "henge app: the last run ended with this app killed (a crash or Android's "
-                + "low-memory killer) and the engine with it; no exit code was seen");
-        try { active.createNewFile(); } catch (Exception ignored) { }
+
         if (reims && !(GpuView.loaded && GpuView.nativeReimsStart(new File(mac, "gpu.reims").getPath(), log.getPath())))
             appendLog(log, "henge app: this build has no reims-vgpu; the GPU will not answer");
         int code = -1;
