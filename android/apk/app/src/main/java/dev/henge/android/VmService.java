@@ -200,6 +200,11 @@ public class VmService extends Service {
         }
         // The last run's gpu.reims is stale: the app must attach only to the one this engine is about to make.
         if (reims) new File(mac, "gpu.reims").delete();
+        // A run whose app process died (native crash, low-memory kill) writes no exit line: say so on the next start.
+        File active = new File(files, "run.active");
+        if (active.exists()) appendLog(log, "henge app: the last run ended with this app killed (a crash or Android's "
+                + "low-memory killer) and the engine with it; no exit code was seen");
+        try { active.createNewFile(); } catch (Exception ignored) { }
         if (reims && !(GpuView.loaded && GpuView.nativeReimsStart(new File(mac, "gpu.reims").getPath(), log.getPath())))
             appendLog(log, "henge app: this build has no reims-vgpu; the GPU will not answer");
         int code = -1;
@@ -250,6 +255,8 @@ public class VmService extends Service {
             }
         }
         if (reims && GpuView.loaded) GpuView.nativeReimsStop();
+        active.delete();
+        if (!install) appendLog(log, "henge app: the engine exited (" + code + ")");
         exportLog(this);
         if (install && code == 0) {
             try { new File(files, "installed").createNewFile(); } catch (Exception ignored) { }

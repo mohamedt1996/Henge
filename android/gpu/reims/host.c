@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <linux/futex.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -34,6 +35,7 @@ typedef struct {
     volatile int stop, ready;
     pthread_t attach, beat, render, slot[HV_REIMS_SLOTS];
     int nslot_threads;
+    int told;
     /* the screen */
     pthread_mutex_t lock;
     pthread_cond_t wake;
@@ -77,6 +79,40 @@ static void hlog(const char *fmt, ...) {
     }
 }
 static pthread_mutex_t host_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Where bring-up is: a crash or a kill in it left no line at all, only the engine's "waiting" and a fresh run. */
+static const char *volatile stage = "idle";
+static void set_stage(const char *s) { stage = s; hlog("reims: %s", s); }
+
+/* A native crash in this process takes the whole app (and the engine with it) down with nothing in henge.log:
+   write the signal and the stage first (write() only: async-signal-safe), then hand over to debuggerd's handler. */
+static struct sigaction old_act[32];
+static void on_crash(int sig, siginfo_t *si, void *uc) {
+    if (log_fd >= 0) {
+        char out[256];
+        const char *n = sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : sig == SIGABRT ? "SIGABRT" : sig == SIGILL ? "SIGILL" : "SIGFPE";
+        size_t m = 0;
+        const char *parts[] = {"henge-gpu: reims: the app crashed (", n, ") during: ", stage, "\n"};
+        for (unsigned i = 0; i < 5; i++)
+            for (const char *c = parts[i]; *c && m < sizeof out - 1; c++) out[m++] = *c;
+        (void)!write(log_fd, out, m);
+    }
+    struct sigaction *o = &old_act[sig];
+    if (o->sa_flags & SA_SIGINFO) { if (o->sa_sigaction) { o->sa_sigaction(sig, si, uc); return; } }
+    else if (o->sa_handler != SIG_DFL && o->sa_handler != SIG_IGN) { o->sa_handler(sig); return; }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+static void install_crash_log(void) {
+    static int done;
+    if (done++) return;
+    int sigs[] = {SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE};
+    struct sigaction a = {0};
+    a.sa_sigaction = on_crash;
+    a.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&a.sa_mask);
+    for (unsigned i = 0; i < sizeof sigs / sizeof *sigs; i++) sigaction(sigs[i], &a, &old_act[sigs[i]]);
+}
 
 static uint64_t now_ns(void) {
     struct timespec t;
@@ -266,6 +302,7 @@ static void *beat_loop(void *arg) {
 /* ------------------------------------------------------------------ bring-up -- */
 static int bring_up(Host *h) {
     HvReimsHeader *x = h->h;
+    set_stage("found the engine's file; opening guest RAM");
     /* The engine may still be handing the RAM file over (owner, SELinux label): retry for 30 s, not once. */
     for (int i = 0; !h->stop; i++) {
         h->ram_fd = open(x->ram_file, O_RDWR | O_CLOEXEC);
@@ -276,6 +313,7 @@ static int bring_up(Host *h) {
     }
     if (h->ram_fd < 0) return -1;
     h->ram_pa = x->ram_pa, h->ram_size = x->ram_size;
+    set_stage("mapping guest RAM");
     h->ram = mmap(NULL, h->ram_size, PROT_READ | PROT_WRITE, MAP_SHARED, h->ram_fd, 0);
     if (h->ram == MAP_FAILED) { h->ram = NULL; hlog("reims: mapping guest RAM: %s", strerror(errno)); return -1; }
 
@@ -292,10 +330,12 @@ static int bring_up(Host *h) {
         .memory_files = &file,
         .callbacks = &cb,
     };
+    set_stage("rvg_device_create (Vulkan device, guest memory map)");
     RvgStatus st = rvg_device_create(&dc, &h->dev);
     if (st != RVG_OK) { hlog("reims: rvg_device_create: %s", rvg_status_message(st)); return -1; }
     RvgIOSurfaceCallbacks ic = {.struct_size = sizeof ic, .ctx = h, .raise_interrupt = iosfc_raise};
     RvgIOSurfaceDeviceConfig icfg = {.struct_size = sizeof icfg, .memory_map = &map, .callbacks = &ic};
+    set_stage("rvg_iosurface_device_create");
     st = rvg_iosurface_device_create(&icfg, &h->iosfc);
     if (st != RVG_OK) { hlog("reims: rvg_iosurface_device_create: %s", rvg_status_message(st)); return -1; }
 
@@ -306,6 +346,7 @@ static int bring_up(Host *h) {
     RvgDisplayConfig disp = {.struct_size = sizeof disp, .serial_number = 1, .port = 0,
                              .width_millimeters = w / (110.0 / 25.4), .height_millimeters = hgt / (110.0 / 25.4),
                              .callbacks = &disp_cb};
+    set_stage("rvg_display_create");
     st = rvg_display_create(h->dev, &disp, &h->disp);
     if (st != RVG_OK) { hlog("reims: rvg_display_create: %s", rvg_status_message(st)); return -1; }
     RvgDisplayMode modes[] = {{(uint16_t)w, (uint16_t)hgt, 0, 60.0}, {1920, 1080, 0, 60.0}, {1280, 800, 0, 60.0}};
@@ -316,6 +357,7 @@ static int bring_up(Host *h) {
         if (pthread_create(&h->slot[i], NULL, slot_loop, &x->slot[i]) == 0) h->nslot_threads = i + 1;
     pthread_create(&h->render, NULL, render_loop, h);
     h->ready = 1;
+    stage = "running";
     x->app_pid = (uint32_t)getpid();
     __atomic_store_n(&x->app_ready, 1, __ATOMIC_RELEASE);
     hlog("reims: the GPU is up: guest RAM %llu MB, display %ux%u", (unsigned long long)(h->ram_size >> 20), w, hgt);
@@ -338,9 +380,15 @@ static void *attach_loop(void *arg) {
                 if (bring_up(h) != 0) hlog("reims: no GPU this run");
                 return NULL;
             }
-            if (x != MAP_FAILED) munmap(x, HV_REIMS_FILE_BYTES);
+            if (x != MAP_FAILED) {
+                if (!h->told++) hlog("reims: the engine's file is there but not ready (magic %08x, version %u, engine_alive %u, ram_file %s)",
+                                     x->magic, x->version, x->engine_alive, x->ram_file[0] ? "set" : "empty");
+                munmap(x, HV_REIMS_FILE_BYTES);
+            }
         } else if (fd >= 0) {
             close(fd);
+        } else if (errno != ENOENT && !h->told++) {
+            hlog("reims: %s: %s", h->path, strerror(errno));
         }
         usleep(100000);
     }
@@ -358,6 +406,8 @@ int reims_host_start(const char *path, const char *log_path) {
     pthread_mutex_init(&h->lock, NULL);
     pthread_cond_init(&h->wake, NULL);
     rvg_log_set_handler(on_log, NULL, RVG_LOG_INFO);
+    install_crash_log();
+    stage = "waiting for the engine's file";
     H = h;
     pthread_create(&h->attach, NULL, attach_loop, h);
     pthread_mutex_unlock(&host_lock);
