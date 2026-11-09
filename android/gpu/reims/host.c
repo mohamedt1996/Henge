@@ -49,6 +49,12 @@ typedef struct {
     uint64_t frames, mmio;
 } Host;
 
+/* reims-vgpu calls memfd_create, which bionic has from API 30; the app's minSdk is 29, and the kernel
+   has had the syscall since Linux 3.17. */
+int memfd_create(const char *name, unsigned int flags) {
+    return (int)syscall(SYS_memfd_create, name, flags);
+}
+
 static Host *H;
 static pthread_mutex_t host_lock = PTHREAD_MUTEX_INITIALIZER;
 
