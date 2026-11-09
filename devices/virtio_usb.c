@@ -23,7 +23,12 @@ static void put_msg(HvVirtioUsb *d, HvVusbMsg *m) {
     if (d->log) fprintf(stderr, "virtio-usb: response type %u ep %#x len %u\n", m->type, m->ep, m->len);
     pthread_mutex_lock(&d->mu);
     if (d->in_tail - d->in_head < HV_VUSB_RING) d->in[d->in_tail++ % HV_VUSB_RING] = *m;
-    else msg_free(m);
+    else {
+        /* Losing a device write breaks usbmux's sequence numbers for good ("detected duplicate packet",
+           then the connection stalls), so never quietly. drain_responses waits for room instead. */
+        fprintf(stderr, "virtio-usb: response queue full, dropped type %u ep %#x len %u\n", m->type, m->ep, m->len);
+        msg_free(m);
+    }
     pthread_cond_broadcast(&d->cv);
     pthread_mutex_unlock(&d->mu);
 }
@@ -64,7 +69,15 @@ static void drain_responses(HvVirtioUsb *d) {
     HvVirtio *v = &d->vio;
     static HvVirtqElem e;
     int any = 0;
-    while (hv_virtq_pop(v, RSPQ, &e) > 0) {
+    for (;;) {
+        /* Backpressure: leave the guest's buffer with it until the host has room for its contents. */
+        pthread_mutex_lock(&d->mu);
+        int room = d->in_tail - d->in_head < HV_VUSB_RING;
+        pthread_mutex_unlock(&d->mu);
+        static int waiting;
+        if (!room && !waiting) fprintf(stderr, "virtio-usb: response queue full; holding the guest's writes\n");
+        waiting = !room;
+        if (!room || hv_virtq_pop(v, RSPQ, &e) <= 0) break;
         uint32_t total = 0;
         for (int s = 0; s < e.nseg; s++)
             if (!e.seg[s].write) total += e.seg[s].len;
@@ -220,6 +233,7 @@ int hv_vusb_recv(HvVirtioUsb *d, uint8_t ep, HvVusbMsg *out, int timeout_ms) {
                 for (uint32_t j = i; j != d->in_head; j--) d->in[j % HV_VUSB_RING] = d->in[(j - 1) % HV_VUSB_RING];
                 d->in_head++;
                 pthread_mutex_unlock(&d->mu);
+                hv_machine_wake(d->vio.m); /* a slot is free: responses the guest is holding can come in */
                 return 1;
             }
         }
