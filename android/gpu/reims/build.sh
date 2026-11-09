@@ -78,6 +78,6 @@ cd "$WORK/reims-vgpu"
 RUSTUP_TOOLCHAIN=$TOOLCHAIN cargo build --release --target "$TARGET" -p reims-vgpu-c --no-default-features --features vulkan
 
 mkdir -p "$OUT/lib" "$OUT/include"
-cp "$CARGO_TARGET_DIR/$TARGET/release/libreims_vgpu.a" "$OUT/lib/"
+cp "$CARGO_TARGET_DIR/$TARGET/release/libreims_vgpu_c.a" "$OUT/lib/libreims_vgpu.a" # the crate's name; xtask dist renames it the same way
 cp crates/reims-vgpu-c/include/reims_vgpu.h "$OUT/include/"
 echo "reims: $OUT/lib/libreims_vgpu.a"
