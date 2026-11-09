@@ -217,6 +217,11 @@ static void info(Replay *r, uint32_t tag, Rec rc, uint32_t task) {
     }
 }
 
+/* The engine takes a stale heartbeat for a closed app: beat during long work too, not only between commands. */
+static void beat(Replay *r) {
+    if (r->g.link) __atomic_store_n(&r->g.link->heartbeat, now_ns(), __ATOMIC_RELEASE);
+}
+
 static int is_draw(uint32_t tag) { return tag <= 19 || tag == 28 || tag == 29 || tag == 155 || tag == 162; }
 
 /* One exec: {task, resources, buffers}, {ref, flags} per resource, {offset, length} per buffer.
@@ -229,6 +234,7 @@ static void exec(Replay *r, const uint32_t *a, uint32_t n) {
     for (uint32_t i = 0; i < nres; i++) obj_refresh(&r->os, obj_get(&r->os, task, res[i * 2]));
     const uint8_t *bufs = (const uint8_t *)(res + nres * 2);
     for (uint32_t b = 0; b < nbuf; b++) {
+        beat(r);
         uint64_t off, blen;
         memcpy(&off, bufs + b * 16, 8), memcpy(&blen, bufs + b * 16 + 8, 8);
         if (blen < 8 || blen > (64u << 20)) continue;
@@ -255,6 +261,7 @@ static void exec(Replay *r, const uint32_t *a, uint32_t n) {
             Rec rc = {p + 8, size - 8};
             if (type == 0) {
                 if (tag == 26) {
+                    beat(r);
                     gpu_pass_end(r->gpu);
                     begin_pass(r, rc, task); /* the clears, on the CPU; a pass that draws clears again on the GPU */
                     gpu_pass_begin(r->gpu, task, rc.p, rc.size);

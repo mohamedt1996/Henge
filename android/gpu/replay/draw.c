@@ -166,6 +166,7 @@ struct Gpu {
     Pipe *pipes;
     /* the pass */
     int open, running;
+    int lost; /* a pass hung or the device was lost: no more passes on the GPU */
     uint32_t task;
     uint8_t pass_rec[0x248];
     uint32_t pass_size;
@@ -793,7 +794,7 @@ static void read_attach(Gpu *g, Attach *a, const uint8_t *rec, uint32_t size, ui
 }
 
 void gpu_pass_begin(Gpu *g, uint32_t task, const uint8_t *rec, uint32_t size) {
-    if (!g) return;
+    if (!g || g->lost) return;
     g->open = 1, g->running = 0, g->task = task;
     g->pass_size = size < sizeof g->pass_rec ? size : (uint32_t)sizeof g->pass_rec;
     memcpy(g->pass_rec, rec, g->pass_size);
@@ -1113,8 +1114,17 @@ static void finish(Gpu *g) {
     VkCommandBuffer cbs[2] = {g->pre, g->main};
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 2, cbs, 0, NULL};
     vkResetFences(g->dev, 1, &g->fence);
-    if (vkQueueSubmit(g->queue, 1, &si, g->fence) == VK_SUCCESS) {
-        vkWaitForFences(g->dev, 1, &g->fence, VK_TRUE, UINT64_MAX);
+    VkResult waited = VK_ERROR_UNKNOWN;
+    if (vkQueueSubmit(g->queue, 1, &si, g->fence) == VK_SUCCESS &&
+        (waited = vkWaitForFences(g->dev, 1, &g->fence, VK_TRUE, 2000000000ull)) != VK_SUCCESS) {
+        /* A translated shader that never finishes (or a lost device): nothing is read back into guest
+           memory, and draws stay off rather than hang every pass after it. */
+        rlog("pass: the GPU %s; draws off for this run", waited == VK_TIMEOUT ? "did not finish it in 2 s" : "was lost");
+        g->lost = 1;
+        free_pass_images(g);
+        return;
+    }
+    if (waited == VK_SUCCESS) {
         for (int i = 0; i < 8; i++) {
             Attach *a = &g->color[i];
             if (back_at[i] < 0) continue;

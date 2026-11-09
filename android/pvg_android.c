@@ -254,18 +254,20 @@ static void link_publish(HvPvgMetal *m) {
     __atomic_thread_fence(__ATOMIC_RELEASE);
 }
 
-/* Puts the command in the ring; returns its seq, or 0 if the app went away while waiting for room. */
-static uint64_t link_send(HvPvgMetal *m, uint32_t ch, const uint32_t *cmd, uint32_t len) {
+/* Puts the command in the ring; returns its seq, or 0 if there was no room (at once when nowait, else once
+   the app went away or the wait budget ran out). */
+static uint64_t wait_budget_ns(void);
+static uint64_t link_send(HvPvgMetal *m, uint32_t ch, const uint32_t *cmd, uint32_t len, int nowait) {
     HvLinkHeader *h = m->link;
     uint32_t bytes = (uint32_t)((sizeof(HvLinkRecord) + len + 7) & ~7u);
     if (bytes > HV_LINK_RING_BYTES / 2) return 0;
-    uint64_t head = h->head;
+    uint64_t head = h->head, until = now_ns() + wait_budget_ns();
     for (;;) {
         uint64_t tail = __atomic_load_n(&h->tail, __ATOMIC_ACQUIRE);
         uint32_t at = (uint32_t)(head % HV_LINK_RING_BYTES), room = HV_LINK_RING_BYTES - at;
         uint64_t need = bytes + (room < bytes ? room : 0); /* a wrap wastes the rest of the ring */
         if (HV_LINK_RING_BYTES - (head - tail) >= need) break;
-        if (!app_attached(m)) return 0;
+        if (nowait || !app_attached(m) || now_ns() > until) return 0;
         pause_us(100);
     }
     uint8_t *ring = hv_link_ring(h);
@@ -281,15 +283,32 @@ static uint64_t link_send(HvPvgMetal *m, uint32_t ch, const uint32_t *cmd, uint3
     return m->seq;
 }
 
-static void link_wait(HvPvgMetal *m, uint64_t seq) {
+/* How long one command may hold its stamp for the app. macOS's GPU driver treats a stamp that does not
+   move for a few seconds as a hung GPU and panics (IOGPUFamily); the renderer can be that slow (first
+   draws translate shaders, a stuck Vulkan fence), so the guest is never made to wait longer than this. */
+static uint64_t wait_budget_ns(void) {
+    static uint64_t ns;
+    if (!ns) {
+        const char *e = getenv("HV_GPU_WAIT_MS");
+        long ms = e ? strtol(e, NULL, 10) : 250;
+        ns = (uint64_t)(ms > 0 ? ms : 1) * 1000000ull;
+    }
+    return ns;
+}
+
+/* Returns 1 if the app finished seq in time. */
+static int link_wait(HvPvgMetal *m, uint64_t seq) {
+    uint64_t until = now_ns() + wait_budget_ns();
     for (unsigned spins = 0; __atomic_load_n(&m->link->done, __ATOMIC_ACQUIRE) < seq; spins++) {
-        if ((spins & 63) == 0 && !app_attached(m)) return;
+        if ((spins & 63) == 0 && (!app_attached(m) || now_ns() > until)) return 0;
         pause_us(spins < 200 ? 20 : 200);
     }
+    return 1;
 }
 
 static void *link_work(void *arg) {
     HvPvgMetal *m = arg;
+    uint64_t behind_since = 0, late = 0, dropped = 0;
     for (;;) {
         pthread_mutex_lock(&m->lock);
         while (!m->head) pthread_cond_wait(&m->wake, &m->lock);
@@ -302,8 +321,22 @@ static void *link_work(void *arg) {
         if (op != 0x43 && op != 0x45) hv_pvg_lite_command(m->lite, j->cmd, j->len);
         if (app_attached(m)) {
             link_publish(m);
-            uint64_t seq = link_send(m, j->ch, j->cmd, j->len);
-            if (seq) link_wait(m, seq);
+            /* While the app is behind, commands still go to it (it catches up in order) but the guest's
+               stamps no longer wait for it; the ring must not block either. */
+            int behind = behind_since && __atomic_load_n(&m->link->done, __ATOMIC_ACQUIRE) < m->seq;
+            uint64_t seq = link_send(m, j->ch, j->cmd, j->len, behind);
+            if (!seq) {
+                if (dropped++ % 1000 == 0)
+                    fprintf(stderr, "hengevm: gpu link: ring full while the renderer is behind; %llu commands not drawn\n",
+                            (unsigned long long)dropped);
+            } else if (!behind && !link_wait(m, seq) && m->linked) {
+                behind_since = now_ns();
+                if (late++ % 100 == 0)
+                    fprintf(stderr, "hengevm: gpu link: renderer over %llu ms on a command (%llu times); not holding macOS for it\n",
+                            (unsigned long long)(wait_budget_ns() / 1000000), (unsigned long long)late);
+            } else if (behind_since && !behind) {
+                behind_since = 0;
+            }
         }
         hv_pvg_lite_complete(m->lite, j->ch, j->cmd[2]);
         free(j->cmd);
