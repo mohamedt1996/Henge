@@ -167,20 +167,31 @@ public class VmService extends Service {
         gatherImages(this);
         // A run whose app process died (native crash, low-memory kill) writes no exit line, and the next start
         // must not walk into the same crash: "run.active" holds the GPU mode of a run still going.
+        // The file holds "<mode>@<versionCode>": a new build of the app may well have fixed the crash, so only a
+        // crash of this same build sends the run to Graphics: GPU (the first start after an update otherwise
+        // fell back silently, and the fix went untested).
         File active = new File(files, "run.active");
+        String build = Integer.toString(buildNumber(this));
         if (active.exists()) {
             String last = "";
             try { last = new String(Files.readAllBytes(active.toPath()), StandardCharsets.UTF_8).trim(); } catch (Exception ignored) { }
+            String lastMode = last.contains("@") ? last.substring(0, last.indexOf('@')) : last;
+            String lastBuild = last.contains("@") ? last.substring(last.indexOf('@') + 1) : "";
             appendLog(log, "henge app: the last run ended with this app killed (a crash or Android's low-memory killer) "
                     + "and the engine with it; no exit code was seen");
-            if ("reims".equals(last) && "reims".equals(gpu) && !"install".equals(mode)) {
-                gpu = "on";
-                appendLog(log, "henge app: reims took the app down last time (its \"reims:\" lines above say where); "
-                        + "this run uses Graphics: GPU. The next start tries reims again");
+            if ("reims".equals(lastMode) && "reims".equals(gpu) && !"install".equals(mode)) {
+                if (build.equals(lastBuild)) {
+                    gpu = "on";
+                    appendLog(log, "henge app: reims took the app down last time (its \"reims:\" lines above say where); "
+                            + "this run uses Graphics: GPU. The next start tries reims again");
+                } else {
+                    appendLog(log, "henge app: that was build " + (lastBuild.isEmpty() ? "?" : lastBuild) + "; this is build "
+                            + build + ", so reims is tried again");
+                }
             }
         }
         try (FileOutputStream o = new FileOutputStream(active)) {
-            o.write(("install".equals(mode) ? "install" : gpu).getBytes(StandardCharsets.UTF_8));
+            o.write((("install".equals(mode) ? "install" : gpu) + "@" + build).getBytes(StandardCharsets.UTF_8));
         } catch (Exception ignored) { }
         File lib = libraryDir(this), image = findImage(this, release);
         String engine = getApplicationInfo().nativeLibraryDir + "/libhengevm.so";
@@ -297,6 +308,11 @@ public class VmService extends Service {
         if (wake != null && wake.isHeld()) wake.release();
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
+    }
+
+    static int buildNumber(Context c) {
+        try { return (int) c.getPackageManager().getPackageInfo(c.getPackageName(), 0).getLongVersionCode(); }
+        catch (Exception e) { return 0; }
     }
 
     static volatile String engineMode = "jit";
