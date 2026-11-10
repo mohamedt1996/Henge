@@ -437,7 +437,12 @@ int hv_gunyah_run(void) {
         HvRam *ram = &M->ram[i];
         fprintf(stderr, "gunyah: memory %llx-%llx (%llu MB)\n", (unsigned long long)ram->pa,
                 (unsigned long long)(ram->pa + ram->size), (unsigned long long)(ram->size >> 20));
-        madvise(ram->host, ram->size, MADV_HUGEPAGE); /* fewer, longer runs in the parcel; harmless if refused */
+        /* No transparent huge pages in what Gunyah is given. This asked for them (fewer, longer runs in the
+           parcel), and the tablet panicked when the VM started. Gunyah's firmware of the Snapdragon 8 Gen 3
+           generation (the Mi Pad 7's 7+ Gen 3 is of it, Linux 6.1) is reported not to take 2 MB pages made by
+           THP collapse: the hypervisor fails and resets the device (xiehezhi/Xiaomi14-8Gen3-Gunyah-Fix, on
+           DroidVM's "Prepare Lend mTHP"). Plain 4 KB pages, as HV_GUNYAH_THP=1 does not. */
+        madvise(ram->host, ram->size, getenv("HV_GUNYAH_THP") ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
         uint64_t chunk = 256ull << 20, done = 0;
         int pieces = 0;
         while (done < ram->size) {
