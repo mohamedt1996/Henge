@@ -49,7 +49,7 @@ $(B)/%.o: devices/%.c devices/*.h android/compat/aes_soft.h | $(B)
 $(B)/pvg_android.o: android/pvg_android.c | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 # Linked as an object, not from the archive: it overrides vmapple.c's weak hv_pvg_external_create.
-$(B)/pvg_reims.o: android/pvg_reims.c android/gpu/reims_link.h | $(B)
+$(B)/pvg_reims.o: android/pvg_reims.c android/gpu/reims_link.h android/gpu/ram_fd.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(B)/vm.o: host/vm.c host/*.h android/compat/plat_linux.h | $(B)

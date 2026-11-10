@@ -161,6 +161,9 @@ def main() -> None:
     subprocess.run([sys.executable, '-I', str(HERE / 'm2v_icd_library.py'), str(m2v)], check=True)
     # A commit compares the copied host buffers its commands use, not every one (m2v_copy_in_used.py).
     subprocess.run([sys.executable, '-I', str(HERE / 'm2v_copy_in_used.py'), str(m2v)], check=True)
+    # The process's mappings are asked of the kernel for a no-copy object's pages alone, not read from
+    # /proc/self/maps, on a kernel without PROCMAP_QUERY (m2v_map_asks.py).
+    subprocess.run([sys.executable, '-I', str(HERE / 'm2v_map_asks.py'), str(m2v)], check=True)
     print(f'android_port: {total} Linux-only places now take Android')
 
 

@@ -4,6 +4,7 @@
    device's state lives in the engine, so this replaces pvg_lite outright (and VNC shows no GPU frames:
    the app's screen does). */
 #include "gpu/reims_link.h"
+#include "gpu/ram_fd.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -176,6 +177,21 @@ int hv_pvg_external_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_t i
     h->version = HV_REIMS_VERSION;
     h->ram_pa = ram->pa, h->ram_size = ram->size;
     snprintf(h->ram_file, sizeof h->ram_file, "%s", file);
+    {   /* The Mac's RAM in memory (HV_RAM_MEMFD): its name, /proc/<engine>/fd/<n>, is one Android lets no app
+           open, so the app is handed the descriptor over a socket and the header names the socket ('@...').
+           Where the socket cannot be made the /proc name stays, and the app's note sends the next start back
+           to the RAM file, as before. */
+        const char *number = getenv("HV_RAM_FD");
+        char name[64];
+        if (number && *number && !strncmp(file, "/proc/", 6)) {
+            if (hv_ram_fd_serve(atoi(number), name, sizeof name) == 0) {
+                snprintf(h->ram_file, sizeof h->ram_file, "%s", name);
+                fprintf(stderr, "hengevm: reims: the Mac's RAM is handed to the app as a descriptor (%s)\n", name);
+            } else {
+                fprintf(stderr, "hengevm: reims: no socket to hand the Mac's RAM over (%s); the app opens %s\n", strerror(errno), file);
+            }
+        }
+    }
     hv_pvg_lite_mode(&h->display_w, &h->display_h);
     {   /* HV_REIMS_MODE=WxH (the app's "Mac screen" setting). Without the host-memory import every surface is a
            copy compared on the CPU at each commit, so fewer pixels is the first performance lever: 1280x800

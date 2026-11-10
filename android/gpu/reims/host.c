@@ -9,6 +9,7 @@
 #define _GNU_SOURCE /* Dl_info, dladdr */
 #endif
 #include "../reims_link.h"
+#include "../ram_fd.h"
 #include "../replay/replay.h"
 #include "reims_vgpu.h"
 #include "reims_host.h"
@@ -514,12 +515,17 @@ static int bring_up(Host *h) {
     set_stage("found the engine's file; opening guest RAM");
     /* The engine may still be handing the RAM file over (owner, SELinux label): retry for 30 s, not once. */
     for (int i = 0; !h->stop; i++) {
-        h->ram_fd = open(x->ram_file, O_RDWR | O_CLOEXEC);
-        if (h->ram_fd >= 0) break;
+        /* '@...': the engine's in-memory RAM (HV_RAM_MEMFD), handed over as a descriptor (../ram_fd.h). */
+        h->ram_fd = x->ram_file[0] == '@' ? hv_ram_fd_take(x->ram_file) : open(x->ram_file, O_RDWR | O_CLOEXEC);
+        if (h->ram_fd >= 0) {
+            if (x->ram_file[0] == '@') hlog("reims: the Mac's RAM is in memory: the engine handed it over (%s)", x->ram_file);
+            break;
+        }
         if (i == 0 || i == 300) hlog("reims: guest RAM %s: %s%s", x->ram_file, strerror(errno), i ? "; giving up" : "; retrying");
-        /* The engine's in-memory RAM (HV_RAM_MEMFD) is opened through /proc/<engine>/fd: where Android refuses
-           that, leave a note the app reads at the next start, which then asks for the RAM file as before. */
-        if (i == 30 && !strncmp(x->ram_file, "/proc/", 6) && h->home[0]) {
+        /* The engine's in-memory RAM (HV_RAM_MEMFD) comes as a descriptor over the engine's socket ('@...'), or
+           is opened through /proc/<engine>/fd where the engine had no socket: where Android refuses either,
+           leave a note the app reads at the next start, which then asks for the RAM file as before. */
+        if (i == 30 && (x->ram_file[0] == '@' || !strncmp(x->ram_file, "/proc/", 6)) && h->home[0]) {
             char note[1100];
             snprintf(note, sizeof note, "%s/ram-memfd-failed", h->home);
             int nf = open(note, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);

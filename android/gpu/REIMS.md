@@ -219,6 +219,38 @@ wrote), every copy where a command reaches memory no use names; a line every 10 
 how many MiB are live, compared and passed over, and in how long. Settings, GPU memory checks:
 Used or Everything (`M2V_COPY_IN_ALL`), for a window that shows stale pixels.
 
+0.3.23 on the tablet (2026-11-10, the system's driver, 1280x800). The comparisons are no longer the
+cost: 1740 commits in 10 s compared 8 GiB and passed over 158 GiB in 2.9 s. The desktop still ran
+at 17 frames a second at best, each frame 12 ms of the GPU's own work, with the Mac's CPUs waiting
+20 s of every 30 on GPU registers (1.5 ms an access), and the guest's driver still gave up on a
+stamp after 2 s. Two things in that log:
+
+- The one FIFO thread at work in the stamp report's samples was in
+  `Device::new_buffer_with_descriptor`, in `std::fs::File::read`. The only file the runtime reads
+  there is `/proc/self/maps`: before it makes a no-copy buffer or an IOSurface texture it asks
+  whether the process maps the pages writable, with `PROCMAP_QUERY` on Linux 6.11 and later, and on
+  an older kernel (the tablet's) by reading the maps' lines from the first to the pages, up to
+  twice an object (the import that fails, then its copy). Without `/dev/udmabuf` every run of a
+  view of the guest's pages is a mapping of its own, so the process holds hundreds of thousands,
+  and the kernel formats them under the process's map lock, which the views' own `mmap` and
+  `munmap` (the register accesses) wait for. Measured on a Linux host: 65 ms a read at 200,000
+  mappings below the pages. `m2v_map_asks.py`: `MADV_POPULATE_WRITE` (or `_READ`) over the pages
+  alone answers "every page is mapped with the permission" (0.6 to 3 ms for an 8 MiB surface of
+  2048 mappings on the same host, and the same answers as the lines for writable, read-only,
+  inaccessible and unmapped pages); every other answer still reads the lines. A line every 10 s
+  says how many questions were asked, how many read the maps, and the time; `M2V_MAPS_LINES`
+  reads the lines every time, to compare.
+- `guest RAM (4096 MB) is backed by a file`: the Mac's RAM was on flash again. 0.3.22's memfd is
+  named to the app as `/proc/<engine>/fd/<n>`, and opening that is an `open` of a tmpfs file, which
+  Android's SELinux policy gives no app (apps use such files through descriptors they are passed),
+  so the first start left its note and every later one used the file. The engine now hands the
+  descriptor itself to the app over an abstract Unix socket (`gpu/ram_fd.h`, `@henge-ram-<pid>` in
+  the header where the file's name was); the note and the file remain the way back. With the RAM
+  in memory the comparisons' outliers (200 MiB in 1.3 s where 8 GiB take 2.9 s) should go too:
+  those are pages coming back from storage.
+
+Version 0.3.24.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

@@ -306,6 +306,11 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
             static char name[64];
             snprintf(name, sizeof name, "/proc/%d/fd/%d", (int)getpid(), fd); /* the fd stays open: it is the name */
             setenv("HV_RAM_FILE", name, 1);
+            /* The descriptor itself, for a process that may not open that name (an Android app, whose SELinux
+               policy lets it use a tmpfs file it is passed, never open one): android/gpu/ram_fd.h. */
+            char number[16];
+            snprintf(number, sizeof number, "%d", fd);
+            setenv("HV_RAM_FD", number, 1);
             fprintf(stderr, "hengevm: guest RAM (%llu MB) is in memory (%s), not written to storage\n",
                     (unsigned long long)(ram_size >> 20), name);
         } else {
