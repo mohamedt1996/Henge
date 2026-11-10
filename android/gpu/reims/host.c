@@ -56,6 +56,7 @@ typedef struct {
     int hx, hy, cursor_on;
     Replay *sink;
     uint64_t frames, mmio;
+    uint64_t t_encode, t_read, t_show, t_frames, t_shows; /* ns and counts since the last log line */
 } Host;
 
 /* reims-vgpu calls memfd_create, which bionic has from API 30; the app's minSdk is 29, and the kernel
@@ -327,6 +328,7 @@ static void *render_loop(void *arg) {
         pthread_mutex_unlock(&h->lock);
         if (h->stop || !sink || !h->disp || !w || !hgt) continue;
         if ((mode || !h->target) && make_target(h, w, hgt) != 0) continue;
+        uint64_t t0 = now_ns(), t1 = t0, t2 = t0;
         if (frame) {
             RvgFrame *f = NULL;
             RvgStatus st = rvg_display_encode_frame(h->disp, h->target, NULL, &f);
@@ -334,14 +336,20 @@ static void *render_loop(void *arg) {
             rvg_frame_commit(f);
             rvg_frame_wait(f);
             rvg_frame_release(f);
+            t1 = now_ns();
             size_t stride = (size_t)h->tw * 4;
             st = rvg_frame_target_read_pixels(h->target, h->pixels, stride, stride * h->th);
             if (st != RVG_OK) { hlog("reims: read pixels: %s", rvg_status_message(st)); continue; }
             h->frames++;
+            t2 = now_ns();
         }
         pthread_mutex_lock(&h->lock);
         compose(h);
         if (h->sink) replay_show_frame(h->sink, h->shown, h->tw, h->th); /* under the lock: set_sink waits for it */
+        /* Where a frame's time goes, for the log (beat_loop): drawing it to the target and waiting for the
+           GPU, reading it back, then the pointer and the tablet's screen. */
+        if (frame) h->t_encode += t1 - t0, h->t_read += t2 - t1, h->t_frames++;
+        h->t_show += now_ns() - t2, h->t_shows++;
         pthread_mutex_unlock(&h->lock);
     }
     return NULL;
@@ -392,8 +400,15 @@ static void *beat_loop(void *arg) {
         if (now_ns() - last > 10000000000ull && h->ready) {
             uint64_t guest = 0, host = 0;
             if (h->disp) rvg_display_present_counts(h->disp, &guest, &host);
-            hlog("reims: %llu MMIO accesses, %llu interrupts; %llu presents, %llu frames shown",
-                 (unsigned long long)h->mmio, (unsigned long long)h->h->irqs, (unsigned long long)guest, (unsigned long long)h->frames);
+            pthread_mutex_lock(&h->lock);
+            uint64_t n = h->t_frames, s = h->t_shows, te = h->t_encode, tr = h->t_read, ts = h->t_show;
+            h->t_frames = h->t_shows = h->t_encode = h->t_read = h->t_show = 0;
+            pthread_mutex_unlock(&h->lock);
+            double secs = (now_ns() - last) / 1e9;
+            hlog("reims: %llu MMIO accesses, %llu interrupts; %llu presents, %llu frames shown; "
+                 "%.1f frames/s, each %.1f ms to draw, %.1f ms to read back, %.1f ms to show",
+                 (unsigned long long)h->mmio, (unsigned long long)h->h->irqs, (unsigned long long)guest, (unsigned long long)h->frames,
+                 n / secs, n ? te / 1e6 / n : 0.0, n ? tr / 1e6 / n : 0.0, s ? ts / 1e6 / s : 0.0);
             last = now_ns();
         }
     }

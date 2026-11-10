@@ -298,6 +298,7 @@ public class VmService extends Service {
             }
             process = pb.start();
             if (sound) new Thread(() -> playSound(log), "sound").start();
+            if (!install) new Thread(() -> favourEngine(pidFile, log), "favour").start();
             code = process.waitFor();
         } catch (Exception e) {
             appendLog(log, "henge app: could not start the engine: " + e);
@@ -379,6 +380,36 @@ public class VmService extends Service {
             case android.app.ApplicationExitInfo.REASON_USER_REQUESTED: return "user requested";
             case android.app.ApplicationExitInfo.REASON_OTHER: return "other";
             default: return "?";
+        }
+    }
+
+    /**
+     * The engine among Android's foreground work. Android schedules by group: a process outside "top-app"
+     * may be kept off the fastest cores and held to lower CPU frequencies, and the engine is a child process
+     * Android knows nothing about. With root, it is put into the top-app groups (which cores it may use, and
+     * how eagerly the CPU speeds up for it); without root nothing changes, and the log says so.
+     */
+    private void favourEngine(File pidFile, File log) {
+        try {
+            String pid = "";
+            for (int i = 0; i < 20 && pid.isEmpty(); i++) {
+                Thread.sleep(500);
+                try { pid = new String(Files.readAllBytes(pidFile.toPath()), StandardCharsets.UTF_8).trim(); } catch (Exception ignored) { }
+            }
+            if (!pid.matches("[0-9]+") || !busy()) return;
+            String sh = "n=0; for d in /dev/cpuset/top-app /dev/cpuctl/top-app /dev/stune/top-app; do "
+                    + "[ -e $d/cgroup.procs ] && echo " + pid + " > $d/cgroup.procs && n=$((n+1)); done; echo $n";
+            Process p = new ProcessBuilder("su", "-c", sh).redirectErrorStream(true).start();
+            StringBuilder sb = new StringBuilder();
+            try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                for (String l; (l = r.readLine()) != null; ) sb.append(l).append(' ');
+            }
+            String out = sb.toString().trim();
+            appendLog(log, p.waitFor() == 0 && out.matches("[1-9]")
+                    ? "henge app: the engine runs among Android's foreground work (top-app, " + out + " groups)"
+                    : "henge app: could not put the engine among Android's foreground work (no root?): " + out);
+        } catch (Exception e) {
+            appendLog(log, "henge app: could not put the engine among Android's foreground work: " + e);
         }
     }
 

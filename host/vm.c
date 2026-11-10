@@ -308,9 +308,13 @@ void hv_vm_prepare_cpu_thread(void) {
     pthread_sigmask(SIG_BLOCK, &set, NULL);
 }
 
+/* A host's own way to favour the calling guest-CPU thread (Android: the fast cores, android/runner.c). */
+__attribute__((weak)) void hv_host_cpu_thread(void) {}
+
 /* iOS parks default-QoS threads on efficiency cores readily; the guest's CPUs are what the user waits on. */
 void hv_vm_cpu_qos(void) {
     hv_vm_prepare_cpu_thread();
+    hv_host_cpu_thread();
     /* HV_QOS=ui|init|default (testing): the class the guest's CPUs run at. */
     const char *q = getenv("HV_QOS");
 #if TARGET_OS_IPHONE

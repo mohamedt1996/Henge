@@ -15,10 +15,13 @@
 #include <curl/curl.h>
 /* Graphics: reims (pvg_reims.c): what crossed to the app's GPU device. */
 void hv_pvg_reims_activity(uint64_t *requests, uint64_t *irqs);
+uint64_t hv_pvg_reims_wait_ns(void);
 
 static void curl_global_init_all(void) { curl_global_init(CURL_GLOBAL_ALL); }
 
+#include <errno.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -103,6 +106,61 @@ static void *install_watchdog(void *arg) {
    Idle is the same PC on every CPU with a few thousand blocks: that alone is not a hang. A hang is no CPU moving
    off its PC and no disk or GPU work for 2 minutes; then each CPU's registers go to the log, once per hang. */
 static int heartbeat_no_cpus; /* Gunyah runs the CPU: its state is not ours to read */
+
+/* The Mac's CPUs on the tablet's fast cores. A phone's cores are of two or three speeds (the Mi Pad 7: one
+   at 2.8 GHz, four at 2.6, three at 1.9), and nothing kept a guest CPU's thread, which translates and runs
+   the Mac's code flat out, off the slow ones. Each such thread is bound to every core but the slowest kind
+   (by cpuinfo_max_freq). HV_CPU_ANY=1 leaves them where Android puts them. host/vm.c calls this (weak there). */
+static cpu_set_t fast_set;
+static int fast_count, fast_total;
+static pid_t fast_tids[HV_MAX_CPUS];
+static int fast_ntids;
+/* Again, now and then: Android (or the app, moving the engine into the top-app group with root) may move
+   the process between scheduling groups, and Linux 6.1 gives every thread the new group's cores when it does. */
+static void *fast_again(void *unused) {
+    (void)unused;
+    for (int i = 0;; i++) {
+        sleep(i < 4 ? 3 : 30);
+        int n = __atomic_load_n(&fast_ntids, __ATOMIC_ACQUIRE);
+        for (int k = 0; k < n && k < HV_MAX_CPUS; k++) sched_setaffinity(fast_tids[k], sizeof fast_set, &fast_set);
+    }
+    return NULL;
+}
+static pthread_once_t fast_once = PTHREAD_ONCE_INIT;
+static void fast_find(void) {
+    long freq[64], lo = 0, hi = 0;
+    int n = 0;
+    for (; n < 64; n++) {
+        char path[96];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", n);
+        FILE *f = fopen(path, "r");
+        if (!f) break;
+        if (fscanf(f, "%ld", &freq[n]) != 1) freq[n] = 0;
+        fclose(f);
+        if (!n || freq[n] < lo) lo = freq[n];
+        if (freq[n] > hi) hi = freq[n];
+    }
+    fast_total = n;
+    CPU_ZERO(&fast_set);
+    if (!n || lo == hi) return; /* unreadable, or all of one speed: nothing to choose */
+    for (int i = 0; i < n; i++)
+        if (freq[i] > lo) CPU_SET(i, &fast_set), fast_count++;
+    pthread_t th;
+    if (pthread_create(&th, NULL, fast_again, NULL) == 0) pthread_detach(th);
+}
+void hv_host_cpu_thread(void) {
+    if (getenv("HV_CPU_ANY")) return;
+    pthread_once(&fast_once, fast_find);
+    if (!fast_count) return;
+    static int said;
+    int slot = __atomic_fetch_add(&fast_ntids, 1, __ATOMIC_ACQ_REL);
+    if (slot < HV_MAX_CPUS) fast_tids[slot] = gettid();
+    int rc = sched_setaffinity(0, sizeof fast_set, &fast_set);
+    if (!__atomic_exchange_n(&said, 1, __ATOMIC_ACQ_REL)) {
+        if (rc == 0) fprintf(stderr, "hengevm: the Mac's CPUs run on the tablet's %d fast cores of %d\n", fast_count, fast_total);
+        else fprintf(stderr, "hengevm: could not keep the Mac's CPUs on the fast cores: %s\n", strerror(errno));
+    }
+}
 static void dump_cpu(int i, HvCpu *c) {
     fprintf(stderr, "henge: stuck? cpu%d EL%u pc %llx sp %llx x29 %llx x30 %llx | elr %llx spsr %llx esr %llx far %llx | "
                     "x0 %llx x1 %llx x2 %llx x3 %llx daif %llx\n",
@@ -114,7 +172,7 @@ static void dump_cpu(int i, HvCpu *c) {
 static void *install_heartbeat(void *arg) {
     (void)arg;
     uint64_t last[HV_MAX_CPUS] = {0}, last_pc[HV_MAX_CPUS] = {0};
-    uint64_t last_disk = 0, last_gpu = 0;
+    uint64_t last_disk = 0, last_gpu = 0, last_wait = 0;
     int still = 0, reported = 0;
     for (int t = 30; install_done == -2; t += 30) {
         sleep(30);
@@ -142,8 +200,13 @@ static void *install_heartbeat(void *arg) {
                     (unsigned long long)(cmds - last_gpu), (unsigned long long)swaps);
         } else { /* Graphics: reims: the device is the app's; count what crosses to it */
             hv_pvg_reims_activity(&cmds, &swaps);
-            fprintf(stderr, " | disk +%llu | gpu (reims) +%llu register accesses, %llu interrupts",
-                    (unsigned long long)(disk - last_disk), (unsigned long long)(cmds - last_gpu), (unsigned long long)swaps);
+            /* How long the Mac's CPUs stood waiting for the app's GPU to answer a register, of this
+               interval's 30 s per CPU: what the GPU costs the Mac, apart from the CPU's own slowness. */
+            uint64_t wait = hv_pvg_reims_wait_ns();
+            fprintf(stderr, " | disk +%llu | gpu (reims) +%llu register accesses, %llu interrupts, CPUs waited %.1f s on it",
+                    (unsigned long long)(disk - last_disk), (unsigned long long)(cmds - last_gpu), (unsigned long long)swaps,
+                    (wait - last_wait) / 1e9);
+            last_wait = wait;
         }
         if (disk != last_disk || cmds != last_gpu) moved = 1;
         last_disk = disk, last_gpu = cmds;

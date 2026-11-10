@@ -32,6 +32,7 @@ typedef struct {
     int gfx_irq, iosfc_irq;
     int nslots;
     uint64_t waits, lost;
+    uint64_t wait_ns; /* all CPUs' time inside forward(), for the heartbeat */
 } Reims;
 
 static Reims R;
@@ -94,6 +95,7 @@ static uint64_t forward(int device, int write, uint64_t off, uint64_t value, uns
         return 0;
     }
     HvReimsSlot *s = &R.h->slot[my_slot];
+    uint64_t began = now_ns();
     s->device = (uint32_t)device, s->write = (uint32_t)write, s->size = size, s->offset = off, s->value = value;
     __atomic_store_n(&s->state, HV_REIMS_REQUEST, __ATOMIC_RELEASE);
     futex(&s->state, FUTEX_WAKE, 1, NULL);
@@ -112,6 +114,7 @@ static uint64_t forward(int device, int write, uint64_t off, uint64_t value, uns
         R.waits++;
     }
 done:;
+    __atomic_fetch_add(&R.wait_ns, now_ns() - began, __ATOMIC_RELAXED);
     uint64_t v = s->value;
     __atomic_store_n(&s->state, HV_REIMS_IDLE, __ATOMIC_RELEASE);
     __atomic_fetch_add(&R.h->requests, 1, __ATOMIC_RELAXED);
@@ -236,6 +239,8 @@ int hv_pvg_external_pointer(int *x, int *y) {
     }
     return -1;
 }
+
+uint64_t hv_pvg_reims_wait_ns(void) { return __atomic_load_n(&R.wait_ns, __ATOMIC_RELAXED); }
 
 void hv_pvg_reims_activity(uint64_t *requests, uint64_t *irqs) {
     *requests = R.h ? R.h->requests : 0, *irqs = R.h ? R.h->irqs : 0;

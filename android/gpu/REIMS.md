@@ -172,6 +172,16 @@ while walking (target, cursor, step, answered and unanswered counts, the gain it
 Settings has Touch: Direct or Trackpad; Trackpad moves the pointer from where it is (the app's
 message 250, as a captured mouse does) and reads nothing back.
 
+0.3.20, speed, measured before it is guessed at. The desktop came up on the system's driver (JIT,
+4 CPUs) and is slow. Nothing kept the Mac's CPU threads off the tablet's slow cores: each is now
+bound to every core but the slowest kind (`hv_host_cpu_thread`, android/runner.c), and with root
+the app moves the engine into Android's top-app scheduling groups (`favourEngine`). The heartbeat
+says how long the Mac's CPUs stood waiting on the app's GPU in each 30 s, and the app's `reims:`
+line every 10 s gives frames per second and each frame's time to draw, to read back and to show.
+What those say decides the next step: the per-commit comparison of every copied guest page inside
+metal2vulkan (`copied.rs`; it wants a log of dirty pages, which reims-vgpu takes from KVM alone)
+is the suspected cost, the frame's own round trip a small one.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
