@@ -172,6 +172,10 @@ public class VmService extends Service {
         // fell back silently, and the fix went untested).
         File active = new File(files, "run.active");
         String build = Integer.toString(buildNumber(this));
+        // Graphics: reims on Turnip: asked for, bundled, and not the driver that took this build down before.
+        android.content.SharedPreferences prefs = getSharedPreferences("henge", MODE_PRIVATE);
+        boolean turnipAsked = "reims".equals(gpu) && !install && "turnip".equals(prefs.getString("reimsDriver", "turnip"));
+        boolean turnip = turnipAsked && GpuView.turnip(this) != null && !build.equals(prefs.getString("turnipCrashed", ""));
         if (active.exists()) {
             logLastCrash(log);
             String last = "";
@@ -180,7 +184,13 @@ public class VmService extends Service {
             String lastBuild = last.contains("@") ? last.substring(last.indexOf('@') + 1) : "";
             appendLog(log, "henge app: the last run ended with this app killed (a crash or Android's low-memory killer) "
                     + "and the engine with it; no exit code was seen");
-            if ("reims".equals(lastMode) && "reims".equals(gpu) && !"install".equals(mode)) {
+            if ("reims-turnip".equals(lastMode) && "reims".equals(gpu) && !"install".equals(mode) && build.equals(lastBuild)) {
+                // Turnip's death is not reims's: the same screen on the system's driver, until the app is updated.
+                prefs.edit().putString("turnipCrashed", build).apply();
+                turnip = false;
+                appendLog(log, "henge app: reims on Turnip took the app down last time (its \"reims:\" lines above say where); "
+                        + "this build uses the system's Vulkan driver from now on. An update of the app tries Turnip again");
+            } else if (lastMode.startsWith("reims") && "reims".equals(gpu) && !"install".equals(mode)) {
                 if (build.equals(lastBuild)) {
                     gpu = "on";
                     appendLog(log, "henge app: reims took the app down last time (its \"reims:\" lines above say where); "
@@ -192,7 +202,7 @@ public class VmService extends Service {
             }
         }
         try (FileOutputStream o = new FileOutputStream(active)) {
-            o.write((("install".equals(mode) ? "install" : gpu) + "@" + build).getBytes(StandardCharsets.UTF_8));
+            o.write((("install".equals(mode) ? "install" : turnip && "reims".equals(gpu) ? "reims-turnip" : gpu) + "@" + build).getBytes(StandardCharsets.UTF_8));
         } catch (Exception ignored) { }
         File lib = libraryDir(this), image = findImage(this, release);
         String engine = getApplicationInfo().nativeLibraryDir + "/libhengevm.so";
@@ -243,10 +253,10 @@ public class VmService extends Service {
         // The Vulkan driver reims-vgpu runs on: the system's, or Turnip where the build bundles it and the setting asks.
         String vulkanLib = null;
         if (reims) {
-            String driver = getSharedPreferences("henge", MODE_PRIVATE).getString("reimsDriver", "turnip");
-            File turnip = GpuView.turnip(this);
-            if ("turnip".equals(driver) && turnip != null) vulkanLib = turnip.getPath();
-            else if ("turnip".equals(driver)) appendLog(log, "henge app: this build has no Turnip; the system's Vulkan driver is used");
+            File lib2 = GpuView.turnip(this);
+            if (turnip && lib2 != null) vulkanLib = lib2.getPath();
+            else if (turnipAsked && lib2 == null) appendLog(log, "henge app: this build has no Turnip; the system's Vulkan driver is used");
+            else if (turnipAsked) appendLog(log, "henge app: Turnip took this build of the app down before; the system's Vulkan driver is used");
         }
         if (reims && !(GpuView.loaded && GpuView.nativeReimsStart(new File(mac, "gpu.reims").getPath(), log.getPath(),
                 reimsHomeDir(this).getPath(), vulkanLib)))

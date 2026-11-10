@@ -73,6 +73,20 @@ def main() -> None:
         if t.count(old) != 1:
             sys.exit(f'android_port: {platform}: SHADER_CACHE_CAPACITY not found once; upstream changed')
         platform.write_text(t.replace(old, new))
+    # No window on Android, so none of the window system's extensions. The probe for them opens the
+    # system's Vulkan loader, which lists VK_KHR_surface and the rest; asked of a driver opened without
+    # that loader (Turnip, through its hardware module), which has none of them, the instance was refused:
+    # "MTLCreateSystemDefaultDevice(): the Vulkan runtime refused it: Vulkan failure -7"
+    # (VK_ERROR_EXTENSION_NOT_PRESENT), the app's death at the first start on Turnip (the tablet, 2026-11-10).
+    t = platform.read_text()
+    old = '        crate::os::add_window_extensions(&mut options);\n'
+    new = ('        // Henge\'s Android port: no window, so no window-system extensions (android_port.py).\n'
+           '        #[cfg(not(target_os = "android"))]\n'
+           '        crate::os::add_window_extensions(&mut options);\n')
+    if new not in t:
+        if t.count(old) != 1:
+            sys.exit(f'android_port: {platform}: add_window_extensions not called once; upstream changed')
+        platform.write_text(t.replace(old, new))
     # The IOSurface mapper's ring: the library maps ring size x 16 bytes and dies unless that is whole
     # 16 KiB pages (docs/testing.md 6.23). On the tablet macOS wrote a size that is not
     # ("reims-vgpu: fatal: memory.map.mapping_length_unaligned", the app's first death past device

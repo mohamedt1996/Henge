@@ -153,6 +153,15 @@ none of Android's audio libraries, so `android/audio_android.c` serves the guest
 AudioTrack (Settings: Sound). The shader cache was already kept between boots (`files/reims-home`);
 the log now says at each start how many files and megabytes it found there.
 
+0.3.16 on the tablet (2026-11-10): Turnip opened ("in a child of the sphal namespace, as Android's
+hardware module"), the cache held 1173 files, and the app died at `MTLCreateSystemDefaultDevice():
+the Vulkan runtime refused it: Vulkan failure -7` (VK_ERROR_EXTENSION_NOT_PRESENT). reims-vgpu's
+window probe opens the *system's* loader, which lists `VK_KHR_surface` and the rest, and adds them
+to the instance; Turnip's hardware module, opened without that loader, has none. Android has no
+window here, so `android_port.py` leaves the probe out (0.3.17). And since such a refusal is the
+library's death, not a status `host.c` can fall back from: a run that dies on Turnip marks Turnip
+as crashed for that build of the app, and the next start uses the system's driver, still on reims.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
