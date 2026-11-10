@@ -407,10 +407,14 @@ static void wheel(uint16_t axis, int amount) {
 void hv_vm_mouse_wheel(int dy) { wheel(HV_REL_WHEEL, dy); }
 void hv_vm_mouse_hwheel(int dx) { wheel(HV_REL_HWHEEL, dx); }
 
+/* A host that runs the GPU device elsewhere (Android's Graphics: reims, android/pvg_reims.c) answers the
+   guest's cursor here; the default, for every other build, knows none. */
+__attribute__((weak)) int hv_pvg_external_pointer(int *x, int *y) { (void)x, (void)y; return -1; }
+
 int hv_vm_pointer(int *x, int *y) {
     HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
     const uint8_t *page = pvg ? hv_pvg_lite_display_page(pvg) : NULL;
-    if (!page) return -1;
+    if (!page) return hv_pvg_external_pointer(x, y);
     uint32_t at = *(const volatile uint32_t *)(page + 0xe00);
     if (at == 0xffffffff) return -1;
     *x = (int)(at & 0xffff), *y = (int)(at >> 16);

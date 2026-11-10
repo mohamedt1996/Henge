@@ -23,6 +23,7 @@
 
 void hv_android_share_with_app(const char *path);
 void hv_pvg_lite_mode(uint32_t *width, uint32_t *height);
+void hv_pvg_lite_set_mode(uint32_t width, uint32_t height);
 
 typedef struct {
     HvReimsHeader *h;
@@ -184,6 +185,9 @@ int hv_pvg_external_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_t i
             h->display_w = 1280, h->display_h = 800;
         fprintf(stderr, "hengevm: reims: the Mac's screen is %ux%u%s\n", h->display_w, h->display_h,
                 mode ? "" : " (HV_REIMS_MODE=WxH to change)");
+        /* The engine's own display size too: the boot framebuffer and the VNC framebuffer the app maps its
+           touches through are then the Mac's screen, one coordinate space. */
+        hv_pvg_lite_set_mode(h->display_w, h->display_h);
     }
     h->engine_alive = 1;
     __atomic_store_n(&h->magic, HV_REIMS_MAGIC, __ATOMIC_RELEASE);
@@ -213,6 +217,24 @@ int hv_pvg_external_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_t i
     pthread_detach(t);
     fprintf(stderr, "hengevm: GPU: reims-vgpu in the app, through %s\n", path);
     return 1;
+}
+
+/* host/vm.c's hook (weak there): the guest's cursor as the app last placed it, for the pointer correction
+   the VNC server does (vnc.c's pointer_event), which read pvg_lite's display page before. */
+int hv_pvg_external_pointer(int *x, int *y) {
+    HvReimsHeader *h = R.h;
+    if (!h) return -1;
+    for (int i = 0; i < 8; i++) {
+        uint32_t s0 = __atomic_load_n(&h->cursor_seq, __ATOMIC_ACQUIRE);
+        if (s0 & 1) continue;
+        uint32_t cx = h->cursor_x, cy = h->cursor_y, valid = h->cursor_valid;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&h->cursor_seq, __ATOMIC_ACQUIRE) != s0) continue;
+        if (!valid) return -1;
+        *x = (int)cx, *y = (int)cy;
+        return 0;
+    }
+    return -1;
 }
 
 void hv_pvg_reims_activity(uint64_t *requests, uint64_t *irqs) {

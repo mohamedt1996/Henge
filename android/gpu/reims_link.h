@@ -20,7 +20,7 @@
 #include <stdint.h>
 
 #define HV_REIMS_MAGIC 0x534d5248u /* "HRMS" */
-#define HV_REIMS_VERSION 1
+#define HV_REIMS_VERSION 2 /* 2: cursor_x/y/seq */
 #define HV_REIMS_SLOTS 32
 #define HV_REIMS_STALE_NS 3000000000ull
 #define HV_REIMS_FILE_BYTES 16384u
@@ -53,7 +53,11 @@ typedef struct {
     uint32_t irq_bits;             /* HV_REIMS_IRQ_*, taken by the engine */
     uint32_t pad0;
     uint64_t requests, irqs;       /* counts, for the log */
-    uint64_t pad[8];
+    /* The guest's cursor as reims-vgpu last placed it (rvg_display_cursor_position), in the display's
+       pixels, written by the app at each move: the engine's pointer correction reads it (hv_vm_pointer),
+       as it reads pvg_lite's display page. cursor_seq is odd while a write is under way. */
+    uint32_t cursor_x, cursor_y, cursor_seq, cursor_valid;
+    uint64_t pad[6];
     HvReimsSlot slot[HV_REIMS_SLOTS];
 } HvReimsHeader;
 

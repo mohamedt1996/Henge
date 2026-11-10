@@ -242,16 +242,30 @@ static void on_glyph(void *ctx, const RvgCursorGlyph *g) {
     pthread_mutex_unlock(&h->lock);
 }
 
+static void publish_cursor(Host *h);
 static void on_show(void *ctx, uint8_t show) {
     Host *h = ctx;
+    publish_cursor(h);
     pthread_mutex_lock(&h->lock);
     h->cursor_on = show != 0, h->cursor_changed = 1;
     pthread_cond_signal(&h->wake);
     pthread_mutex_unlock(&h->lock);
 }
 
+/* The guest's cursor into the shared file, for the engine's pointer correction (reims_link.h). */
+static void publish_cursor(Host *h) {
+    if (!h->disp || !h->h) return;
+    RvgDisplayCoord at = rvg_display_cursor_position(h->disp);
+    HvReimsHeader *x = h->h;
+    uint32_t seq = __atomic_load_n(&x->cursor_seq, __ATOMIC_RELAXED);
+    __atomic_store_n(&x->cursor_seq, seq | 1u, __ATOMIC_RELEASE);
+    x->cursor_x = at.x, x->cursor_y = at.y, x->cursor_valid = 1;
+    __atomic_store_n(&x->cursor_seq, (seq | 1u) + 1u, __ATOMIC_RELEASE);
+}
+
 static void on_move(void *ctx) {
     Host *h = ctx;
+    publish_cursor(h);
     pthread_mutex_lock(&h->lock);
     h->cursor_changed = 1;
     pthread_cond_signal(&h->wake);

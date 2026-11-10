@@ -47,6 +47,7 @@ public class ScreenActivity extends Activity {
         }
         view = new RfbView(this);
         view.overlay = vulkan;
+        if (vulkan) view.setPointerIcon(android.view.PointerIcon.getSystemIcon(this, android.view.PointerIcon.TYPE_NULL));
         root.addView(view);
 
         // A hidden field takes the soft keyboard's text; its characters go to the Mac as keys.
@@ -250,15 +251,22 @@ public class ScreenActivity extends Activity {
 
         private final Rect dst = new Rect();
 
+        /** Where the Mac's screen lies in this view: the framebuffer letterboxed, as the GPU view letterboxes its
+         *  frame (screen_vk.c). From the size alone, so touches map before (or without) a VNC frame. */
+        private void layoutScreen() {
+            if (fbW == 0 || fbH == 0 || getWidth() == 0 || getHeight() == 0) return;
+            float s = Math.min(getWidth() / (float) fbW, getHeight() / (float) fbH);
+            int w = Math.round(fbW * s), h = Math.round(fbH * s);
+            int x = (getWidth() - w) / 2, y = (getHeight() - h) / 2;
+            dst.set(x, y, x + w, y + h);
+        }
+
         @Override protected void onDraw(Canvas c) {
             if (!overlay) c.drawColor(Color.BLACK);
             Bitmap f;
             synchronized (this) { f = frame; }
+            layoutScreen();
             if (f != null && message == null) {
-                float s = Math.min(getWidth() / (float) f.getWidth(), getHeight() / (float) f.getHeight());
-                int w = Math.round(f.getWidth() * s), h = Math.round(f.getHeight() * s);
-                int x = (getWidth() - w) / 2, y = (getHeight() - h) / 2;
-                dst.set(x, y, x + w, y + h); /* the GPU's frame is letterboxed the same way (screen_vk.c) */
                 if (!overlay) synchronized (this) { c.drawBitmap(f, null, dst, paint); }
             } else if (overlay && message == null) {
                 // nothing yet: the GPU view shows what there is
@@ -286,7 +294,53 @@ public class ScreenActivity extends Activity {
             if (!moved && !scrolling) { dragging = true; buttons = 1; pointer(1, downX, downY); performHapticFeedback(0); }
         };
 
+        /** A mouse (or a trackpad in pointer mode): its position, buttons and wheel go through as they are;
+         *  the finger heuristics (tap, long press, two-finger scroll) are for touch alone. */
+        private static boolean isMouse(MotionEvent e) {
+            return (e.getSource() & android.view.InputDevice.SOURCE_MOUSE) == android.view.InputDevice.SOURCE_MOUSE
+                    || e.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE;
+        }
+
+        private int mouseButtons(MotionEvent e) {
+            int st = e.getButtonState(), m = 0;
+            if ((st & MotionEvent.BUTTON_PRIMARY) != 0) m |= 1;
+            if ((st & MotionEvent.BUTTON_TERTIARY) != 0) m |= 2;
+            if ((st & MotionEvent.BUTTON_SECONDARY) != 0) m |= 4;
+            return m;
+        }
+
+        @Override public boolean onGenericMotionEvent(MotionEvent e) {
+            if (!isMouse(e)) return super.onGenericMotionEvent(e);
+            layoutScreen();
+            switch (e.getActionMasked()) {
+            case MotionEvent.ACTION_HOVER_MOVE:
+            case MotionEvent.ACTION_HOVER_ENTER:
+                buttons = mouseButtons(e);
+                pointer(buttons, e.getX(), e.getY());
+                return true;
+            case MotionEvent.ACTION_SCROLL: {
+                float v = e.getAxisValue(MotionEvent.AXIS_VSCROLL), hz = e.getAxisValue(MotionEvent.AXIS_HSCROLL);
+                int b = buttons | (v > 0 ? 8 : v < 0 ? 16 : 0) | (hz < 0 ? 32 : hz > 0 ? 64 : 0);
+                if (b != buttons) { pointer(b, e.getX(), e.getY()); pointer(buttons, e.getX(), e.getY()); }
+                return true;
+            }
+            case MotionEvent.ACTION_BUTTON_PRESS:
+            case MotionEvent.ACTION_BUTTON_RELEASE:
+                buttons = mouseButtons(e);
+                pointer(buttons, e.getX(), e.getY());
+                return true;
+            }
+            return super.onGenericMotionEvent(e);
+        }
+
         @Override public boolean onTouchEvent(MotionEvent e) {
+            layoutScreen();
+            if (isMouse(e)) {
+                // Android sends a mouse's button presses as touch down/up too: the button state is the truth.
+                buttons = mouseButtons(e);
+                pointer(buttons, e.getX(), e.getY());
+                return true;
+            }
             switch (e.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
                 downX = e.getX(); downY = e.getY(); downAt = e.getEventTime();

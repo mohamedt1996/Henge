@@ -115,6 +115,16 @@ With it, three things against the next gaps rather than after them:
   unordered raster order groups and the copy path stay. A Turnip that gives no device falls back to
   the system's driver in the same run, logged.
 
+**0.3.11 booted macOS to the Setup Assistant on the tablet** (2026-11-10), on the system driver.
+
+Input after that: the engine places the mouse relatively, correcting each VNC pointer event by the
+guest's actual cursor position, which it read from pvg_lite's display page; with the device in the
+app that read nothing, and touches drifted. The app now publishes reims-vgpu's cursor position
+through the shared file (`cursor_x/y/seq`, header version 2) and the engine reads it
+(`hv_pvg_external_pointer`, a weak hook in host/vm.c); the engine's own display size follows the
+reims mode, so the VNC framebuffer, the boot framebuffer and the Mac's screen are one coordinate
+space; and a mouse is a mouse in the app (hover, buttons, wheel through as they are), not a finger.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
