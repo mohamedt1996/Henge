@@ -131,3 +131,40 @@ SDL3), it passed on lavapipe (2026-11-09):
 On a host without `/dev/udmabuf` (Android), reims-vgpu views guest memory a 4 KB mapping at a time,
 counted against `vm.max_map_count`: at 65530 that covers about 190 MB of guest RAM. The app raises it
 through su when Graphics: reims starts, and logs whether it could.
+
+## What the native-macOS-on-Snapdragon projects give this port
+
+Surveyed 2026-11-10: [UniXNU](https://github.com/UniXNU/UniXNU), [macOS-ForSheng](https://github.com/CrossDarwin/macOS-ForSheng),
+[macOS-uke](https://github.com/iOSNJBrepo/macOS-uke) and [Snapintosh](https://github.com/Snapintosh/Snapintosh) (with
+SnapMetal, SnapAdreno, air2ir3). All four run Apple's kernel natively on a Snapdragon (an EL2 monitor or
+a patched kernel, their own Adreno kernel driver, a Metal plug-in inside macOS that compiles AIR for the
+Adreno). Henge emulates a Mac and plays its GPU work on Android's Vulkan through reims-vgpu, so none
+of their code runs here: no kernel, no monitor, no IOGPU kext, no in-guest Metal plug-in. What does
+carry over is what they learned about macOS's GPU clients, and the Turnip route:
+
+- **WindowServer aborts, never degrades, on a nil texture over an IOSurface or a nil sampler**
+  (SnapMetal `AdrenoMTLDevice.m`, macOS-uke's plan): a refused creator kills the guest's WindowServer,
+  which launchd restarts. `reims_lenient.py` answers nil rather than ending the app, so a gap now costs
+  a WindowServer restart loop with the gap named in henge.log, not the run.
+- **CoreAnimation's generic pipeline blends through framebuffer fetch.** On a device that answers
+  "no fetch" it is built with blending off (black rounded corners, blur and backdrop; no abort); on a
+  device that answers "fetch" and then refuses the pipeline, CoreAnimation aborts. The port answers
+  "fetch" (the profile claims the interlock) and builds the pipeline through the storage form, so that
+  pipeline must keep compiling: a refusal of it is the first thing to look for in a WindowServer loop.
+  `CA_DISABLE_GENERIC_SHADERS` and `CA_DISABLE_APL_FILTER` are CoreAnimation's own switches for both
+  (set in the guest, not here).
+- **Snapintosh's order of WindowServer failures** (`docs/GUI-BOOT-ROADMAP.md`, sections 9-12): the
+  10-bit framebuffer format CoreAnimation picks, render-target usages, depth/stencil and
+  multi-attachment passes, `no_perspective` interpolation, buffer textures, constant samplers,
+  half-float surfaces, mip levels, 16-bit derivatives, then framebuffer fetch; a command buffer that
+  never retires latches submission; and the first desktop ran at one frame per 10 s until the host's
+  own overhead was cut. metal2vulkan already models all of the shader and format items (it was built
+  against macOS guests on other GPUs); the list is the checklist for what a refusal in henge.log means.
+- **A persistent shader cache is what makes a second boot usable** (macOS-uke: 107 of WindowServer's
+  209 pipelines found in the cache on the second boot). `files/reims-home` holds it here.
+- **Turnip, not Qualcomm's driver, is where metal2vulkan on an Adreno has run** (macOS-uke, Snapintosh):
+  it has `VK_EXT_rasterization_order_attachment_access` (the fetch becomes exact), and its bugs are
+  debuggable. It lacks `VK_EXT_external_memory_host` and the interlock as Qualcomm's does, so the copy
+  path and the unordered raster order groups stay. Bundling an Android Turnip (the emulator
+  community's prebuilts, loaded directly as the ICD) is the next structural step once the stock driver
+  has shown what else it refuses.
