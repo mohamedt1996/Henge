@@ -19,14 +19,14 @@ there and builds, and no run has shown it working (or failing).
 
 | Area | Status | Notes |
 |---|---|---|
-| Boot to the macOS desktop | **Works** (0.3.11 to 0.3.24) | JIT engine, Graphics: reims, the system's Vulkan driver, 4 CPUs, 4 GB. |
-| Desktop drawing (Graphics: reims) | **Works, slow** | 17 to 22 frames a second at best in animations up to 0.3.24, with long stalls. |
+| Boot to the macOS desktop | **Works** (0.3.11 to 0.3.24, 0.3.27) | JIT engine, Graphics: reims, the system's Vulkan driver, 4 CPUs, 4 GB. |
+| Desktop drawing (Graphics: reims) | **Works, slow** | 17 to 27 frames a second at best in animations, with long stalls. |
 | 0.3.26 | **Broken: draws nothing** | Every GPU task failed to start. Do not use it. |
-| 0.3.27 | **Unconfirmed** | Meant to fix 0.3.26 and keep its faster GPU register path. Not yet run. |
+| 0.3.27 | **Works** | Fixes 0.3.26. The Mac's CPUs wait 2 to 4 s of 30 on the GPU (18 to 22 before); about 27 frames a second at best. |
 | Wallpaper | **Not drawn** | The desktop picture does not appear. Cause unknown. |
 | Touch, pointer, on-screen and hardware keyboard | **Works** | Touch: Direct or Trackpad. A captured mouse moves the Mac's pointer itself. |
 | Mac's RAM in memory (not on flash) | **Works** (0.3.24) | Handed from the engine to the app as a descriptor. |
-| Internet in the Mac | **Unconfirmed** | Names stopped resolving a second after boot until 0.3.25, which fixes that. Not yet checked on the tablet. |
+| Internet in the Mac | **Works** (0.3.25) | Safari loaded apple.com on the tablet. Heavy pages slow the whole Mac to a crawl. |
 | Sound | **Works** | Played through the app since 0.3.16. |
 | Install macOS on the device | **Unconfirmed here** | Downloads the restore image and restores it, as the iOS app does. Takes hours; needs about 45 GB free. |
 | Vulkan driver: Turnip | **Unconfirmed** | Bundled since 0.3.15. It took the app down on 0.3.16; fixes went in after, and the logged runs since used the system's driver. |
