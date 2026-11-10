@@ -198,7 +198,7 @@ int main(int argc, char **argv) {
     const char *gpu = "on", *shader_dir = NULL, *engine = "jit";
     const char *install_dir = NULL, *release = "15.6.1", *ipsw = NULL, *cache = NULL;
     uint64_t disk_gb = 64;
-    HvVmConfig vc = {.aux_offset = 16384, .ram_mb = 4096, .ncpus = 2, .log = 1, .no_net = 0, .no_sound = 1};
+    HvVmConfig vc = {.aux_offset = 16384, .ram_mb = 4096, .ncpus = 2, .log = 1, .no_net = 0, .no_sound = 0};
     for (int i = 1; i < argc; i++) {
         if (i + 1 >= argc) usage();
         const char *a = argv[i], *v = argv[++i];
@@ -222,6 +222,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--engine")) engine = v;
         else if (!strcmp(a, "--shader-dir")) shader_dir = v;
         else if (!strcmp(a, "--net")) vc.no_net = !atoi(v);
+        else if (!strcmp(a, "--sound")) vc.no_sound = !atoi(v);
         else if (!strcmp(a, "--jit-mb")) vc.jit_bytes = (size_t)atoi(v) << 20;
         else usage();
     }
@@ -376,8 +377,8 @@ int main(int argc, char **argv) {
     if (install_dir) usleep(500000); /* usbmuxd installs its own handlers; take SIGINT and SIGTERM back */
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
-    fprintf(stderr, "hengevm: %d CPUs, %llu MB, network %s, no sound yet\n", hv_vm_ncpus(),
-            (unsigned long long)vc.ram_mb, vc.no_net ? "off" : "on (NAT)");
+    fprintf(stderr, "hengevm: %d CPUs, %llu MB, network %s, sound %s\n", hv_vm_ncpus(),
+            (unsigned long long)vc.ram_mb, vc.no_net ? "off" : "on (NAT)", vc.no_sound ? "off" : "on");
     if (!gunyah) {
         /* CPUs 1 and up need their own threads (parked until PSCI CPU_ON) and the 1 ms kicker. Without them
            XNU's CPU_ON for cpu1 waits forever for a thread that was never started: cpu0 stuck, +0 blocks. */

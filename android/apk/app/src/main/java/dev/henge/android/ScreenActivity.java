@@ -48,6 +48,7 @@ public class ScreenActivity extends Activity {
         }
         view = new RfbView(this);
         view.overlay = vulkan;
+        view.macPointer = vulkan && "reims".equals(gpuMode);
         if (vulkan) view.setPointerIcon(android.view.PointerIcon.getSystemIcon(this, android.view.PointerIcon.TYPE_NULL));
         root.addView(view);
 
@@ -165,6 +166,8 @@ public class ScreenActivity extends Activity {
         private int buttons;
         /* Over a GpuView: the frame is the GPU's; this view only places the pointer and says why there is none. */
         boolean overlay;
+        /* The screen under this view draws the Mac's own pointer (Graphics: reims): a mouse may be captured. */
+        boolean macPointer;
 
         RfbView(Context c) {
             super(c);
@@ -280,8 +283,17 @@ public class ScreenActivity extends Activity {
         private void sendAsync(byte[] b) {
             synchronized (outbox) {
                 // A move with the same buttons as the move still waiting replaces it: only the latest matters.
+                // A mouse's own movement (250) adds to the one waiting instead.
                 byte[] last = outbox.peekLast();
                 if (b[0] == 5 && last != null && last[0] == 5 && last[1] == b[1]) outbox.pollLast();
+                if ((b[0] & 0xff) == 250 && last != null && (last[0] & 0xff) == 250 && last[1] == b[1]) {
+                    int dx = (short) ((last[2] & 0xff) << 8 | (last[3] & 0xff)) + (short) ((b[2] & 0xff) << 8 | (b[3] & 0xff));
+                    int dy = (short) ((last[4] & 0xff) << 8 | (last[5] & 0xff)) + (short) ((b[4] & 0xff) << 8 | (b[5] & 0xff));
+                    if (Math.abs(dx) < 32000 && Math.abs(dy) < 32000) {
+                        outbox.pollLast();
+                        b = new byte[]{(byte) 250, b[1], (byte) (dx >> 8), (byte) dx, (byte) (dy >> 8), (byte) dy};
+                    }
+                }
                 if (outbox.size() < 4096) outbox.addLast(b);
                 outbox.notify();
             }
@@ -362,8 +374,61 @@ public class ScreenActivity extends Activity {
             return m;
         }
 
+        /* A mouse, captured: Android hands over its raw movement and draws no pointer of its own, and the
+           movement goes to the Mac as it is (message 250, the engine's own: buttons, then dx and dy), so
+           the Mac's pointer is moved by the mouse and by nothing else: no steering to a place on the screen,
+           which is for fingers. A trackpad, captured, reports finger positions instead: it is let go and
+           stays as it was. */
+        private boolean noCapture;
+        private float restX, restY; // movement not yet sent: less than one unit
+
+        private void captureMouse() {
+            // Only over a screen that draws the Mac's own pointer: elsewhere, without Android's, the mouse
+            // would be invisible.
+            if (macPointer && !noCapture && !hasPointerCapture() && hasWindowFocus()) { requestFocus(); requestPointerCapture(); }
+        }
+
+        @Override public void onWindowFocusChanged(boolean has) {
+            super.onWindowFocusChanged(has);
+            if (!has) restX = restY = 0; // Android ends the capture with the focus; the next mouse event takes it again
+        }
+
+        private void relative(int mask, float dx, float dy) {
+            restX += dx; restY += dy;
+            int ix = (int) restX, iy = (int) restY;
+            restX -= ix; restY -= iy;
+            ix = Math.max(-32000, Math.min(32000, ix));
+            iy = Math.max(-32000, Math.min(32000, iy));
+            sendAsync(new byte[]{(byte) 250, (byte) mask, (byte) (ix >> 8), (byte) ix, (byte) (iy >> 8), (byte) iy});
+        }
+
+        @Override public boolean onCapturedPointerEvent(MotionEvent e) {
+            if ((e.getSource() & android.view.InputDevice.SOURCE_MOUSE_RELATIVE) != android.view.InputDevice.SOURCE_MOUSE_RELATIVE) {
+                noCapture = true;
+                releasePointerCapture();
+                return true;
+            }
+            int was = buttons;
+            buttons = mouseButtons(e);
+            switch (e.getActionMasked()) {
+            case MotionEvent.ACTION_SCROLL: {
+                float v = e.getAxisValue(MotionEvent.AXIS_VSCROLL), hz = e.getAxisValue(MotionEvent.AXIS_HSCROLL);
+                int b = buttons | (v > 0 ? 8 : v < 0 ? 16 : 0) | (hz < 0 ? 32 : hz > 0 ? 64 : 0);
+                if (b != buttons) { relative(b, 0, 0); relative(buttons, 0, 0); }
+                return true;
+            }
+            default: {
+                float dx = e.getX(), dy = e.getY();
+                for (int i = 0; i < e.getHistorySize(); i++) { dx += e.getHistoricalX(i); dy += e.getHistoricalY(i); }
+                if (dx != 0 || dy != 0 || buttons != was) relative(buttons, dx, dy);
+                return true;
+            }
+            }
+        }
+
         @Override public boolean onGenericMotionEvent(MotionEvent e) {
             if (!isMouse(e)) return super.onGenericMotionEvent(e);
+            captureMouse(); // from the next event on, the mouse comes through onCapturedPointerEvent
             layoutScreen();
             switch (e.getActionMasked()) {
             case MotionEvent.ACTION_HOVER_MOVE:
@@ -389,6 +454,7 @@ public class ScreenActivity extends Activity {
         @Override public boolean onTouchEvent(MotionEvent e) {
             layoutScreen();
             if (isMouse(e)) {
+                captureMouse();
                 // Android sends a mouse's button presses as touch down/up too: the button state is the truth.
                 buttons = mouseButtons(e);
                 pointer(buttons, e.getX(), e.getY());

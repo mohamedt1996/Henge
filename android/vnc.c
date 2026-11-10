@@ -173,6 +173,7 @@ static struct {
     int x, y, have;  /* where the viewer wants the pointer */
     int settled;     /* the Mac's pointer is there (or as near as it gets) */
     int started;
+    unsigned relative; /* counts a mouse's own moves: where the pointer was last sent blind no longer holds */
 } P = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
 
 static uint64_t now_ms(void) {
@@ -198,11 +199,13 @@ static void *pointer_thread(void *unused) {
     int waiting = 0, gx0 = 0, gy0 = 0;   /* a step is out: where the guest was when it left */
     int sx = 0, sy = 0, silent = 0;
     uint64_t sent_at = 0, blind_until = 0;
+    unsigned relative = 0;
     double gain = 1;                     /* guest pixels per unit sent, as last seen */
     for (;;) {
         pthread_mutex_lock(&P.mu);
         while (!P.have || P.settled) pthread_cond_wait(&P.cv, &P.mu);
         int tx = P.x, ty = P.y;
+        if (P.relative != relative) relative = P.relative, have_o = 0, waiting = 0;
         pthread_mutex_unlock(&P.mu);
         uint64_t now = now_ms();
         int gx, gy;
@@ -279,9 +282,20 @@ static void pointer_wait(int ms) {
     }
 }
 
+/* The viewer's own message 250 (Henge's app, a captured mouse): the mouse's movement as it is, with the
+   RFB button mask. Nothing steers: the pointer thread is told there is no place to walk to. */
+static void buttons_event(Client *c, int mask);
+
+static void relative_event(Client *c, int mask, int dx, int dy) {
+    pthread_mutex_lock(&P.mu);
+    P.have = 0, P.settled = 1, P.relative++;
+    pthread_mutex_unlock(&P.mu);
+    if (dx || dy) hv_vm_mouse_move(dx, dy);
+    buttons_event(c, mask);
+}
+
 static void pointer_event(Client *c, int mask, int x, int y) {
     pointer_target(x, y);
-    static const int map[3] = {0, 2, 1}; /* RFB: 1 left, 2 middle, 4 right */
     if ((mask ^ c->buttons) & 7) {
         pointer_wait(800);
         /* macOS misses a press let go at once: a tap holds for a moment. */
@@ -289,6 +303,11 @@ static void pointer_event(Client *c, int mask, int x, int y) {
         if ((c->buttons & 7 & ~mask) && held < 60) usleep((useconds_t)(60 - held) * 1000);
         if (mask & 7 & ~c->buttons) c->pressed_at = now_ms();
     }
+    buttons_event(c, mask);
+}
+
+static void buttons_event(Client *c, int mask) {
+    static const int map[3] = {0, 2, 1}; /* RFB: 1 left, 2 middle, 4 right */
     for (int b = 0; b < 3; b++) {
         int was = c->buttons >> b & 1, now = mask >> b & 1;
         if (was != now) hv_vm_mouse_button(map[b], now);
@@ -370,6 +389,10 @@ static void serve(Client *c) {
             case 5: /* PointerEvent */
                 if (recv_all(c->fd, b, 5)) return;
                 pointer_event(c, b[0], get16(b + 1), get16(b + 3));
+                break;
+            case 250: /* Henge's app: a captured mouse's movement (relative_event) */
+                if (recv_all(c->fd, b, 5)) return;
+                relative_event(c, b[0], (int16_t)get16(b + 1), (int16_t)get16(b + 3));
                 break;
             case 6: /* ClientCutText */
                 if (recv_all(c->fd, b, 7)) return;

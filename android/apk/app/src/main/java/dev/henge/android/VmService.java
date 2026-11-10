@@ -215,6 +215,8 @@ public class VmService extends Service {
             cmd.add("--cache"); cmd.add(lib.getPath()); // a missing boot ROM comes back from here
             if ("capture".equals(gpu)) { cmd.add("--shader-dir"); cmd.add(shaderDir(this).getPath()); }
         }
+        boolean sound = !install && !"off".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("sound", "on"));
+        cmd.add("--sound"); cmd.add(sound ? "1" : "0");
         cmd.add("--ram"); cmd.add(Integer.toString(gunyah() ? Math.min(ram, 3072) : ram));
         cmd.add("--cpus"); cmd.add(Integer.toString(cpus));
         if (gunyah()) { cmd.add("--engine"); cmd.add("gunyah"); }
@@ -285,6 +287,7 @@ public class VmService extends Service {
                 o.write(("\n=== " + String.join(" ", cmd.subList(3, cmd.size())) + "\n").getBytes(StandardCharsets.UTF_8));
             }
             process = pb.start();
+            if (sound) new Thread(() -> playSound(log), "sound").start();
             code = process.waitFor();
         } catch (Exception e) {
             appendLog(log, "henge app: could not start the engine: " + e);
@@ -367,6 +370,87 @@ public class VmService extends Service {
             case android.app.ApplicationExitInfo.REASON_OTHER: return "other";
             default: return "?";
         }
+    }
+
+    private static int le32(byte[] b, int at) {
+        return (b[at] & 0xff) | (b[at + 1] & 0xff) << 8 | (b[at + 2] & 0xff) << 16 | (b[at + 3] & 0xff) << 24;
+    }
+
+    /**
+     * The Mac's sound. The engine has none of Android's audio libraries: it serves the guest's PCM on
+     * 127.0.0.1:5901 (android/audio_android.c: messages of 'H','S',type,0,length; type 1 the format,
+     * type 2 PCM), and this plays it. In the service, so the Mac is heard with its screen closed too.
+     */
+    private void playSound(File log) {
+        byte[] head = new byte[8], body = new byte[1 << 16];
+        java.nio.ByteBuffer out = java.nio.ByteBuffer.allocateDirect(1 << 16).order(java.nio.ByteOrder.nativeOrder());
+        boolean said = false;
+        while (busy()) {
+            android.media.AudioTrack track = null;
+            try (java.net.Socket s = new java.net.Socket()) {
+                s.connect(new java.net.InetSocketAddress("127.0.0.1", 5901), 1000);
+                s.setTcpNoDelay(true);
+                java.io.DataInputStream in = new java.io.DataInputStream(s.getInputStream());
+                int format = 0;
+                while (true) {
+                    in.readFully(head);
+                    int len = le32(head, 4);
+                    if (head[0] != 'H' || head[1] != 'S' || len < 0 || len > body.length) throw new java.io.IOException("not the engine's sound");
+                    in.readFully(body, 0, len);
+                    if (head[2] == 1 && len >= 12) {
+                        int channels = le32(body, 0), rate = le32(body, 8);
+                        format = le32(body, 4);
+                        if (track != null) { track.release(); track = null; }
+                        try {
+                            track = soundTrack(channels, format, rate);
+                            track.play();
+                            if (!said) appendLog(log, "henge app: sound: playing " + channels + " channels at " + rate + " Hz");
+                        } catch (Exception e) {
+                            if (!said) appendLog(log, "henge app: sound: Android refused " + channels + " channels, format " + format + ", " + rate + " Hz: " + e);
+                            track = null;
+                        }
+                        said = true;
+                    } else if (head[2] == 2 && track != null) {
+                        out.clear();
+                        if (format == 17) { // 32-bit integers: as floats, which every Android plays
+                            for (int i = 0; i + 4 <= len; i += 4) out.putFloat(le32(body, i) / 2147483648f);
+                        } else {
+                            out.put(body, 0, len);
+                        }
+                        out.flip();
+                        // Never waits: what the track has no room for is dropped, so the sound stays on time
+                        // (the Mac's clock and the tablet's drift apart by a little, for ever).
+                        track.write(out, out.remaining(), android.media.AudioTrack.WRITE_NON_BLOCKING);
+                    }
+                }
+            } catch (Exception e) {
+                // no engine yet, or it left: again in a moment, while there is one
+            } finally {
+                if (track != null) { try { track.release(); } catch (Exception ignored) { } }
+            }
+            try { Thread.sleep(1000); } catch (InterruptedException e) { return; }
+        }
+    }
+
+    /** format: virtio-snd's number (5: 16-bit, 17: 32-bit, 19: float). */
+    private static android.media.AudioTrack soundTrack(int channels, int format, int rate) {
+        int encoding = format == 5 ? android.media.AudioFormat.ENCODING_PCM_16BIT : android.media.AudioFormat.ENCODING_PCM_FLOAT;
+        android.media.AudioFormat.Builder f = new android.media.AudioFormat.Builder().setEncoding(encoding).setSampleRate(rate);
+        if (channels == 1) f.setChannelMask(android.media.AudioFormat.CHANNEL_OUT_MONO);
+        else if (channels == 2) f.setChannelMask(android.media.AudioFormat.CHANNEL_OUT_STEREO);
+        else f.setChannelIndexMask((1 << channels) - 1);
+        int frame = channels * (format == 5 ? 2 : 4);
+        int least = android.media.AudioTrack.getMinBufferSize(rate,
+                channels == 1 ? android.media.AudioFormat.CHANNEL_OUT_MONO : android.media.AudioFormat.CHANNEL_OUT_STEREO, encoding);
+        int size = Math.max(least > 0 ? least : 0, rate / 10 * frame); // a tenth of a second, or what the device needs
+        return new android.media.AudioTrack.Builder()
+                .setAudioAttributes(new android.media.AudioAttributes.Builder()
+                        .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                .setAudioFormat(f.build())
+                .setBufferSizeInBytes(size)
+                .setTransferMode(android.media.AudioTrack.MODE_STREAM)
+                .build();
     }
 
     static int buildNumber(Context c) {

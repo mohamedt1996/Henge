@@ -16,6 +16,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <linux/futex.h>
 #include <pthread.h>
 #include <signal.h>
@@ -244,6 +245,13 @@ static void on_glyph(void *ctx, const RvgCursorGlyph *g) {
 }
 
 static void publish_cursor(Host *h);
+
+static unsigned long long cache_files, cache_bytes;
+static int cache_count(const char *path, const struct stat *st, int type, struct FTW *ftw) {
+    (void)path, (void)ftw;
+    if (type == FTW_F) cache_files++, cache_bytes += (unsigned long long)st->st_size;
+    return 0;
+}
 static void on_show(void *ctx, uint8_t show) {
     Host *h = ctx;
     publish_cursor(h);
@@ -437,7 +445,11 @@ static int bring_up(Host *h) {
         mkdir(h->home, 0700);
         setenv("HOME", h->home, 1);
         setenv("XDG_CACHE_HOME", h->home, 0);
-        hlog("reims: shader cache under %s", h->home);
+        /* What the last boots left: a cache that is found again is why the second boot is quicker than the first. */
+        cache_files = 0, cache_bytes = 0;
+        nftw(h->home, cache_count, 16, FTW_PHYS);
+        hlog("reims: shader cache under %s: %llu files, %.1f MB from earlier runs%s", h->home, cache_files, cache_bytes / 1048576.0,
+             cache_files ? "" : " (none yet: this boot translates every shader, the next finds them here)");
     } else if (!getenv("HOME")) {
         hlog("reims: no HOME and no cache folder given: metal2vulkan will refuse the device");
     }

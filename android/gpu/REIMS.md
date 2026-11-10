@@ -145,6 +145,14 @@ it and the step was allowed to fail. `turnip_load.cpp` now opens the module's `v
 Android's loader does and answers a `vkGetInstanceProcAddr` over it; the CI fails if the APK
 would go out without the driver.
 
+0.3.16. A mouse is captured over the reims screen (Android's pointer capture): its raw movement goes
+to the Mac as it is (the app's own VNC message 250, `relative_event` in android/vnc.c), so nothing
+steers it to a place on the screen; fingers still do that. Sound: the engine is a static program with
+none of Android's audio libraries, so `android/audio_android.c` serves the guest's virtio-snd PCM on
+127.0.0.1:5901, pulled at the stream's rate by the clock, and VmService plays it through an
+AudioTrack (Settings: Sound). The shader cache was already kept between boots (`files/reims-home`);
+the log now says at each start how many files and megabytes it found there.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

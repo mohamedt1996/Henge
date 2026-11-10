@@ -12,7 +12,6 @@ First Android build of Henge: macOS in an emulator on arm64 Android tablets and 
 
 ### Known limits
 - The macOS desktop doesn't render after boot. macOS draws through Apple's GPU and its shader format, which Android GPUs can't run.
-- No sound.
 - Needs about 45 GB free, about 8 GB RAM on the device (give the Mac 4 GB), and hours to install. Keep the device plugged in.
 - Signed with a debug key.
 

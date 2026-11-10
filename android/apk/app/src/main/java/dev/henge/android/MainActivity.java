@@ -563,6 +563,9 @@ public class MainActivity extends Activity {
             c.addView(dnote);
         }
         c.addView(hairline());
+        c.addView(choiceRow("Sound", new String[]{"On", "Off"}, "off".equals(prefs.getString("sound", "on")) ? 1 : 0,
+                i -> { prefs.edit().putString("sound", i == 0 ? "on" : "off").apply(); render(true); }));
+        c.addView(hairline());
         c.addView(choiceRow("CPU engine", ENGINE_LABELS, java.util.Arrays.asList(ENGINE_MODES).indexOf(engineMode()),
                 i -> { prefs.edit().putString("engine", ENGINE_MODES[i]).apply(); render(true); }));
         TextView enote = text(ENGINE_NOTES[Math.max(0, java.util.Arrays.asList(ENGINE_MODES).indexOf(engineMode()))], 13, DIM, false);
