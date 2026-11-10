@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 /* Opens dir/name (the app's own Vulkan driver) in a child of Android's vendor-driver linker namespace and
-   answers its vk_icdGetInstanceProcAddr, or NULL; reims_turnip_error says what happened either way. */
+   answers a vkGetInstanceProcAddr for it (its ICD entry point, or one over its Android hardware module), or NULL; reims_turnip_error says what happened either way. */
 void *reims_turnip_open(const char *dir, const char *name);
 const char *reims_turnip_error(void);
 #ifdef __cplusplus

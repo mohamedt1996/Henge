@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <math.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -30,8 +31,7 @@ typedef struct {
     int want_update, incremental;
     uint32_t w, h;                 /* what the viewer was told */
     int buttons;                   /* last RFB button mask */
-    int px, py;                    /* where the viewer's pointer was */
-    int have_pointer;
+    uint64_t pressed_at;           /* ms: when a button last went down */
 } Client;
 
 static int send_all(int fd, const void *p, size_t n) {
@@ -161,12 +161,134 @@ static int keysym_code(uint32_t k) {
     return -1;
 }
 
+/* ---- The pointer ----
+   The Mac's mouse is relative, and macOS accelerates it; the viewer's pointer is a place on the screen.
+   One thread walks the Mac's pointer to that place: it sends a step, waits until the guest's cursor has
+   answered it (hv_vm_pointer: the display's own cursor position), and only then measures again. Sending
+   the whole remaining distance at every viewer event, as this did, applied it several times over before
+   the guest had moved once, so the pointer overshot, was pulled back, and shook around the finger. */
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int x, y, have;  /* where the viewer wants the pointer */
+    int settled;     /* the Mac's pointer is there (or as near as it gets) */
+    int started;
+} P = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
+
+static uint64_t now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
+}
+
+static void pointer_settled(int x, int y) {
+    pthread_mutex_lock(&P.mu);
+    if (P.x == x && P.y == y) P.settled = 1; /* else the viewer moved on meanwhile */
+    pthread_mutex_unlock(&P.mu);
+}
+
+#define POINTER_NEAR 6      /* within this the step is the distance itself */
+#define POINTER_STEP 300    /* the longest step */
+#define POINTER_ANSWER_MS 500 /* a slow guest answers late: a second step on top of an unanswered one is the shake */
+#define POINTER_BLIND_MS 3000
+
+static void *pointer_thread(void *unused) {
+    (void)unused;
+    int ox = 0, oy = 0, have_o = 0;      /* the last place sent blind */
+    int waiting = 0, gx0 = 0, gy0 = 0;   /* a step is out: where the guest was when it left */
+    int sx = 0, sy = 0, silent = 0;
+    uint64_t sent_at = 0, blind_until = 0;
+    double gain = 1;                     /* guest pixels per unit sent, as last seen */
+    for (;;) {
+        pthread_mutex_lock(&P.mu);
+        while (!P.have || P.settled) pthread_cond_wait(&P.cv, &P.mu);
+        int tx = P.x, ty = P.y;
+        pthread_mutex_unlock(&P.mu);
+        uint64_t now = now_ms();
+        int gx, gy;
+        if (now < blind_until || hv_vm_pointer(&gx, &gy) != 0) {
+            /* No cursor to measure against (the boot screen, or a guest that is not answering):
+               the viewer's own movement, as it is. */
+            if (have_o) hv_vm_mouse_move(tx - ox, ty - oy);
+            ox = tx, oy = ty, have_o = 1, waiting = 0;
+            pointer_settled(tx, ty);
+            continue;
+        }
+        if (waiting) {
+            int answered = gx != gx0 || gy != gy0;
+            if (!answered && now - sent_at < POINTER_ANSWER_MS) { usleep(2000); continue; }
+            if (answered) {
+                silent = 0;
+                double sent = sqrt((double)sx * sx + (double)sy * sy);
+                double went = sqrt((double)(gx - gx0) * (gx - gx0) + (double)(gy - gy0) * (gy - gy0));
+                if (sent >= 6) {
+                    double g = went / sent;
+                    g = g < 0.3 ? 0.3 : g > 8 ? 8 : g;
+                    gain = 0.3 * gain + 0.7 * g;
+                }
+            } else if (++silent >= 3) {
+                /* Steps go out and the cursor never moves: stop steering by it for a while. */
+                silent = 0, blind_until = now + POINTER_BLIND_MS;
+                ox = tx, oy = ty, have_o = 1, waiting = 0;
+                pointer_settled(tx, ty);
+                continue;
+            }
+            waiting = 0;
+        }
+        int ex = tx - gx, ey = ty - gy;
+        if (abs(ex) <= 1 && abs(ey) <= 1) {
+            ox = tx, oy = ty, have_o = 1;
+            pointer_settled(tx, ty);
+            continue;
+        }
+        int big = abs(ex) > abs(ey) ? abs(ex) : abs(ey);
+        double scale;
+        if (big <= POINTER_NEAR) scale = gain > 1 ? 1 / gain : 1;
+        else {
+            scale = 0.75 / gain;
+            if (scale > 2) scale = 2;
+            if (big * scale > POINTER_STEP) scale = (double)POINTER_STEP / big;
+        }
+        sx = (int)lround(ex * scale), sy = (int)lround(ey * scale);
+        if (!sx && abs(ex) > 1) sx = ex > 0 ? 1 : -1;
+        if (!sy && abs(ey) > 1) sy = ey > 0 ? 1 : -1;
+        hv_vm_mouse_move(sx, sy);
+        waiting = 1, gx0 = gx, gy0 = gy, sent_at = now;
+    }
+    return NULL;
+}
+
+static void pointer_target(int x, int y) {
+    pthread_mutex_lock(&P.mu);
+    if (!P.started) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, pointer_thread, NULL) == 0) pthread_detach(t), P.started = 1;
+    }
+    if (!P.have || P.x != x || P.y != y) P.x = x, P.y = y, P.have = 1, P.settled = 0;
+    pthread_cond_signal(&P.cv);
+    pthread_mutex_unlock(&P.mu);
+}
+
+/* A button changes where the pointer is, not where it was heading: wait (briefly) for it to arrive. */
+static void pointer_wait(int ms) {
+    for (uint64_t until = now_ms() + (uint64_t)ms; now_ms() < until; usleep(2000)) {
+        pthread_mutex_lock(&P.mu);
+        int there = P.settled || !P.started;
+        pthread_mutex_unlock(&P.mu);
+        if (there) return;
+    }
+}
+
 static void pointer_event(Client *c, int mask, int x, int y) {
-    int gx, gy;
-    if (hv_vm_pointer(&gx, &gy) == 0) hv_vm_mouse_move(x - gx, y - gy);
-    else if (c->have_pointer) hv_vm_mouse_move(x - c->px, y - c->py);
-    c->px = x, c->py = y, c->have_pointer = 1;
+    pointer_target(x, y);
     static const int map[3] = {0, 2, 1}; /* RFB: 1 left, 2 middle, 4 right */
+    if ((mask ^ c->buttons) & 7) {
+        pointer_wait(800);
+        /* macOS misses a press let go at once: a tap holds for a moment. */
+        uint64_t held = now_ms() - c->pressed_at;
+        if ((c->buttons & 7 & ~mask) && held < 60) usleep((useconds_t)(60 - held) * 1000);
+        if (mask & 7 & ~c->buttons) c->pressed_at = now_ms();
+    }
     for (int b = 0; b < 3; b++) {
         int was = c->buttons >> b & 1, now = mask >> b & 1;
         if (was != now) hv_vm_mouse_button(map[b], now);

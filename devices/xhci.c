@@ -699,7 +699,10 @@ void hv_xhci_key(HvXhci *x, uint8_t usage, int down) {
             s[7] = 0;
         }
     }
+    /* Full (a guest that is not reading): the newest report takes the last place, so the state the guest
+       ends on is the true one. Dropping it left a released key held, repeating. */
     if (x->rtail - x->rhead < HV_XHCI_REPORTS) memcpy(x->reports[x->rtail++ % HV_XHCI_REPORTS], s, 8);
+    else memcpy(x->reports[(x->rtail - 1) % HV_XHCI_REPORTS], s, 8);
     pthread_mutex_unlock(&x->mu);
     hv_machine_wake(x->m);
 }

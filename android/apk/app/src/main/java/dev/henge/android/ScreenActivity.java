@@ -32,6 +32,7 @@ public class ScreenActivity extends Activity {
     private RfbView view;
     private EditText keys;
     private GpuView gpu; /* Graphics: Vulkan: the app draws the screen; VNC only carries input */
+    private static final String FILLER = " ";
 
     @Override
     protected void onCreate(Bundle saved) {
@@ -55,21 +56,44 @@ public class ScreenActivity extends Activity {
         keys.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
                 | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
         keys.setAlpha(0f);
+        // No full-screen "extract" editor in landscape: it would cover the Mac.
+        keys.setImeOptions(android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI
+                | android.view.inputmethod.EditorInfo.IME_FLAG_NO_FULLSCREEN
+                | android.view.inputmethod.EditorInfo.IME_ACTION_NONE);
+        // The field always holds at least one character (a space), so Backspace always has something to
+        // delete and the keyboard keeps reporting it: an empty field swallows it on many keyboards.
+        keys.setText(FILLER);
+        keys.setSelection(FILLER.length());
         keys.addTextChangedListener(new TextWatcher() {
-            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) { }
+            private String removed = "";
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+                removed = s.subSequence(start, start + count).toString();
+            }
             @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
-                for (int i = 0; i < before; i++) view.tapKey(0xff08, false); // deletions: Backspace
-                for (int i = start; i < start + count; i++) view.typeChar(s.charAt(i));
+                // A keyboard that composes replaces the whole word at each letter: only what differs is typed.
+                String added = s.subSequence(start, start + count).toString();
+                int same = 0;
+                while (same < removed.length() && same < added.length() && removed.charAt(same) == added.charAt(same)) same++;
+                for (int i = same; i < removed.length(); i++) view.tapKey(0xff08, false); // deletions: Backspace
+                for (int i = same; i < added.length(); i++) view.typeChar(added.charAt(i));
             }
             @Override public void afterTextChanged(Editable e) {
-                if (e.length() > 64) { keys.removeTextChangedListener(this); e.clear(); keys.addTextChangedListener(this); }
+                if (e.length() == 0 || e.length() > 64) {
+                    keys.removeTextChangedListener(this);
+                    keys.setText(FILLER);
+                    keys.setSelection(FILLER.length());
+                    keys.addTextChangedListener(this);
+                }
             }
         });
         keys.setOnKeyListener((v, code, ev) -> {
-            if (ev.getAction() != KeyEvent.ACTION_DOWN) return false;
-            if (code == KeyEvent.KEYCODE_DEL) { view.tapKey(0xff08, false); return true; }
-            if (code == KeyEvent.KEYCODE_ENTER) { view.tapKey(0xff0d, false); return true; }
-            return false;
+            if (code != KeyEvent.KEYCODE_ENTER) return false; // Backspace goes through the field's text
+            if (ev.getAction() == KeyEvent.ACTION_DOWN) view.tapKey(0xff0d, false);
+            return true;
+        });
+        keys.setOnEditorActionListener((v, action, ev) -> {
+            if (ev == null) view.tapKey(0xff0d, false); // the keyboard's own Return; a key event came through above
+            return true;
         });
         root.addView(keys, new FrameLayout.LayoutParams(1, 1));
 
@@ -148,13 +172,17 @@ public class ScreenActivity extends Activity {
         }
 
         void connect() {
+            synchronized (outbox) { outbox.clear(); }
             reader = new Thread(this::loop, "rfb");
             reader.start();
+            writer = new Thread(this::writeLoop, "rfb-input");
+            writer.start();
         }
 
         void disconnect() {
             try { if (sock != null) sock.close(); } catch (IOException ignored) { }
             if (reader != null) reader.interrupt();
+            if (writer != null) writer.interrupt();
         }
 
         private void loop() {
@@ -243,8 +271,33 @@ public class ScreenActivity extends Activity {
             out.flush();
         }
 
+        /* Input goes out from one thread, in the order it happened. (A thread per message let a key's
+           release overtake its press, which left the key held on the Mac, repeating; and let pointer
+           positions arrive out of order, which shook the pointer.) */
+        private final java.util.ArrayDeque<byte[]> outbox = new java.util.ArrayDeque<>();
+        private Thread writer;
+
         private void sendAsync(byte[] b) {
-            new Thread(() -> { try { send(b); } catch (IOException ignored) { } }).start();
+            synchronized (outbox) {
+                // A move with the same buttons as the move still waiting replaces it: only the latest matters.
+                byte[] last = outbox.peekLast();
+                if (b[0] == 5 && last != null && last[0] == 5 && last[1] == b[1]) outbox.pollLast();
+                if (outbox.size() < 4096) outbox.addLast(b);
+                outbox.notify();
+            }
+        }
+
+        private void writeLoop() {
+            while (true) {
+                byte[] b;
+                synchronized (outbox) {
+                    while (outbox.isEmpty()) {
+                        try { outbox.wait(); } catch (InterruptedException e) { return; }
+                    }
+                    b = outbox.pollFirst();
+                }
+                try { send(b); } catch (IOException ignored) { } // no Mac to hear it: dropped
+            }
         }
 
         // ---- drawing ----

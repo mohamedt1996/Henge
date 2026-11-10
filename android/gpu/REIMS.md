@@ -129,6 +129,22 @@ through the shared file (`cursor_x/y/seq`, header version 2) and the engine read
 reims mode, so the VNC framebuffer, the boot framebuffer and the Mac's screen are one coordinate
 space; and a mouse is a mouse in the app (hover, buttons, wheel through as they are), not a finger.
 
+0.3.15, input on the open screen. The pointer shook around the finger and a letter typed itself
+several times: the app sent each input message from a thread of its own, so they arrived out of
+order (a key's release before its press leaves it held on the Mac, repeating; pointer places
+arrive shuffled), and the engine sent the whole remaining distance at every pointer event, several
+times over before the guest's cursor had moved once. The app now sends input from one thread, in
+order; the engine walks the pointer with one thread that sends a step and waits for the guest's
+cursor to answer before measuring again (android/vnc.c), and a button waits for the pointer to
+arrive. The soft keyboard's hidden field types only what changed and is never empty, so Backspace
+keeps working after everything is deleted.
+
+Turnip was never in an APK before 0.3.15: Mesa's Android build exports one symbol, `HMI` (the
+driver as Android's hardware module), not `vk_icdGetInstanceProcAddr`, so the CI's check refused
+it and the step was allowed to fail. `turnip_load.cpp` now opens the module's `vk0` device as
+Android's loader does and answers a `vkGetInstanceProcAddr` over it; the CI fails if the APK
+would go out without the driver.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

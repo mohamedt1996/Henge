@@ -84,7 +84,7 @@ jobs:
 
       # Graphics: reims: Turnip, Mesa's open Adreno Vulkan driver, as an alternative to the system's
       # (the app's "Vulkan driver" setting). A prebuilt for Android (KGSL) from whitebelyash's CI of
-      # upstream Mesa; MIT. A failure here leaves the APK without it (the setting then says so).
+      # upstream Mesa; MIT. The step after it fails the build if the APK would go out without it.
       - name: "Turnip for the tablet (Graphics: reims, Vulkan driver: Turnip)"
         continue-on-error: true
         env:
@@ -98,13 +98,20 @@ jobs:
           ls -la
           for z in *.zip; do mkdir -p "x/${z%.zip}" && unzip -q -o "$z" -d "x/${z%.zip}"; done
           find x -type f \( -name '*.so' -o -name 'meta.json' \) -print
-          # The adrenotools zip's meta.json names the library; else the only .so.
-          so=$(find x -type f -name '*.so' | head -1)
-          [ -n "$so" ] || { echo "no .so in the release"; exit 1; }
+          # The plain build before the "sync" one; the adrenotools zip holds the one library.
+          so=$(find x -type f -name '*.so' | sort | grep -v -i sync | head -1)
+          [ -n "$so" ] || so=$(find x -type f -name '*.so' | sort | head -1)
+          [ -n "$so" ] || { echo "::warning::Turnip: no .so in the release; the APK has no Turnip"; exit 1; }
           file "$so"; readelf -d "$so" | grep NEEDED || true
-          readelf -Ws "$so" | grep -q vk_icdGetInstanceProcAddr || { echo "not a Vulkan ICD"; exit 1; }
+          # Mesa for Android exports one symbol, HMI (the driver as Android's hardware module), which
+          # turnip_load.cpp opens; a desktop-style build exports the ICD's entry point instead.
+          syms=$(readelf -W --dyn-syms "$so" | awk '$7 != "UND" {print $8}')
+          echo "$syms" | grep -q -x -e HMI -e vk_icdGetInstanceProcAddr || { echo "::warning::Turnip: neither HMI nor vk_icdGetInstanceProcAddr exported; the APK has no Turnip"; exit 1; }
           cp "$so" ../android/apk/app/src/main/jniLibs/arm64-v8a/libvulkan_freedreno.so
           echo "turnip: $so -> libvulkan_freedreno.so ($(stat -c %s "$so") bytes)"
+
+      - name: Turnip is in the APK's libraries
+        run: ls -la android/apk/app/src/main/jniLibs/arm64-v8a/ && test -s android/apk/app/src/main/jniLibs/arm64-v8a/libvulkan_freedreno.so
 
       - uses: actions/setup-java@v4
         with:
