@@ -118,6 +118,7 @@ static _Unwind_Reason_Code take_frame(struct _Unwind_Context *ctx, void *arg) {
     if (pc && f->n < (int)(sizeof f->pc / sizeof *f->pc)) f->pc[f->n++] = pc;
     return f->n < (int)(sizeof f->pc / sizeof *f->pc) ? _URC_NO_REASON : _URC_END_OF_STACK;
 }
+static void write_frames(void);
 static void write_backtrace(int sig, siginfo_t *si) {
     char out[512];
     size_t m = 0;
@@ -127,6 +128,11 @@ static void write_backtrace(int sig, siginfo_t *si) {
     m = put_hex(out, m, sizeof out, (uint64_t)si->si_code);
     m = put_str(out, m, sizeof out, "\n");
     (void)!write(log_fd, out, m);
+    write_frames();
+}
+static void write_frames(void) {
+    char out[512];
+    size_t m;
     Frames f = {{0}, 0};
     _Unwind_Backtrace(take_frame, &f);
     for (int i = 0; i < f.n; i++) {
@@ -198,9 +204,89 @@ static long futex(uint32_t *word, int op, uint32_t val, const struct timespec *t
     return syscall(SYS_futex, word, op, val, t, NULL, 0);
 }
 
+/* ---- Where the GPU's threads are when the guest waits on it ----
+   The guest's driver reports a wait of 2 s for the GPU ("stamp wait report") when a command buffer takes that
+   long; on the tablet they took tens of seconds each, with nothing in the log to say doing what. On such a
+   report (at most every 30 s, 10 times a run) every busy thread of this process, and every thread of the GPU
+   library's by name, writes its backtrace to the log: a sample of where the time goes. The library's symbols
+   are in the CI's "symbols" artifact for the same build, for the offsets dladdr cannot name. */
+#include <dirent.h>
+#include <sys/prctl.h>
+#define SAMPLE_SIG (SIGRTMAX - 3)
+static volatile int sample_wanted;
+static void on_sample(int sig, siginfo_t *si, void *uc) {
+    (void)sig, (void)si, (void)uc;
+    if (log_fd < 0) return;
+    int saved = errno;
+    char name[32] = "?", out[160];
+    prctl(PR_GET_NAME, name, 0, 0, 0);
+    size_t m = 0;
+    m = put_str(out, m, sizeof out, "henge-gpu: reims: sample: thread ");
+    m = put_str(out, m, sizeof out, name);
+    m = put_str(out, m, sizeof out, " is at:\n");
+    (void)!write(log_fd, out, m);
+    write_frames();
+    errno = saved;
+}
+static unsigned long long thread_ticks(const char *tid) {
+    char path[64], buf[512];
+    snprintf(path, sizeof path, "/proc/self/task/%s/stat", tid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    char *p = strrchr(buf, ')'); /* past the name, which may hold spaces */
+    unsigned long long ut = 0, st = 0;
+    if (!p || sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &ut, &st) != 2) return 0;
+    return ut + st;
+}
+static void sample_threads(void) {
+    static int installed;
+    if (!installed++) {
+        struct sigaction a = {0};
+        a.sa_sigaction = on_sample;
+        a.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&a.sa_mask);
+        sigaction(SAMPLE_SIG, &a, NULL);
+    }
+    enum { MAX = 96 };
+    static char tids[MAX][12];
+    static unsigned long long before[MAX];
+    int n = 0;
+    DIR *d = opendir("/proc/self/task");
+    if (!d) return;
+    for (struct dirent *e; (e = readdir(d)) && n < MAX;) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        snprintf(tids[n], sizeof tids[n], "%s", e->d_name);
+        before[n] = thread_ticks(tids[n]);
+        n++;
+    }
+    closedir(d);
+    usleep(400000);
+    long me = syscall(SYS_gettid);
+    int sent = 0;
+    for (int i = 0; i < n && sent < 14; i++) {
+        long tid = atol(tids[i]);
+        if (tid == me) continue;
+        char path[64], comm[32] = "";
+        snprintf(path, sizeof path, "/proc/self/task/%s/comm", tids[i]);
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) { ssize_t k = read(fd, comm, sizeof comm - 1); if (k > 0) comm[k] = 0; close(fd); }
+        int busy = thread_ticks(tids[i]) - before[i] >= 4; /* a tenth of the 400 ms on a CPU, at 100 ticks a second */
+        int ours = !strncmp(comm, "metal2vulkan", 12) || !strncmp(comm, "m2v", 3) || !strncmp(comm, "reims", 5) ||
+                   !strncmp(comm, "com.Metal", 9) || strstr(comm, "fifo") || strstr(comm, "FIFO");
+        if (!busy && !ours) continue;
+        if (syscall(SYS_tgkill, getpid(), tid, SAMPLE_SIG) == 0) sent++, usleep(40000); /* one at a time: lines stay together */
+    }
+    hlog("reims: sample: %d of %d threads sampled (the busy ones and the GPU library's)", sent, n);
+}
+
 static void on_log(void *ctx, RvgLogLevel level, const char *target, size_t tl, const char *msg, size_t ml) {
     (void)ctx, (void)level;
     hlog("reims %.*s: %.*s", (int)tl, target, (int)ml, msg);
+    if (ml >= 17 && !memcmp(msg, "stamp wait report", 17)) sample_wanted = 1;
 }
 
 /* ------------------------------------------------------------------ interrupts -- */
@@ -397,6 +483,13 @@ static void *beat_loop(void *arg) {
             if (h->ready && !h->stop) __atomic_store_n(&h->h->app_ready, 1, __ATOMIC_RELEASE); /* survives a header reset */
         }
         usleep(250000);
+        static uint64_t sampled_at;
+        static int samples;
+        if (sample_wanted && h->ready && samples < 10 && now_ns() - sampled_at > 30000000000ull) {
+            sampled_at = now_ns(), samples++;
+            sample_threads();
+        }
+        sample_wanted = 0;
         if (now_ns() - last > 10000000000ull && h->ready) {
             uint64_t guest = 0, host = 0;
             if (h->disp) rvg_display_present_counts(h->disp, &guest, &host);

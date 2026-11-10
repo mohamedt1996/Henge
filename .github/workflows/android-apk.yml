@@ -144,6 +144,21 @@ jobs:
           name: Henge-android
           path: Henge-android.apk
 
+      # libhengegpu.so before the APK strips it: the names for the offsets in the app's backtraces and
+      # thread samples ("pc 0x... libhengegpu.so" in henge.log), with addr2line or llvm-symbolizer.
+      - name: Symbols of libhengegpu.so
+        continue-on-error: true
+        run: |
+          mkdir -p symbols
+          find android/apk/app/build android/apk/app/.cxx -name libhengegpu.so -printf '%s %p\n' 2>/dev/null | sort -n | tail -3
+          so=$(find android/apk/app/build android/apk/app/.cxx -name libhengegpu.so -printf '%s %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)
+          [ -n "$so" ] && cp "$so" symbols/libhengegpu.so && file symbols/libhengegpu.so
+      - uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: symbols
+          path: symbols/
+
       - name: Publish a versioned release
         if: env.V != 'latest'
         uses: softprops/action-gh-release@v2

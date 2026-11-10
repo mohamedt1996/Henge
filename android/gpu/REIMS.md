@@ -182,6 +182,17 @@ What those say decides the next step: the per-commit comparison of every copied 
 metal2vulkan (`copied.rs`; it wants a log of dirty pages, which reims-vgpu takes from KVM alone)
 is the suspected cost, the frame's own round trip a small one.
 
+0.3.20 on the tablet (2026-11-10): the screen stopped at 391 presents, and the log says how. The
+guest waits for FIFO 1's stamp to reach 0x10e700; it holds 0x10e000, then 0x10e100, then 0x10e200,
+one step every twenty seconds or so, each step one pending `CMD=0x43` (ExecIndirect3: a Metal
+command buffer). So the GPU is not hung: each command buffer takes tens of seconds, the guest's
+driver gives up at 2 s, reports, and tries to resume a FIFO that was never faulted. The Mac's CPUs
+waited 2.6 s of 120 on GPU registers, so the time is not in the engine's hand-off either; it is
+inside the library's execution of a command buffer. 0.3.21 samples it: on a stamp wait report
+(every 30 s at most, ten a run) each busy thread and each of the library's threads writes its
+backtrace to the log (`sample: thread ... is at:`), and the CI keeps the unstripped
+libhengegpu.so as the `symbols` artifact to name the offsets.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
