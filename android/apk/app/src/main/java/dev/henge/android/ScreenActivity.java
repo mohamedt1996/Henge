@@ -49,6 +49,7 @@ public class ScreenActivity extends Activity {
         view = new RfbView(this);
         view.overlay = vulkan;
         view.macPointer = vulkan && "reims".equals(gpuMode);
+        view.trackpad = "trackpad".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("touch", "direct"));
         if (vulkan) view.setPointerIcon(android.view.PointerIcon.getSystemIcon(this, android.view.PointerIcon.TYPE_NULL));
         root.addView(view);
 
@@ -168,6 +169,11 @@ public class ScreenActivity extends Activity {
         boolean overlay;
         /* The screen under this view draws the Mac's own pointer (Graphics: reims): a mouse may be captured. */
         boolean macPointer;
+        /* Settings, Touch: Trackpad. The screen is a laptop's trackpad: a finger moves the Mac's pointer from
+           where it is, a tap clicks where it is. Nothing is steered to a place, so nothing depends on reading
+           the Mac's cursor back. */
+        boolean trackpad;
+        private float lastX, lastTouchY;
 
         RfbView(Context c) {
             super(c);
@@ -356,7 +362,11 @@ public class ScreenActivity extends Activity {
         }
 
         private final Runnable longPress = () -> {
-            if (!moved && !scrolling) { dragging = true; buttons = 1; pointer(1, downX, downY); performHapticFeedback(0); }
+            if (!moved && !scrolling) {
+                dragging = true; buttons = 1;
+                if (trackpad) relative(1, 0, 0); else pointer(1, downX, downY);
+                performHapticFeedback(0);
+            }
         };
 
         /** A mouse (or a trackpad in pointer mode): its position, buttons and wheel go through as they are;
@@ -465,7 +475,8 @@ public class ScreenActivity extends Activity {
                 downX = e.getX(); downY = e.getY(); downAt = e.getEventTime();
                 moved = dragging = scrolling = false;
                 buttons = 0;
-                pointer(0, downX, downY);
+                lastX = downX; lastTouchY = downY;
+                if (!trackpad) pointer(0, downX, downY);
                 postDelayed(longPress, 500);
                 return true;
             case MotionEvent.ACTION_POINTER_DOWN:
@@ -476,18 +487,30 @@ public class ScreenActivity extends Activity {
                     float dy = e.getY(1) - lastY;
                     if (Math.abs(dy) > 24) {
                         int b = dy < 0 ? 16 : 8; // wheel down / up
-                        pointer(b, e.getX(0), e.getY(0));
-                        pointer(0, e.getX(0), e.getY(0));
+                        if (trackpad) { relative(b, 0, 0); relative(0, 0, 0); }
+                        else { pointer(b, e.getX(0), e.getY(0)); pointer(0, e.getX(0), e.getY(0)); }
                         lastY = e.getY(1);
                     }
                     return true;
                 }
                 if (Math.hypot(e.getX() - downX, e.getY() - downY) > 12) { moved = true; removeCallbacks(longPress); }
+                if (trackpad) {
+                    // The finger's movement, a little faster than the finger: the Mac adds its own acceleration.
+                    if (moved || dragging) relative(buttons, (e.getX() - lastX) * 1.3f, (e.getY() - lastTouchY) * 1.3f);
+                    lastX = e.getX(); lastTouchY = e.getY();
+                    return true;
+                }
                 if (moved || dragging) pointer(buttons, e.getX(), e.getY());
                 return true;
             case MotionEvent.ACTION_UP:
                 removeCallbacks(longPress);
                 if (scrolling) return true;
+                if (trackpad) {
+                    if (dragging) relative(0, 0, 0);
+                    else if (!moved && e.getEventTime() - downAt < 500) { relative(1, 0, 0); relative(0, 0, 0); } // click where the pointer is
+                    buttons = 0;
+                    return true;
+                }
                 if (dragging) {
                     pointer(0, e.getX(), e.getY());
                 } else if (!moved && e.getEventTime() - downAt < 500) {

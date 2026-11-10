@@ -162,6 +162,16 @@ window here, so `android_port.py` leaves the probe out (0.3.17). And since such 
 library's death, not a status `host.c` can fall back from: a run that dies on Turnip marks Turnip
 as crashed for that build of the app, and the next start uses the system's driver, still on reims.
 
+0.3.18, the pointer again. On 0.3.16 the Mac's pointer still jumped between places a few hundred
+pixels apart (photographs show it in three or four places within one exposure). The engine's walk
+sent a step and measured again at the guest cursor's *first* move; a guest that answers one step in
+pieces (X then Y, or over a few frames) was then sent the rest a second time, and a simulation of
+such a guest throws the pointer from edge to edge exactly so. The walk now waits until the cursor
+has stood still for 40 ms before it measures, and logs a `hengevm: pointer:` line every two seconds
+while walking (target, cursor, step, answered and unanswered counts, the gain it has learned).
+Settings has Touch: Direct or Trackpad; Trackpad moves the pointer from where it is (the app's
+message 250, as a captured mouse does) and reads nothing back.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

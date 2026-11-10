@@ -563,6 +563,14 @@ public class MainActivity extends Activity {
             c.addView(dnote);
         }
         c.addView(hairline());
+        c.addView(choiceRow("Touch", new String[]{"Direct", "Trackpad"}, "trackpad".equals(prefs.getString("touch", "direct")) ? 1 : 0,
+                i -> { prefs.edit().putString("touch", i == 0 ? "direct" : "trackpad").apply(); render(true); }));
+        TextView tnote = text("trackpad".equals(prefs.getString("touch", "direct"))
+                ? "The screen is a trackpad: slide a finger to move the Mac's pointer, tap to click where it is, hold to drag, two fingers scroll."
+                : "The Mac's pointer goes where the finger is: tap to click there, hold to drag, two fingers scroll.", 13, DIM, false);
+        tnote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(tnote);
+        c.addView(hairline());
         c.addView(choiceRow("Sound", new String[]{"On", "Off"}, "off".equals(prefs.getString("sound", "on")) ? 1 : 0,
                 i -> { prefs.edit().putString("sound", i == 0 ? "on" : "off").apply(); render(true); }));
         c.addView(hairline());

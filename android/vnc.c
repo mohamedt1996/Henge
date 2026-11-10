@@ -192,12 +192,16 @@ static void pointer_settled(int x, int y) {
 #define POINTER_STEP 300    /* the longest step */
 #define POINTER_ANSWER_MS 500 /* a slow guest answers late: a second step on top of an unanswered one is the shake */
 #define POINTER_BLIND_MS 3000
+#define POINTER_QUIET_MS 40 /* the guest's cursor has stopped: over two of its frames without a move */
 
 static void *pointer_thread(void *unused) {
     (void)unused;
     int ox = 0, oy = 0, have_o = 0;      /* the last place sent blind */
     int waiting = 0, gx0 = 0, gy0 = 0;   /* a step is out: where the guest was when it left */
     int sx = 0, sy = 0, silent = 0;
+    int lx = 0, ly = 0, moving = 0;      /* the guest's cursor as last seen moving, for the quiet wait */
+    uint64_t moved_at = 0, said_at = 0;
+    unsigned steps = 0, answers = 0, silences = 0;
     uint64_t sent_at = 0, blind_until = 0;
     unsigned relative = 0;
     double gain = 1;                     /* guest pixels per unit sent, as last seen */
@@ -220,8 +224,16 @@ static void *pointer_thread(void *unused) {
         if (waiting) {
             int answered = gx != gx0 || gy != gy0;
             if (!answered && now - sent_at < POINTER_ANSWER_MS) { usleep(2000); continue; }
+            /* The guest may answer one step in pieces (X, then Y; or over a few of its frames): the step is
+               answered once its cursor has stood still for a moment, not at the first move. Measuring at the
+               first piece sent the rest again on top of it, which is the shake. */
             if (answered) {
-                silent = 0;
+                if (gx != lx || gy != ly || !moving) lx = gx, ly = gy, moved_at = now, moving = 1;
+                if (now - moved_at < POINTER_QUIET_MS && now - sent_at < POINTER_ANSWER_MS) { usleep(2000); continue; }
+            }
+            moving = 0;
+            if (answered) {
+                silent = 0, answers++;
                 double sent = sqrt((double)sx * sx + (double)sy * sy);
                 double went = sqrt((double)(gx - gx0) * (gx - gx0) + (double)(gy - gy0) * (gy - gy0));
                 if (sent >= 6) {
@@ -229,7 +241,7 @@ static void *pointer_thread(void *unused) {
                     g = g < 0.3 ? 0.3 : g > 8 ? 8 : g;
                     gain = 0.3 * gain + 0.7 * g;
                 }
-            } else if (++silent >= 3) {
+            } else if (silences++, ++silent >= 3) {
                 /* Steps go out and the cursor never moves: stop steering by it for a while. */
                 silent = 0, blind_until = now + POINTER_BLIND_MS;
                 ox = tx, oy = ty, have_o = 1, waiting = 0;
@@ -256,7 +268,13 @@ static void *pointer_thread(void *unused) {
         if (!sx && abs(ex) > 1) sx = ex > 0 ? 1 : -1;
         if (!sy && abs(ey) > 1) sy = ey > 0 ? 1 : -1;
         hv_vm_mouse_move(sx, sy);
-        waiting = 1, gx0 = gx, gy0 = gy, sent_at = now;
+        waiting = 1, moving = 0, gx0 = gx, gy0 = gy, sent_at = now, steps++;
+        /* What the pointer is doing, every two seconds while it is being walked: for the log. */
+        if (now - said_at >= 2000) {
+            said_at = now;
+            fprintf(stderr, "hengevm: pointer: to %d,%d from %d,%d, step %d,%d; %u steps, %u answered, %u unanswered, gain %.2f\n",
+                    tx, ty, gx, gy, sx, sy, steps, answers, silences, gain);
+        }
     }
     return NULL;
 }
@@ -296,18 +314,18 @@ static void relative_event(Client *c, int mask, int dx, int dy) {
 
 static void pointer_event(Client *c, int mask, int x, int y) {
     pointer_target(x, y);
-    if ((mask ^ c->buttons) & 7) {
-        pointer_wait(800);
-        /* macOS misses a press let go at once: a tap holds for a moment. */
-        uint64_t held = now_ms() - c->pressed_at;
-        if ((c->buttons & 7 & ~mask) && held < 60) usleep((useconds_t)(60 - held) * 1000);
-        if (mask & 7 & ~c->buttons) c->pressed_at = now_ms();
-    }
+    if ((mask ^ c->buttons) & 7) pointer_wait(800);
     buttons_event(c, mask);
 }
 
 static void buttons_event(Client *c, int mask) {
     static const int map[3] = {0, 2, 1}; /* RFB: 1 left, 2 middle, 4 right */
+    if ((mask ^ c->buttons) & 7) {
+        /* macOS misses a press let go at once: a tap holds for a moment. */
+        uint64_t held = now_ms() - c->pressed_at;
+        if ((c->buttons & 7 & ~mask) && held < 60) usleep((useconds_t)(60 - held) * 1000);
+        if (mask & 7 & ~c->buttons) c->pressed_at = now_ms();
+    }
     for (int b = 0; b < 3; b++) {
         int was = c->buttons >> b & 1, now = mask >> b & 1;
         if (was != now) hv_vm_mouse_button(map[b], now);
