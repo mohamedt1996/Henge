@@ -284,6 +284,19 @@ is not known until a run draws.
 
 Version 0.3.27.
 
+0.3.27 on the tablet (2026-11-10): the RAM is on the guest's pages (`mapped at 0x73a5600000`), every
+task was made, and the desktop drew: 27 frames a second at best, the Mac's CPUs waiting 2 to 4 s of
+30 on GPU registers where they waited 18 to 22. Then Safari opened apple.com, and from about 400 s
+everything slowed together: a frame from 10 ms to 100-480 ms to draw, the copies' comparisons from
+under 0.5 ms a MiB to about 10, the Mac's CPUs to a quarter of their instructions, a register's way
+to the app from 40 us to 446. Things that share only the tablet slowing at once is the tablet short
+of something, memory (4 GB of RAM now in memory, the copies at 190-224 MiB, Safari) or heat, and the
+log could not say which. 0.3.28 puts the tablet's state in the heartbeat: memory available, swap
+used, the kernel's memory pressure, the hottest sensor, and whether the fastest core is held below
+its top frequency.
+
+Version 0.3.28.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

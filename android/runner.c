@@ -30,6 +30,72 @@ static void curl_global_init_all(void) { curl_global_init(CURL_GLOBAL_ALL); }
 
 void hv_android_share_with_app(const char *path); /* pvg_android.c */
 
+/* The tablet's own state in the heartbeat: when the whole Mac slows at once (0.3.27: frames from 10 ms to
+   400 ms, the copies' comparisons twenty times slower, the Mac's CPUs a quarter as fast, all together) the
+   cause is the tablet's, and the log had nothing to tell memory from heat. So: the memory Android can still
+   give, how much swap (zram, or Xiaomi's "memory extension" on flash) is in use, the kernel's memory pressure
+   (the share of the last 10 s in which something waited for memory), the hottest sensor, and whether the
+   fastest core is being held below its top frequency. Each part is left out where the tablet does not let
+   the app read it. */
+static long long file_number(const char *path) {
+    FILE *f = fopen(path, "r");
+    long long v = -1;
+    if (f) {
+        if (fscanf(f, "%lld", &v) != 1) v = -1;
+        fclose(f);
+    }
+    return v;
+}
+
+static void host_state(FILE *out) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (f) {
+        char line[160];
+        long long total = -1, avail = -1, swap_total = -1, swap_free = -1, v;
+        while (fgets(line, sizeof line, f)) {
+            if (sscanf(line, "MemTotal: %lld kB", &v) == 1) total = v;
+            else if (sscanf(line, "MemAvailable: %lld kB", &v) == 1) avail = v;
+            else if (sscanf(line, "SwapTotal: %lld kB", &v) == 1) swap_total = v;
+            else if (sscanf(line, "SwapFree: %lld kB", &v) == 1) swap_free = v;
+        }
+        fclose(f);
+        if (total > 0 && avail >= 0) fprintf(out, " | tablet: %lld of %lld MB of memory available", avail >> 10, total >> 10);
+        if (swap_total > 0 && swap_free >= 0) fprintf(out, ", %lld of %lld MB of swap used", (swap_total - swap_free) >> 10, swap_total >> 10);
+    }
+    f = fopen("/proc/pressure/memory", "r");
+    if (f) {
+        char line[160];
+        double some = -1, full = -1, v;
+        while (fgets(line, sizeof line, f)) {
+            if (sscanf(line, "some avg10=%lf", &v) == 1) some = v;
+            else if (sscanf(line, "full avg10=%lf", &v) == 1) full = v;
+        }
+        fclose(f);
+        if (some >= 0) fprintf(out, ", waiting for memory %.0f%% of the time (everything stalled %.0f%%)", some, full < 0 ? 0 : full);
+    }
+    long long hottest = -1;
+    for (int z = 0; z < 120; z++) {
+        char path[96];
+        snprintf(path, sizeof path, "/sys/class/thermal/thermal_zone%d/temp", z);
+        long long milli = file_number(path);
+        if (milli > 1000 && milli < 130000 && milli > hottest) hottest = milli; /* millidegrees; skips unset and absurd ones */
+    }
+    if (hottest > 0) fprintf(out, ", hottest sensor %lld C", hottest / 1000);
+    /* The last CPU is the fastest kind on these chips: its allowed top frequency against its real one. */
+    long ncpu = sysconf(_SC_NPROCESSORS_CONF);
+    if (ncpu > 0) {
+        char path[96];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/cpufreq/scaling_max_freq", ncpu - 1);
+        long long allowed = file_number(path);
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", ncpu - 1);
+        long long top = file_number(path);
+        if (allowed > 0 && top > 0) {
+            if (allowed < top) fprintf(out, ", fastest core held to %.1f of %.1f GHz", allowed / 1e6, top / 1e6);
+            else fprintf(out, ", fastest core not held back");
+        }
+    }
+}
+
 static void usage(void) {
     fprintf(stderr,
             "usage (both forms also take --engine jit|gunyah): hengevm-android --install FOLDER [--release 15.6.1] [--ipsw FILE] [--disk-gb 64] [--rom FILE] [--cache DIR] [--ram MB] [--cpus N]\n"
@@ -210,6 +276,7 @@ static void *install_heartbeat(void *arg) {
         }
         if (disk != last_disk || cmds != last_gpu) moved = 1;
         last_disk = disk, last_gpu = cmds;
+        host_state(stderr);
         if (u) fprintf(stderr, " | usb: %s, kernel driver %s (status %#x)", u->rom_on ? "iBoot has it" : "iBoot let go",
                        u->pci_on ? "on" : "not started", u->vio.status);
         fputc('\n', stderr);
