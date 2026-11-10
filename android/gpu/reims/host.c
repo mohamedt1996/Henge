@@ -517,6 +517,16 @@ static int bring_up(Host *h) {
         h->ram_fd = open(x->ram_file, O_RDWR | O_CLOEXEC);
         if (h->ram_fd >= 0) break;
         if (i == 0 || i == 300) hlog("reims: guest RAM %s: %s%s", x->ram_file, strerror(errno), i ? "; giving up" : "; retrying");
+        /* The engine's in-memory RAM (HV_RAM_MEMFD) is opened through /proc/<engine>/fd: where Android refuses
+           that, leave a note the app reads at the next start, which then asks for the RAM file as before. */
+        if (i == 30 && !strncmp(x->ram_file, "/proc/", 6) && h->home[0]) {
+            char note[1100];
+            snprintf(note, sizeof note, "%s/ram-memfd-failed", h->home);
+            int nf = open(note, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+            if (nf >= 0) close(nf);
+            hlog("reims: the engine's in-memory RAM cannot be opened from the app; the next start uses the RAM file");
+            return -1;
+        }
         if (i == 300) return -1;
         usleep(100000);
     }

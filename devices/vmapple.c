@@ -12,6 +12,7 @@ __attribute__((weak)) int hv_pvg_external_create(HvMachine *m, HvGic *gic, uint6
 #include <errno.h>
 #ifdef __linux__
 #include "plat_linux.h"
+#include <sys/syscall.h>
 #else
 #include <mach/mach.h>
 #include <mach/mach_error.h>
@@ -289,6 +290,30 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
         uint8_t *free_of_footprint = alloc_no_footprint(ram_size);
         if (free_of_footprint) b->ram = free_of_footprint;
     }
+#ifdef __linux__
+    /* HV_RAM_MEMFD (Android): guest RAM in memory the kernel never writes to storage (a memfd), still a file
+       another process can map: its name for them is /proc/<this pid>/fd/<n>, which HV_RAM_FILE becomes. A
+       regular file on the tablet's flash is written back by the kernel for as long as the guest writes its
+       RAM, which is always: gigabytes of flash writes an hour, a write-protection fault on every page after
+       each writeback, and the guest's CPUs held back whenever the dirty pages outrun the flash. (Linux has no
+       per-app memory ledger to dodge, which is what the file is for on iOS.) No prefault: memory is taken as
+       the guest touches it. */
+    if (b->ram == MAP_FAILED && ram_file && *ram_file && getenv("HV_RAM_MEMFD")) {
+        int fd = (int)syscall(SYS_memfd_create, "henge-ram", 0u);
+        if (fd >= 0 && ftruncate(fd, (off_t)ram_size) == 0)
+            b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (b->ram != MAP_FAILED) {
+            static char name[64];
+            snprintf(name, sizeof name, "/proc/%d/fd/%d", (int)getpid(), fd); /* the fd stays open: it is the name */
+            setenv("HV_RAM_FILE", name, 1);
+            fprintf(stderr, "hengevm: guest RAM (%llu MB) is in memory (%s), not written to storage\n",
+                    (unsigned long long)(ram_size >> 20), name);
+        } else {
+            fprintf(stderr, "hengevm: guest RAM in memory failed (%s); a file instead\n", strerror(errno));
+            if (fd >= 0) close(fd);
+        }
+    }
+#endif
     if (b->ram == MAP_FAILED && ram_file && *ram_file) {
         int fd = open(ram_file, O_RDWR | O_CREAT | O_TRUNC, 0600);
         if (fd >= 0) {

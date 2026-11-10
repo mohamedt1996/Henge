@@ -571,6 +571,16 @@ public class MainActivity extends Activity {
         tnote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(tnote);
         c.addView(hairline());
+        c.addView(choiceRow("Mac's memory", new String[]{"In RAM", "On storage"}, "storage".equals(prefs.getString("ram", "memory")) ? 1 : 0,
+                i -> { prefs.edit().putString("ram", i == 0 ? "memory" : "storage").apply(); render(true); }));
+        TextView mnote = text("storage".equals(prefs.getString("ram", "memory"))
+                ? "The Mac's RAM is a file on the tablet's storage: slower, and it writes to the flash all the time, but Android "
+                    + "can make room by itself when memory is short."
+                : "The Mac's RAM is held in the tablet's memory: faster, nothing written to storage. If Android closes the app "
+                    + "under memory pressure, lower RAM or pick On storage.", 13, DIM, false);
+        mnote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(mnote);
+        c.addView(hairline());
         c.addView(choiceRow("Sound", new String[]{"On", "Off"}, "off".equals(prefs.getString("sound", "on")) ? 1 : 0,
                 i -> { prefs.edit().putString("sound", i == 0 ? "on" : "off").apply(); render(true); }));
         c.addView(hairline());

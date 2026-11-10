@@ -244,6 +244,7 @@ public class ScreenActivity extends Activity {
                         if (row.length < w) { row = new int[w]; bytes = new byte[w * 4]; }
                         for (int yy = 0; yy < h; yy++) {
                             in.readFully(bytes, 0, w * 4);
+                            if (overlay) continue; // the GPU view draws the Mac: this picture is never shown
                             for (int i = 0; i < w; i++) {
                                 int b = bytes[i * 4] & 0xff, g = bytes[i * 4 + 1] & 0xff, rr = bytes[i * 4 + 2] & 0xff;
                                 row[i] = 0xff000000 | rr << 16 | g << 8 | b;

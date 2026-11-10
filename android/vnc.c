@@ -32,6 +32,8 @@ typedef struct {
     uint32_t w, h;                 /* what the viewer was told */
     int buttons;                   /* last RFB button mask */
     uint64_t pressed_at;           /* ms: when a button last went down */
+    uint64_t sent_sum;             /* what the last frame sent looked like (frame_sum) */
+    int sent_any;
 } Client;
 
 static int send_all(int fd, const void *p, size_t n) {
@@ -69,10 +71,32 @@ static int current_frame(const uint8_t **px, uint32_t *w, uint32_t *h, uint32_t 
     return -1;
 }
 
+/* A sum over a sample of the picture (every 8th pixel of every 8th row), to tell a changed one from the same. */
+static uint64_t frame_sum(const uint8_t *src, uint32_t w, uint32_t h, uint32_t stride) {
+    uint64_t sum = 1469598103934665603ull ^ ((uint64_t)w << 32 | h);
+    if (!src) return sum;
+    for (uint32_t y = 0; y < h; y += 8) {
+        const uint8_t *row = src + (size_t)y * stride;
+        for (uint32_t x = 0; x < w; x += 8) {
+            uint32_t v;
+            memcpy(&v, row + (size_t)x * 4, 4);
+            sum = (sum ^ v) * 1099511628211ull;
+        }
+    }
+    return sum;
+}
+
+/* 0 sent, 1 nothing to send (an incremental request for a picture that has not changed), -1 the viewer is gone. */
 static int send_frame(Client *c) {
     const uint8_t *src = NULL;
     uint32_t w = BLANK_W, h = BLANK_H, stride = 0;
     int have = current_frame(&src, &w, &h, &stride) == 0;
+    /* The same picture again: nothing. With the GPU device in the app (Graphics: reims) this picture is the
+       boot screen, still for good once macOS draws through the GPU, and it was sent whole ten times a second
+       all the same: 4 MB a time, converted pixel by pixel here and again in the app. */
+    uint64_t sum = frame_sum(have ? src : NULL, w, h, stride);
+    if (c->incremental && c->sent_any && sum == c->sent_sum && w == c->w && h == c->h) return 1;
+    c->sent_sum = sum, c->sent_any = 1;
     uint8_t hdr[16 + 12];
     size_t hn = 4;
     hdr[0] = 0, hdr[1] = 0;
@@ -92,7 +116,11 @@ static int send_frame(Client *c) {
     uint8_t *out = malloc(row);
     if (!out) return -1;
     int rc = 0;
+    /* The viewer's format is the picture's own (the app's, and most viewers'): rows go out as they are. */
+    int same = have && bpp == 4 && !c->big_endian && c->rmax == 255 && c->gmax == 255 && c->bmax == 255 &&
+               c->rshift == 16 && c->gshift == 8 && c->bshift == 0;
     for (uint32_t y = 0; y < h && !rc; y++) {
+        if (same) { rc = send_all(c->fd, src + (size_t)y * stride, row); continue; }
         for (uint32_t x = 0; x < w; x++) {
             uint32_t b = 0, g = 0, r = 0;
             if (have) {
@@ -427,8 +455,10 @@ static void serve(Client *c) {
         clock_gettime(CLOCK_MONOTONIC, &now);
         long ms = (now.tv_sec - last.tv_sec) * 1000 + (now.tv_nsec - last.tv_nsec) / 1000000;
         if (c->incremental && ms < 100) continue;
-        if (send_frame(c)) return;
-        c->want_update = 0, last = now;
+        int sent = send_frame(c);
+        if (sent < 0) return;
+        last = now;
+        if (sent == 0) c->want_update = 0; /* else the request stands: answered when the picture changes */
     }
 }
 

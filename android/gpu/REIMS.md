@@ -193,6 +193,19 @@ inside the library's execution of a command buffer. 0.3.21 samples it: on a stam
 backtrace to the log (`sample: thread ... is at:`), and the CI keeps the unstripped
 libhengegpu.so as the `symbols` artifact to name the offsets.
 
+0.3.22, three costs that need no measurement to know. (1) The Mac's RAM was a 4 GB regular file on
+the tablet's flash, mapped shared (what iOS needs to stay under its memory ledger; Linux has none):
+the kernel wrote it back for as long as the guest wrote its RAM, every page faulted again after
+each writeback, the boot touched all 4 GB, and the guest's CPUs were held whenever dirty pages
+outran the flash. It is now a memfd (`HV_RAM_MEMFD`, devices/vmapple.c) that the app opens as
+`/proc/<engine>/fd/<n>`; where Android refuses that open, the app leaves a note and the next start
+uses the file again; Settings, Mac's memory: In RAM or On storage. (2) The VNC server sent the
+whole boot framebuffer ten times a second, converted a pixel at a time, though nothing in it
+changes once macOS draws through the GPU, and the app converted it again and never showed it: an
+unchanged picture is no longer sent, the usual format goes out as rows, and the app skips the
+pixels under the GPU view. (3) Each of macOS's disk flushes was an fsync of the disk image; it is
+fdatasync now (`HV_FLUSH=2`).
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

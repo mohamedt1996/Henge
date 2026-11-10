@@ -289,6 +289,15 @@ public class VmService extends Service {
             pb.environment().put("HENGE_PID", pidFile.getPath());
             // Android's seccomp filter kills glibc's per-thread rseq registration on many devices.
             pb.environment().put("GLIBC_TUNABLES", "glibc.pthread.rseq=0");
+            // The Mac's RAM in memory, not in a file on the tablet's storage (devices/vmapple.c): unless Settings
+            // asks for storage, or the app could not open it on this build (the GPU's note, android/gpu/reims/host.c).
+            File memfdNote = new File(reimsHomeDir(this), "ram-memfd-failed");
+            if (memfdNote.exists()) { prefs.edit().putString("ramFileBuild", build).apply(); memfdNote.delete(); }
+            boolean ramInMemory = !install && !"storage".equals(prefs.getString("ram", "memory"))
+                    && !build.equals(prefs.getString("ramFileBuild", ""));
+            if (ramInMemory) pb.environment().put("HV_RAM_MEMFD", "1");
+            // The Mac's disk: the data is flushed at each of macOS's flushes (fdatasync), not the file's times too.
+            pb.environment().put("HV_FLUSH", "2");
             // Graphics: reims: the Mac's screen size (Settings), every pixel of which is copied on this driver.
             if (reims) pb.environment().put("HV_REIMS_MODE", getSharedPreferences("henge", MODE_PRIVATE).getString("reimsMode", "1280x800"));
             pb.redirectErrorStream(true);
