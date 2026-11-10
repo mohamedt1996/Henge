@@ -78,7 +78,7 @@ int main(int argc, char **argv) {
     X->display_w = 1920, X->display_h = 1080, X->engine_alive = 1;
     __atomic_store_n(&X->magic, HV_REIMS_MAGIC, __ATOMIC_RELEASE);
 
-    check(reims_host_start(link, NULL, NULL) == 0, "the app's host starts");
+    check(reims_host_start(link, NULL, NULL, NULL) == 0, "the app's host starts");
     uint64_t until = now_ms() + 60000;
     while (!__atomic_load_n(&X->app_ready, __ATOMIC_ACQUIRE) && now_ms() < until) usleep(10000);
     check(X->app_ready, "reims-vgpu's device, IOSurface device and display come up on Vulkan");

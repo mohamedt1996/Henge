@@ -106,6 +106,15 @@ With it, three things against the next gaps rather than after them:
   at each commit, so pixels are the first performance lever.
 - `disable_argument_buffers` on the device: the plain path has run on this device, the other never.
 
+- **Vulkan driver** setting (Graphics: reims): *Turnip* (default where the build bundles it) or
+  *System*. The APK carries Turnip, Mesa's open Adreno driver, as `libvulkan_freedreno.so` (a prebuilt
+  for Android's KGSL from whitebelyash's CI of upstream Mesa, MIT), and metal2vulkan opens it directly
+  as the ICD through `vk_icdGetInstanceProcAddr` (`m2v_icd_library.py`, `M2V_VULKAN_LIBRARY`): no
+  loader, no window, none needed. On Turnip the fetch is exact (`VK_EXT_rasterization_order_attachment_access`,
+  the inputs form, flags and all); the interlock and the host-memory import are still absent, so the
+  unordered raster order groups and the copy path stay. A Turnip that gives no device falls back to
+  the system's driver in the same run, logged.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

@@ -57,6 +57,11 @@ public class GpuView extends SurfaceView implements SurfaceHolder.Callback {
      * folder of the app's that becomes the process's HOME: metal2vulkan keeps its translated shaders in
      * $HOME/.cache and refuses to make a device without one (an app process has no HOME of its own).
      */
-    static native boolean nativeReimsStart(String reimsPath, String logPath, String homeDir);
+    static native boolean nativeReimsStart(String reimsPath, String logPath, String homeDir, String vulkanLib);
+    /** Turnip, Mesa's open Adreno Vulkan driver, where this build bundles it (the CI's download step). */
+    static java.io.File turnip(Context c) {
+        java.io.File f = new java.io.File(c.getApplicationInfo().nativeLibraryDir, "libvulkan_freedreno.so");
+        return f.exists() ? f : null;
+    }
     static native void nativeReimsStop();
 }

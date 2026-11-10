@@ -143,6 +143,8 @@ def main() -> None:
     # reims-vgpu: what this device lacks is an error the guest sees (Metal's NSError, nil), not the
     # app's death (reims_lenient.py).
     subprocess.run([sys.executable, '-I', str(HERE / 'reims_lenient.py'), str(reims)], check=True)
+    # A Vulkan driver of the app's own (Turnip), opened directly as the ICD (m2v_icd_library.py).
+    subprocess.run([sys.executable, '-I', str(HERE / 'm2v_icd_library.py'), str(m2v)], check=True)
     print(f'android_port: {total} Linux-only places now take Android')
 
 

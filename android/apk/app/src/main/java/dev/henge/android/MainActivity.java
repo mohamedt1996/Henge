@@ -549,6 +549,18 @@ public class MainActivity extends Activity {
                     + "screen is much faster. Takes effect at the next start.", 13, DIM, false);
             rnote.setPadding(dp(17), 0, dp(17), dp(12));
             c.addView(rnote);
+            c.addView(hairline());
+            boolean hasTurnip = GpuView.turnip(this) != null;
+            c.addView(choiceRow("Vulkan driver", DRIVER_LABELS, Math.max(0, java.util.Arrays.asList(DRIVERS).indexOf(reimsDriver())),
+                    i -> { prefs.edit().putString("reimsDriver", DRIVERS[i]).apply(); render(true); }));
+            TextView dnote = text("turnip".equals(reimsDriver())
+                    ? (hasTurnip ? "Turnip, Mesa's open Adreno driver, bundled in this build: it has the ordered framebuffer fetch "
+                        + "macOS's compositor needs, and its bugs can be fixed. Falls back to the system's driver if it does not start."
+                        : "This build has no Turnip; the system's driver is used. Pick System to hide this.")
+                    : "Qualcomm's own Vulkan driver. It lacks ordered framebuffer fetch, raster order groups and host memory imports; "
+                        + "the app works around each, less exactly.", 13, DIM, false);
+            dnote.setPadding(dp(17), 0, dp(17), dp(12));
+            c.addView(dnote);
         }
         c.addView(hairline());
         c.addView(choiceRow("CPU engine", ENGINE_LABELS, java.util.Arrays.asList(ENGINE_MODES).indexOf(engineMode()),
@@ -949,6 +961,9 @@ public class MainActivity extends Activity {
     static final String[] REIMS_MODES = {"1024x768", "1280x800", "1600x1000", "1920x1080"};
     static final String[] REIMS_MODE_LABELS = {"1024", "1280", "1600", "1920"};
     private String reimsMode() { return prefs.getString("reimsMode", "1280x800"); }
+    static final String[] DRIVERS = {"turnip", "system"};
+    static final String[] DRIVER_LABELS = {"Turnip", "System"};
+    private String reimsDriver() { return prefs.getString("reimsDriver", "turnip"); }
 
     /** A row with a segmented choice, the way iOS settings pick one of a few. */
     private LinearLayout choiceRow(String label, String[] options, int selected, java.util.function.IntConsumer pick) {

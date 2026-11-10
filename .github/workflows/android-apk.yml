@@ -82,6 +82,30 @@ jobs:
           CARGO_TARGET_DIR: /home/runner/reims-work/target
         run: android/gpu/reims/build.sh
 
+      # Graphics: reims: Turnip, Mesa's open Adreno Vulkan driver, as an alternative to the system's
+      # (the app's "Vulkan driver" setting). A prebuilt for Android (KGSL) from whitebelyash's CI of
+      # upstream Mesa; MIT. A failure here leaves the APK without it (the setting then says so).
+      - name: "Turnip for the tablet (Graphics: reims, Vulkan driver: Turnip)"
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TURNIP_REPO: whitebelyash/freedreno_turnip-CI
+          TURNIP_TAG: stu_v2
+        run: |
+          set -eu
+          rm -rf turnip && mkdir turnip && cd turnip
+          gh release download "$TURNIP_TAG" -R "$TURNIP_REPO" --pattern '*.zip' || gh release download "$TURNIP_TAG" -R "$TURNIP_REPO"
+          ls -la
+          for z in *.zip; do mkdir -p "x/${z%.zip}" && unzip -q -o "$z" -d "x/${z%.zip}"; done
+          find x -type f \( -name '*.so' -o -name 'meta.json' \) -print
+          # The adrenotools zip's meta.json names the library; else the only .so.
+          so=$(find x -type f -name '*.so' | head -1)
+          [ -n "$so" ] || { echo "no .so in the release"; exit 1; }
+          file "$so"; readelf -d "$so" | grep NEEDED || true
+          readelf -Ws "$so" | grep -q vk_icdGetInstanceProcAddr || { echo "not a Vulkan ICD"; exit 1; }
+          cp "$so" ../android/apk/app/src/main/jniLibs/arm64-v8a/libvulkan_freedreno.so
+          echo "turnip: $so -> libvulkan_freedreno.so ($(stat -c %s "$so") bytes)"
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

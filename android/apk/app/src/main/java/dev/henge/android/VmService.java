@@ -238,8 +238,16 @@ public class VmService extends Service {
 
         // reims-vgpu's shader cache (translated Metal shaders and the driver's pipelines) lives under HOME, which this
         // process does not have: give it a folder that outlives the process, so a second boot finds the first's work.
+        // The Vulkan driver reims-vgpu runs on: the system's, or Turnip where the build bundles it and the setting asks.
+        String vulkanLib = null;
+        if (reims) {
+            String driver = getSharedPreferences("henge", MODE_PRIVATE).getString("reimsDriver", "turnip");
+            File turnip = GpuView.turnip(this);
+            if ("turnip".equals(driver) && turnip != null) vulkanLib = turnip.getPath();
+            else if ("turnip".equals(driver)) appendLog(log, "henge app: this build has no Turnip; the system's Vulkan driver is used");
+        }
         if (reims && !(GpuView.loaded && GpuView.nativeReimsStart(new File(mac, "gpu.reims").getPath(), log.getPath(),
-                reimsHomeDir(this).getPath())))
+                reimsHomeDir(this).getPath(), vulkanLib)))
             appendLog(log, "henge app: this build has no reims-vgpu; the GPU will not answer");
         int code = -1;
         try {

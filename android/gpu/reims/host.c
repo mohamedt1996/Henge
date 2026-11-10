@@ -29,6 +29,7 @@
 typedef struct {
     char path[1024];
     char home[1024];
+    char vulkan[1024]; /* the Vulkan library metal2vulkan opens (Turnip), or empty for the system's */
     HvReimsHeader *h;
     int ram_fd;
     uint8_t *ram;
@@ -425,8 +426,26 @@ static int bring_up(Host *h) {
     } else if (!getenv("HOME")) {
         hlog("reims: no HOME and no cache folder given: metal2vulkan will refuse the device");
     }
+    /* The Vulkan driver: the system's through the loader, or the app's own (Turnip) opened directly as
+       the ICD (metal2vulkan reads M2V_VULKAN_LIBRARY, Henge's port). */
+    if (h->vulkan[0]) {
+        setenv("M2V_VULKAN_LIBRARY", h->vulkan, 1);
+        hlog("reims: Vulkan driver: %s", h->vulkan);
+    } else {
+        unsetenv("M2V_VULKAN_LIBRARY");
+        hlog("reims: Vulkan driver: the system's (libvulkan.so)");
+    }
     set_stage("rvg_device_create (Vulkan device, guest memory map)");
     RvgStatus st = rvg_device_create(&dc, &h->dev);
+    if (st != RVG_OK && h->vulkan[0]) {
+        /* The app's own driver did not give a device (it did not open, or metal2vulkan refused it): the
+           system's, so a bad Turnip build costs the exactness, not the run. */
+        hlog("reims: rvg_device_create on %s: %s; trying the system's Vulkan driver", h->vulkan, rvg_status_message(st));
+        unsetenv("M2V_VULKAN_LIBRARY");
+        h->vulkan[0] = 0;
+        set_stage("rvg_device_create (the system's Vulkan driver, after the app's own failed)");
+        st = rvg_device_create(&dc, &h->dev);
+    }
     if (st != RVG_OK) { hlog("reims: rvg_device_create: %s", rvg_status_message(st)); return -1; }
     RvgIOSurfaceCallbacks ic = {.struct_size = sizeof ic, .ctx = h, .raise_interrupt = iosfc_raise};
     RvgIOSurfaceDeviceConfig icfg = {.struct_size = sizeof icfg, .memory_map = &map, .callbacks = &ic};
@@ -495,13 +514,14 @@ static void *attach_loop(void *arg) {
     return NULL;
 }
 
-int reims_host_start(const char *path, const char *log_path, const char *home) {
+int reims_host_start(const char *path, const char *log_path, const char *home, const char *vulkan_lib) {
     pthread_mutex_lock(&host_lock);
     if (H) { pthread_mutex_unlock(&host_lock); return 0; }
     Host *h = calloc(1, sizeof *h);
     if (!h) { pthread_mutex_unlock(&host_lock); return -1; }
     snprintf(h->path, sizeof h->path, "%s", path);
     if (home && *home) snprintf(h->home, sizeof h->home, "%s", home);
+    if (vulkan_lib && *vulkan_lib) snprintf(h->vulkan, sizeof h->vulkan, "%s", vulkan_lib);
     if (log_fd < 0 && log_path && *log_path) log_fd = open(log_path, O_WRONLY | O_APPEND | O_CLOEXEC);
     /* reims-vgpu reports a panic on stderr and aborts; an app's stderr is /dev/null, so the reason was lost. */
     if (log_fd >= 0) dup2(log_fd, 2);
