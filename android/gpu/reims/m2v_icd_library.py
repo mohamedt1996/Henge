@@ -27,8 +27,24 @@ EDITS = {
     };
     for path in &tried {
 """, """pub(crate) fn open_loader(loader: Option<&Path>) -> Result<ash::Entry, Error> {
-    // Henge's Android port (m2v_icd_library.py): M2V_VULKAN_LIBRARY names the library to open, a
-    // loader or a driver (an ICD, through its `vk_icdGetInstanceProcAddr`).
+    // Henge's Android port (m2v_icd_library.py): M2V_VULKAN_GIPA is the address, in this process, of
+    // a driver's `vkGetInstanceProcAddr` the host opened itself (a driver in a linker namespace of the
+    // host's making); M2V_VULKAN_LIBRARY names a library to open, a loader or a driver (an ICD, through
+    // its `vk_icdGetInstanceProcAddr`).
+    if let Some(gipa) = std::env::var("M2V_VULKAN_GIPA").ok().filter(|v| !v.is_empty()) {
+        let digits = gipa.trim_start_matches("0x").trim_start_matches("0X");
+        if let Ok(address) = usize::from_str_radix(digits, 16).map(|a| a as *const c_void) {
+            if !address.is_null() {
+                eprintln!("metal2vulkan: Vulkan driver entry point at {gipa}, the host's");
+                // SAFETY: the host's contract: the address is a live `vkGetInstanceProcAddr` of a driver
+                // it keeps loaded for the rest of the process.
+                let get_instance_proc_addr: ash::vk::PFN_vkGetInstanceProcAddr = unsafe { std::mem::transmute(address) };
+                // SAFETY: as above.
+                return Ok(unsafe { ash::Entry::from_static_fn(ash::StaticFn { get_instance_proc_addr }) });
+            }
+        }
+        eprintln!("metal2vulkan: M2V_VULKAN_GIPA {gipa}: not an address; ignored");
+    }
     if let Some(own) = std::env::var_os("M2V_VULKAN_LIBRARY").filter(|v| !v.is_empty()) {
         let path = PathBuf::from(own);
         // SAFETY: as below.

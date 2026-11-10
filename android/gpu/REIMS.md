@@ -113,7 +113,11 @@ With it, three things against the next gaps rather than after them:
   loader, no window, none needed. On Turnip the fetch is exact (`VK_EXT_rasterization_order_attachment_access`,
   the inputs form, flags and all); the interlock and the host-memory import are still absent, so the
   unordered raster order groups and the copy path stay. A Turnip that gives no device falls back to
-  the system's driver in the same run, logged.
+  the system's driver in the same run, logged. The prebuilt needs `libhardware.so`, `libsync.so` and
+  `libnativewindow.so`, platform libraries an app's linker namespace is refused, so `turnip_load.cpp`
+  opens it as Android opens a vendor driver: in a child of the exported `sphal` namespace (the hidden
+  linker calls from linkernsbypass, BSD-2, vendored under `linkernsbypass/`), and hands metal2vulkan
+  the driver's `vk_icdGetInstanceProcAddr` by address (`M2V_VULKAN_GIPA`).
 
 **0.3.11 booted macOS to the Setup Assistant on the tablet** (2026-11-10), on the system driver.
 

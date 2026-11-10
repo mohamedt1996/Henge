@@ -12,6 +12,7 @@
 #include "../replay/replay.h"
 #include "reims_vgpu.h"
 #include "reims_host.h"
+#include "turnip_load.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -442,20 +443,34 @@ static int bring_up(Host *h) {
     }
     /* The Vulkan driver: the system's through the loader, or the app's own (Turnip) opened directly as
        the ICD (metal2vulkan reads M2V_VULKAN_LIBRARY, Henge's port). */
+    unsetenv("M2V_VULKAN_LIBRARY"), unsetenv("M2V_VULKAN_GIPA");
     if (h->vulkan[0]) {
-        setenv("M2V_VULKAN_LIBRARY", h->vulkan, 1);
-        hlog("reims: Vulkan driver: %s", h->vulkan);
-    } else {
-        unsetenv("M2V_VULKAN_LIBRARY");
-        hlog("reims: Vulkan driver: the system's (libvulkan.so)");
+        /* The app's own driver needs platform libraries an app's namespace is refused: opened as Android
+           opens a vendor driver (turnip_load.cpp), and metal2vulkan takes its entry point. */
+        char dir[1024];
+        snprintf(dir, sizeof dir, "%s", h->vulkan);
+        char *slash = strrchr(dir, '/');
+        const char *name = slash ? slash + 1 : dir;
+        if (slash) *slash = 0;
+        void *gipa = reims_turnip_open(slash ? dir : ".", name);
+        if (gipa) {
+            char hex[32];
+            snprintf(hex, sizeof hex, "%#llx", (unsigned long long)(uintptr_t)gipa);
+            setenv("M2V_VULKAN_GIPA", hex, 1);
+            hlog("reims: Vulkan driver: %s (%s)", h->vulkan, reims_turnip_error());
+        } else {
+            hlog("reims: Vulkan driver: %s did not open (%s); the system's instead", h->vulkan, reims_turnip_error());
+            h->vulkan[0] = 0;
+        }
     }
+    if (!h->vulkan[0]) hlog("reims: Vulkan driver: the system's (libvulkan.so)");
     set_stage("rvg_device_create (Vulkan device, guest memory map)");
     RvgStatus st = rvg_device_create(&dc, &h->dev);
     if (st != RVG_OK && h->vulkan[0]) {
         /* The app's own driver did not give a device (it did not open, or metal2vulkan refused it): the
            system's, so a bad Turnip build costs the exactness, not the run. */
         hlog("reims: rvg_device_create on %s: %s; trying the system's Vulkan driver", h->vulkan, rvg_status_message(st));
-        unsetenv("M2V_VULKAN_LIBRARY");
+        unsetenv("M2V_VULKAN_LIBRARY"), unsetenv("M2V_VULKAN_GIPA");
         h->vulkan[0] = 0;
         set_stage("rvg_device_create (the system's Vulkan driver, after the app's own failed)");
         st = rvg_device_create(&dc, &h->dev);
