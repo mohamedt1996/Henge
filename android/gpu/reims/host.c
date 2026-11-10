@@ -583,6 +583,31 @@ static void *beat_loop(void *arg) {
     return NULL;
 }
 
+/* The Mac's RAM, mapped where its first byte is on a 2 MiB boundary. reims-vgpu runs each of the Mac's GPU
+   tasks but task 0 apart ("device isolates every task but task 0"), and refuses, without a word, to make such
+   a task unless the memory map's host address is whole pages of the GUEST's size, 16 KiB (tasks/remote.rs,
+   whole_pages). The tablet's pages are 4 KiB, so a plain mmap lands on a 16 KiB boundary only when its
+   neighbour happens to: it always had until 0.3.26, where every task failed ("command 56 faulted: task 1 not
+   created", then "no task" for each of its commands) and nothing was drawn. So: reserve the size and 2 MiB
+   more, map the file over the aligned part of it, and give back the rest. */
+static uint8_t *map_ram_aligned(int fd, uint64_t size) {
+    const uint64_t align = 2ull << 20;
+    uint8_t *reserved = mmap(NULL, size + align, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (reserved == MAP_FAILED) return mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    uint8_t *at = (uint8_t *)(((uintptr_t)reserved + align - 1) & ~(uintptr_t)(align - 1));
+    uint8_t *ram = mmap(at, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    if (ram == MAP_FAILED) {
+        int e = errno;
+        munmap(reserved, size + align);
+        errno = e;
+        return MAP_FAILED;
+    }
+    if (at > reserved) munmap(reserved, (size_t)(at - reserved));
+    uint8_t *end = at + size, *reserved_end = reserved + size + align;
+    if (reserved_end > end) munmap(end, (size_t)(reserved_end - end));
+    return ram;
+}
+
 /* ------------------------------------------------------------------ bring-up -- */
 static int bring_up(Host *h) {
     HvReimsHeader *x = h->h;
@@ -613,8 +638,10 @@ static int bring_up(Host *h) {
     if (h->ram_fd < 0) return -1;
     h->ram_pa = x->ram_pa, h->ram_size = x->ram_size;
     set_stage("mapping guest RAM");
-    h->ram = mmap(NULL, h->ram_size, PROT_READ | PROT_WRITE, MAP_SHARED, h->ram_fd, 0);
+    h->ram = map_ram_aligned(h->ram_fd, h->ram_size);
     if (h->ram == MAP_FAILED) { h->ram = NULL; hlog("reims: mapping guest RAM: %s", strerror(errno)); return -1; }
+    hlog("reims: guest RAM mapped at %p (%s the guest's 16 KiB pages)", (void *)h->ram,
+         (uintptr_t)h->ram & 0x3fff ? "NOT on" : "on");
 
     RvgMemoryRange range = {h->ram_pa, h->ram_size, h->ram};
     RvgMemoryMap map = {&range, 1};

@@ -266,6 +266,24 @@ engine's wait (0: as before).
 
 Version 0.3.26.
 
+0.3.26 on the tablet (2026-11-10): nothing was drawn. Every GPU task of the Mac's failed as it was
+made (`command 56 faulted: task 1 not created`), and each of its commands after that (`no task 2`,
+2000 of them in 90 s). reims-vgpu makes no isolated task unless the memory map's host address is
+whole 16 KiB pages (`whole_pages`, tasks/remote.rs), which it checks without logging, and the app
+mapped the RAM wherever the kernel put it, on the tablet's 4 KiB pages: it had landed on a 16 KiB
+boundary in every run before, by its neighbours, not by anything the code did. That it did not
+this time is inferred (no "refused" line, which every other way to fail the handshake logs); the
+address was not logged. 0.3.27 maps the RAM on a 2 MiB boundary (`map_ram_aligned`) and logs the
+address and whether it is on the guest's pages; if tasks still fail with the address on them, the
+cause is elsewhere and 0.3.26's waiting awake is the next suspect.
+
+The same log has the first split of a register access: 40 us to reach the app and 40 us in the
+library, where an access cost a millisecond before the CPU threads waited awake. So the
+millisecond was the scheduler, twice an access, and it is gone; what that gives in frames a second
+is not known until a run draws.
+
+Version 0.3.27.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
