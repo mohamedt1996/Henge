@@ -1,15 +1,42 @@
 --- a/src/slirp.c
 +++ b/src/slirp.c
-@@ -450,7 +450,11 @@
+@@ -373,6 +373,21 @@
+ #define RESOLV_CONF_PATH "/etc/resolv.conf"
+ #endif
+ 
++/* Android has no /etc/resolv.conf: the host names one (SLIRP_RESOLV_CONF), else the system's,
++   else Termux's. One answer for the file that is read and the file whose change is watched:
++   watching /etc/resolv.conf while reading another made every lookup fail from one second
++   after the first, so the guest had addresses and no names. */
++static const char *resolv_conf_path(void)
++{
++    const char *conf = getenv("SLIRP_RESOLV_CONF");
++    if (conf && *conf)
++        return conf;
++    if (access(RESOLV_CONF_PATH, R_OK) != 0 &&
++        access("/data/data/com.termux/files/usr/etc/resolv.conf", R_OK) == 0)
++        return "/data/data/com.termux/files/usr/etc/resolv.conf";
++    return RESOLV_CONF_PATH;
++}
++
+ static int get_dns_addr_cached(void *pdns_addr, void *cached_addr,
+                                socklen_t addrlen, struct stat *cached_stat,
+                                unsigned *cached_time)
+@@ -383,7 +398,7 @@
+         return 0;
+     }
+     old_stat = *cached_stat;
+-    if (stat(RESOLV_CONF_PATH, cached_stat) != 0) {
++    if (stat(resolv_conf_path(), cached_stat) != 0) {
+         return -1;
+     }
+     if (cached_stat->st_dev == old_stat.st_dev &&
+@@ -450,7 +465,7 @@
      unsigned if_index;
      unsigned nameservers = 0;
  
 -    f = fopen(RESOLV_CONF_PATH, "r");
-+    /* Android has no /etc/resolv.conf: let the host name one, then try Termux's. */
-+    const char *conf = getenv("SLIRP_RESOLV_CONF");
-+    f = fopen(conf && *conf ? conf : RESOLV_CONF_PATH, "r");
-+    if (!f)
-+        f = fopen("/data/data/com.termux/files/usr/etc/resolv.conf", "r");
++    f = fopen(resolv_conf_path(), "r");
      if (!f)
          return -1;
  
