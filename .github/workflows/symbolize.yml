@@ -1,0 +1,35 @@
+name: Symbolize
+
+# Names for the "pc 0x... libhengegpu.so" offsets of henge.log (crash backtraces, thread samples).
+# ci/symbolize/request.txt: the run id of the Android APK build the log came from (its "symbols"
+# artifact holds that build's libhengegpu.so with debug info), then one offset a line. A push of
+# that file prints each offset's function, file and line here.
+on:
+  push:
+    branches: [android-port]
+    paths: ['ci/symbolize/**', '.github/workflows/symbolize.yml']
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  symbolize:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Symbolize
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          run=$(head -1 ci/symbolize/request.txt | tr -d '[:space:]')
+          gh run download "$run" -R "$GITHUB_REPOSITORY" -n symbols -D sym
+          so=$(find sym -name libhengegpu.so | head -1)
+          file "$so"
+          tool=$(ls "$ANDROID_NDK_LATEST_HOME"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-symbolizer)
+          tail -n +2 ci/symbolize/request.txt | grep -E '^0x[0-9a-f]+$' | while read -r a; do
+            echo "== $a"
+            # A return address: the call is the instruction before it.
+            "$tool" --obj="$so" --demangle --inlines --functions=linkage --relativenames $(printf '0x%x' $((a - 1))) | sed 's/^/   /' | head -24
+          done

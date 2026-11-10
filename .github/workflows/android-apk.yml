@@ -4,6 +4,7 @@ on:
   push:
     branches: [android-port]
     tags: ['v*-android']
+    paths-ignore: ['ci/symbolize/**', '.github/workflows/symbolize.yml']
   workflow_dispatch:
     inputs:
       version:
