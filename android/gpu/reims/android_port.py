@@ -159,6 +159,8 @@ def main() -> None:
     subprocess.run([sys.executable, '-I', str(HERE / 'reims_lenient.py'), str(reims)], check=True)
     # A Vulkan driver of the app's own (Turnip), opened directly as the ICD (m2v_icd_library.py).
     subprocess.run([sys.executable, '-I', str(HERE / 'm2v_icd_library.py'), str(m2v)], check=True)
+    # A commit compares the copied host buffers its commands use, not every one (m2v_copy_in_used.py).
+    subprocess.run([sys.executable, '-I', str(HERE / 'm2v_copy_in_used.py'), str(m2v)], check=True)
     print(f'android_port: {total} Linux-only places now take Android')
 
 

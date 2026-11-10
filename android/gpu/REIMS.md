@@ -206,6 +206,19 @@ unchanged picture is no longer sent, the usual format goes out as rows, and the 
 pixels under the GPU view. (3) Each of macOS's disk flushes was an fsync of the disk image; it is
 fdatasync now (`HV_FLUSH=2`).
 
+The samples of 0.3.21 on the tablet (the system's driver; symbolized by the CI's Symbolize job from
+the build's `symbols` artifact): the queue waiters idle in `completion::wait_for_queue` (nothing
+submitted is pending: the GPU itself is not busy), most FIFO threads idle on their rings, one
+waiting on another's stamp, and wherever a thread was at work it was in
+`CopiedBuffers::copy_in` (`sync_blocks`, copying) under `CommandBuffer::commit_now`, or waiting for
+the copies' lock in `copy_in` or `merge_back`. A commit compares every copied host buffer with its
+pages, whether the command buffer uses it or not; with the guest's RAM a file on flash those pages
+had to come back from storage each time. 0.3.23: `m2v_copy_in_used.py` gives a commit the copies
+its commands use (the keys of the uses they noted, as a completion already takes the keys they
+wrote), every copy where a command reaches memory no use names; a line every 10 s of commits says
+how many MiB are live, compared and passed over, and in how long. Settings, GPU memory checks:
+Used or Everything (`M2V_COPY_IN_ALL`), for a window that shows stale pixels.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

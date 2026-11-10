@@ -571,6 +571,21 @@ public class MainActivity extends Activity {
         tnote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(tnote);
         c.addView(hairline());
+        if ("reims".equals(prefs.getString("gpu", "on"))) {
+            final java.io.File copyAll = new java.io.File(VmService.reimsHomeDir(this), "copy-in-all");
+            c.addView(choiceRow("GPU memory checks", new String[]{"Used", "Everything"}, copyAll.exists() ? 1 : 0,
+                    i -> {
+                        try { if (i == 1) copyAll.createNewFile(); else copyAll.delete(); } catch (Exception ignored) { }
+                        render(true);
+                    }));
+            TextView cnote = text(copyAll.exists()
+                    ? "Before each batch of drawing, every piece of the Mac's memory the GPU holds a copy of is checked for changes: slow, but nothing can be missed."
+                    : "Before each batch of drawing, only the memory that batch uses is checked for changes: much faster. If a window shows old "
+                        + "contents, pick Everything. Takes effect when the app is next started.", 13, DIM, false);
+            cnote.setPadding(dp(17), 0, dp(17), dp(12));
+            c.addView(cnote);
+            c.addView(hairline());
+        }
         c.addView(choiceRow("Mac's memory", new String[]{"In RAM", "On storage"}, "storage".equals(prefs.getString("ram", "memory")) ? 1 : 0,
                 i -> { prefs.edit().putString("ram", i == 0 ? "memory" : "storage").apply(); render(true); }));
         TextView mnote = text("storage".equals(prefs.getString("ram", "memory"))

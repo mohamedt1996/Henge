@@ -571,6 +571,19 @@ static int bring_up(Host *h) {
     } else if (!getenv("HOME")) {
         hlog("reims: no HOME and no cache folder given: metal2vulkan will refuse the device");
     }
+    /* Settings, GPU memory checks: Everything. The app leaves a file in the home; metal2vulkan then compares
+       every copied host buffer at each commit, as upstream does, not only those the commands use
+       (m2v_copy_in_used.py): slower, and the answer to a window that shows stale pixels. */
+    if (h->home[0]) {
+        char all[1100];
+        snprintf(all, sizeof all, "%s/copy-in-all", h->home);
+        if (access(all, F_OK) == 0) {
+            setenv("M2V_COPY_IN_ALL", "1", 1);
+            hlog("reims: GPU memory checks: everything, at each commit (Settings)");
+        } else {
+            unsetenv("M2V_COPY_IN_ALL");
+        }
+    }
     /* The Vulkan driver: the system's through the loader, or the app's own (Turnip) opened directly as
        the ICD (metal2vulkan reads M2V_VULKAN_LIBRARY, Henge's port). */
     unsetenv("M2V_VULKAN_LIBRARY"), unsetenv("M2V_VULKAN_GIPA");
