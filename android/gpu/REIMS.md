@@ -251,6 +251,21 @@ stamp after 2 s. Two things in that log:
 
 Version 0.3.24.
 
+0.3.24 on the tablet (2026-11-10): the RAM arrived as a descriptor and stayed in memory, and no
+question read the maps (812 questions in 343 ms at most). The frame rate did not move: 22 frames a
+second at best, the Mac's CPUs still waiting 18 to 22 s of 30 on GPU registers, a millisecond an
+access. So the maps were not that wait, and what it is has not been measured: an access is a post to
+the app's thread, the library's own work, and the answer back, and only their sum was logged.
+0.3.26 logs the parts every 10 s (`reims: registers:`): the accesses, the time for a request to
+reach the app's thread (the engine stamps the post, `sent_ns`), the time inside the library, and the
+four registers that took the most. What is left of the engine's `CPUs waited` is the way back.
+And it takes the scheduler out of the short ones: the engine's CPU thread waits awake for 150 us by
+the clock before it sleeps (it gave up after 2000 loads, a few microseconds), the app's thread stays
+awake as long after an access for the next, and runs at nice -10. `HV_REIMS_SPIN_US` changes the
+engine's wait (0: as before).
+
+Version 0.3.26.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

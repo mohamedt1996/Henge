@@ -98,11 +98,25 @@ static uint64_t forward(int device, int write, uint64_t off, uint64_t value, uns
     HvReimsSlot *s = &R.h->slot[my_slot];
     uint64_t began = now_ns();
     s->device = (uint32_t)device, s->write = (uint32_t)write, s->size = size, s->offset = off, s->value = value;
+    s->sent_ns = began;
     __atomic_store_n(&s->state, HV_REIMS_REQUEST, __ATOMIC_RELEASE);
     futex(&s->state, FUTEX_WAKE, 1, NULL);
-    /* Most answers take microseconds: spin a little before sleeping. */
-    for (unsigned spin = 0; spin < 2000; spin++)
+    /* Most answers take microseconds, and a CPU thread that sleeps here pays the scheduler twice (the app's
+       thread woken, then this one: on the tablet an access cost a millisecond on average, 0.3.24). So it
+       stays awake for the first 150 us, by the clock (2000 loads were a few microseconds), and sleeps
+       only for an answer that takes longer. HV_REIMS_SPIN_US changes it (0: sleep at once). */
+    static int64_t spin_ns = -1;
+    if (spin_ns < 0) {
+        const char *us = getenv("HV_REIMS_SPIN_US");
+        spin_ns = (us && *us ? atoll(us) : 150) * 1000;
+    }
+    for (unsigned spin = 0;; spin++) {
         if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) == HV_REIMS_REPLY) goto done;
+        if ((spin & 63) == 63 && (int64_t)(now_ns() - began) >= spin_ns) break;
+#if defined(__aarch64__)
+        __asm__ volatile("yield");
+#endif
+    }
     for (;;) {
         struct timespec t = {0, 100 * 1000000};
         futex(&s->state, FUTEX_WAIT, HV_REIMS_REQUEST, &t);

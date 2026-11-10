@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -57,6 +58,11 @@ typedef struct {
     int hx, hy, cursor_on;
     Replay *sink;
     uint64_t frames, mmio;
+    /* Where a register access's time goes, since the last log line (reg_lock): from the engine's post to
+       this side's thread taking it, and inside the library; and the registers that took the most. */
+    pthread_mutex_t reg_lock;
+    uint64_t reg_n, reg_reach_ns, reg_device_ns;
+    struct { uint64_t key, n, ns, max_ns; } reg[48];
     uint64_t t_encode, t_read, t_show, t_frames, t_shows; /* ns and counts since the last log line */
 } Host;
 
@@ -443,15 +449,80 @@ static void *render_loop(void *arg) {
 }
 
 /* ---------------------------------------------------------------- the MMIO slots -- */
+#if defined(__aarch64__)
+#define cpu_relax() __asm__ volatile("yield")
+#else
+#define cpu_relax() ((void)0)
+#endif
+
+/* One register access's times into the log's counts: `reach` from the engine's post to this side taking it,
+   `device` inside the library; per register (device, direction, offset) how many and how long. */
+static void reg_note(Host *h, const HvReimsSlot *s, uint64_t reach, uint64_t device) {
+    uint64_t key = (uint64_t)s->device << 62 | (uint64_t)(s->write & 1) << 61 | (s->offset & ((1ull << 61) - 1));
+    key |= 1ull << 60; /* never 0: an empty entry */
+    pthread_mutex_lock(&h->reg_lock);
+    h->reg_n++, h->reg_reach_ns += reach, h->reg_device_ns += device;
+    int n = (int)(sizeof h->reg / sizeof h->reg[0]), at = -1;
+    for (int i = 0; i < n; i++) {
+        if (h->reg[i].key == key) { at = i; break; }
+        if (!h->reg[i].key && at < 0) at = i;
+    }
+    if (at >= 0) {
+        h->reg[at].key = key, h->reg[at].n++, h->reg[at].ns += device;
+        if (device > h->reg[at].max_ns) h->reg[at].max_ns = device;
+    }
+    pthread_mutex_unlock(&h->reg_lock);
+}
+
+/* The log's line of them every 10 s (beat_loop), and the counts start again. */
+static void reg_report(Host *h) {
+    pthread_mutex_lock(&h->reg_lock);
+    uint64_t count = h->reg_n, reach = h->reg_reach_ns, device = h->reg_device_ns;
+    int n = (int)(sizeof h->reg / sizeof h->reg[0]);
+    char top[400] = "";
+    size_t m = 0;
+    for (int k = 0; k < 4; k++) { /* the four registers that took the most time */
+        int best = -1;
+        for (int i = 0; i < n; i++)
+            if (h->reg[i].key && (best < 0 || h->reg[i].ns > h->reg[best].ns)) best = i;
+        if (best < 0 || !h->reg[best].ns) break;
+        uint64_t key = h->reg[best].key;
+        m += (size_t)snprintf(top + m, sizeof top - m, "%s%s %s +%#llx %llux %.0f ms (longest %.1f)", k ? ", " : "",
+                              key >> 62 ? "iosurface" : "gfx", key >> 61 & 1 ? "write" : "read",
+                              (unsigned long long)(key & ((1ull << 60) - 1)), (unsigned long long)h->reg[best].n,
+                              h->reg[best].ns / 1e6, h->reg[best].max_ns / 1e6);
+        h->reg[best].key = 0;
+        if (m >= sizeof top) break;
+    }
+    memset(h->reg, 0, sizeof h->reg);
+    h->reg_n = h->reg_reach_ns = h->reg_device_ns = 0;
+    pthread_mutex_unlock(&h->reg_lock);
+    if (count)
+        hlog("reims: registers: %llu accesses; %.0f ms to reach the app (%.0f us each), %.0f ms in the device (%.0f us each); most: %s",
+             (unsigned long long)count, reach / 1e6, reach / 1e3 / count, device / 1e6, device / 1e3 / count, top[0] ? top : "none");
+}
+
 static void *slot_loop(void *arg) {
     HvReimsSlot *s = arg;
     Host *h = H;
+    /* Ahead of the app's ordinary threads: a CPU of the Mac's stands still until this one answers. */
+    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), -10);
+    uint64_t idle_since = now_ns();
     while (!h->stop) {
         if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != HV_REIMS_REQUEST) {
+            /* Accesses come in runs: stay awake for 150 us after one before sleeping, so the next is taken
+               without the scheduler (the engine's side waits as long for the answer, pvg_reims.c). */
+            if (now_ns() - idle_since < 150000) {
+                cpu_relax();
+                continue;
+            }
             struct timespec t = {0, 200 * 1000000};
             futex(&s->state, FUTEX_WAIT, HV_REIMS_IDLE, &t);
+            idle_since = now_ns() - 150000; /* woken: look once, then sleep again unless there is work */
             continue;
         }
+        uint64_t taken = now_ns(), sent = s->sent_ns;
+        HvReimsSlot asked = *s; /* the engine may post its next request the moment this one is answered */
         uint64_t v = 0;
         if (s->device == HV_REIMS_GFX) {
             if (s->write) rvg_device_mmio_write(h->dev, s->offset, (uint32_t)s->value);
@@ -471,6 +542,8 @@ static void *slot_loop(void *arg) {
         h->mmio++;
         __atomic_store_n(&s->state, HV_REIMS_REPLY, __ATOMIC_RELEASE);
         futex(&s->state, FUTEX_WAKE, 1, NULL);
+        idle_since = now_ns();
+        reg_note(h, &asked, sent && taken > sent ? taken - sent : 0, idle_since - taken);
     }
     return NULL;
 }
@@ -504,6 +577,7 @@ static void *beat_loop(void *arg) {
                  (unsigned long long)h->mmio, (unsigned long long)h->h->irqs, (unsigned long long)guest, (unsigned long long)h->frames,
                  n / secs, n ? te / 1e6 / n : 0.0, n ? tr / 1e6 / n : 0.0, s ? ts / 1e6 / s : 0.0);
             last = now_ns();
+            reg_report(h);
         }
     }
     return NULL;
@@ -705,6 +779,7 @@ int reims_host_start(const char *path, const char *log_path, const char *home, c
     if (log_fd >= 0) dup2(log_fd, 2);
     h->ram_fd = -1;
     pthread_mutex_init(&h->lock, NULL);
+    pthread_mutex_init(&h->reg_lock, NULL);
     pthread_cond_init(&h->wake, NULL);
     rvg_log_set_handler(on_log, NULL, RVG_LOG_INFO);
     install_crash_log();

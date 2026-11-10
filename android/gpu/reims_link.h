@@ -36,7 +36,8 @@ typedef struct {
     uint32_t size;    /* bytes: 4 or 8 */
     uint64_t offset;  /* in the device's window */
     uint64_t value;   /* the write's value, or the read's answer */
-    uint64_t pad[4];
+    uint64_t sent_ns; /* CLOCK_MONOTONIC when the engine posted the request: the app's log says how long it took to reach it */
+    uint64_t pad[3];
 } HvReimsSlot; /* 64 bytes: a cache line each */
 
 typedef struct {
