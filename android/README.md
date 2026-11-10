@@ -27,7 +27,7 @@ there and builds, and no run has shown it working (or failing).
 | Touch, pointer, on-screen and hardware keyboard | **Works** | Touch: Direct or Trackpad. A captured mouse moves the Mac's pointer itself. |
 | Mac's RAM in memory (not on flash) | **Works** (0.3.24) | Handed from the engine to the app as a descriptor. |
 | Internet in the Mac | **Unconfirmed** | Names stopped resolving a second after boot until 0.3.25, which fixes that. Not yet checked on the tablet. |
-| Sound | **Unconfirmed** | Played through the app since 0.3.16; the log shows the player connected, nobody has reported hearing it. |
+| Sound | **Works** | Played through the app since 0.3.16. |
 | Install macOS on the device | **Unconfirmed here** | Downloads the restore image and restores it, as the iOS app does. Takes hours; needs about 45 GB free. |
 | Vulkan driver: Turnip | **Unconfirmed** | Bundled since 0.3.15. It took the app down on 0.3.16; fixes went in after, and the logged runs since used the system's driver. |
 | CPU engine: Gunyah | **Broken: resets the tablet** | Starting the Mac on it panics the Xiaomi Pad 7. No crash record has been recovered yet (`/sys/fs/pstore` was empty). |
