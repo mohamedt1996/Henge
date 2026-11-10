@@ -269,6 +269,8 @@ public class VmService extends Service {
             pb.environment().put("HENGE_PID", pidFile.getPath());
             // Android's seccomp filter kills glibc's per-thread rseq registration on many devices.
             pb.environment().put("GLIBC_TUNABLES", "glibc.pthread.rseq=0");
+            // Graphics: reims: the Mac's screen size (Settings), every pixel of which is copied on this driver.
+            if (reims) pb.environment().put("HV_REIMS_MODE", getSharedPreferences("henge", MODE_PRIVATE).getString("reimsMode", "1280x800"));
             pb.redirectErrorStream(true);
             pb.redirectOutput(ProcessBuilder.Redirect.appendTo(log));
             try (FileOutputStream o = new FileOutputStream(log, true)) {

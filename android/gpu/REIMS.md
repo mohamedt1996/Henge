@@ -93,7 +93,20 @@ an input while writing it as a colour (legal with the subpass's self-dependency;
 `m2v_unordered_fetch.py` now takes metal2vulkan's STORAGE form instead (the profile claims the pixel
 interlock; the attachment is left out of the subpass and read and written as a storage image, with
 a barrier between draws, the path RADV/ANV/NVIDIA take) and never emits the interlock
-instructions, which answer by the enabled features. What to expect next, in order:
+instructions, which answer by the enabled features.
+
+With it, three things against the next gaps rather than after them:
+- **Refusals no longer end the app** (`reims_lenient.py`): a pipeline the device cannot build
+  answers Metal's own NSError (code 3, "the compiler refused the function"), and a creator with a
+  nil answer (textures, buffers, heaps) answers nil, each logged with the runtime's full text. The
+  guest handles both as it would on a Mac whose compiler refused a shader; a WindowServer that
+  cannot live without the pipeline aborts and launchd restarts it, and the Mac and the app go on.
+- **Mac screen** setting (Graphics: reims): 1024x768, 1280x800 (default), 1600x1000, 1920x1080;
+  `HV_REIMS_MODE=WxH`. Without the host-memory import every surface is a copy compared on the CPU
+  at each commit, so pixels are the first performance lever.
+- `disable_argument_buffers` on the device: the plain path has run on this device, the other never.
+
+What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
   `reims` lines in `adb logcat -s henge-gpu`, and a `reims-vgpu: fatal` line ends the app's process;

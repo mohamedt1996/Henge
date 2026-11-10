@@ -541,6 +541,15 @@ public class MainActivity extends Activity {
         TextView gnote = text(GPU_NOTES[Math.max(0, java.util.Arrays.asList(GPU_MODES).indexOf(gpuMode()))], 13, DIM, false);
         gnote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(gnote);
+        if ("reims".equals(gpuMode())) {
+            c.addView(hairline());
+            c.addView(choiceRow("Mac screen", REIMS_MODE_LABELS, Math.max(0, java.util.Arrays.asList(REIMS_MODES).indexOf(reimsMode())),
+                    i -> { prefs.edit().putString("reimsMode", REIMS_MODES[i]).apply(); render(true); }));
+            TextView rnote = text("Every pixel of every surface is copied and compared on the CPU on this GPU driver, so a smaller "
+                    + "screen is much faster. Takes effect at the next start.", 13, DIM, false);
+            rnote.setPadding(dp(17), 0, dp(17), dp(12));
+            c.addView(rnote);
+        }
         c.addView(hairline());
         c.addView(choiceRow("CPU engine", ENGINE_LABELS, java.util.Arrays.asList(ENGINE_MODES).indexOf(engineMode()),
                 i -> { prefs.edit().putString("engine", ENGINE_MODES[i]).apply(); render(true); }));
@@ -937,6 +946,9 @@ public class MainActivity extends Activity {
                     + "tablet's GPU through metal2vulkan, as a Mac's own paravirtual GPU would. Keep the app open while the Mac runs."};
 
     private String gpuMode() { return prefs.getString("gpu", "on"); }
+    static final String[] REIMS_MODES = {"1024x768", "1280x800", "1600x1000", "1920x1080"};
+    static final String[] REIMS_MODE_LABELS = {"1024", "1280", "1600", "1920"};
+    private String reimsMode() { return prefs.getString("reimsMode", "1280x800"); }
 
     /** A row with a segmented choice, the way iOS settings pick one of a few. */
     private LinearLayout choiceRow(String label, String[] options, int selected, java.util.function.IntConsumer pick) {

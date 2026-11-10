@@ -173,6 +173,18 @@ int hv_pvg_external_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_t i
     h->ram_pa = ram->pa, h->ram_size = ram->size;
     snprintf(h->ram_file, sizeof h->ram_file, "%s", file);
     hv_pvg_lite_mode(&h->display_w, &h->display_h);
+    {   /* HV_REIMS_MODE=WxH (the app's "Mac screen" setting). Without the host-memory import every surface is a
+           copy compared on the CPU at each commit, so fewer pixels is the first performance lever: 1280x800
+           by default, a 1920x1080 only when asked. */
+        const char *mode = getenv("HV_REIMS_MODE");
+        unsigned w = 0, hgt = 0;
+        if (mode && sscanf(mode, "%ux%u", &w, &hgt) == 2 && w >= 640 && hgt >= 480 && w <= 7680 && hgt <= 4320)
+            h->display_w = w, h->display_h = hgt;
+        else if (h->display_w == 1920 && h->display_h == 1080)
+            h->display_w = 1280, h->display_h = 800;
+        fprintf(stderr, "hengevm: reims: the Mac's screen is %ux%u%s\n", h->display_w, h->display_h,
+                mode ? "" : " (HV_REIMS_MODE=WxH to change)");
+    }
     h->engine_alive = 1;
     __atomic_store_n(&h->magic, HV_REIMS_MAGIC, __ATOMIC_RELEASE);
     /* The guest has not run yet: wait here for the app's device, and if it does not come, boot with pvg_lite

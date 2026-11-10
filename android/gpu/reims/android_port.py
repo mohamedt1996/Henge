@@ -140,6 +140,9 @@ def main() -> None:
     # Framebuffer fetch on a device with neither ordered form (Qualcomm): input attachments without the
     # order flags, best effort (m2v_unordered_fetch.py), instead of refusing WindowServer's pipelines.
     subprocess.run([sys.executable, '-I', str(HERE / 'm2v_unordered_fetch.py'), str(m2v)], check=True)
+    # reims-vgpu: what this device lacks is an error the guest sees (Metal's NSError, nil), not the
+    # app's death (reims_lenient.py).
+    subprocess.run([sys.executable, '-I', str(HERE / 'reims_lenient.py'), str(reims)], check=True)
     print(f'android_port: {total} Linux-only places now take Android')
 
 

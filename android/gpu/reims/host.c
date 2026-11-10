@@ -403,6 +403,9 @@ static int bring_up(Host *h) {
         .display_port_count = 1,
         .use_iosurface_mapper = true, /* vmapple: the IOSurface device maps the guest's IOSurfaces */
         .process_isolation = true,    /* as QEMU's apple-gfx-mmio */
+        /* Argument buffers are offered only on a device that can detach backing; on this Vulkan device the
+           path has never run, and the plain path has: off, as a conservative first bring-up. */
+        .disable_argument_buffers = true,
         .memory_map = &map,
         .memory_files = &file,
         .callbacks = &cb,
@@ -441,8 +444,13 @@ static int bring_up(Host *h) {
     set_stage("rvg_display_create");
     st = rvg_display_create(h->dev, &disp, &h->disp);
     if (st != RVG_OK) { hlog("reims: rvg_display_create: %s", rvg_status_message(st)); return -1; }
-    RvgDisplayMode modes[] = {{(uint16_t)w, (uint16_t)hgt, 0, 60.0}, {1920, 1080, 0, 60.0}, {1280, 800, 0, 60.0}};
-    rvg_display_set_modes(h->disp, modes, w == 1920 && hgt == 1080 ? 2 : 3);
+    /* The engine's mode first (macOS takes the first), then the others as alternatives. */
+    RvgDisplayMode modes[] = {{(uint16_t)w, (uint16_t)hgt, 0, 60.0}, {1280, 800, 0, 60.0}, {1920, 1080, 0, 60.0},
+                              {1024, 768, 0, 60.0}, {1600, 1000, 0, 60.0}};
+    size_t nmodes = 1;
+    for (size_t i = 1; i < sizeof modes / sizeof *modes; i++)
+        if (modes[i].width != w || modes[i].height != hgt) modes[nmodes++] = modes[i];
+    rvg_display_set_modes(h->disp, modes, nmodes);
     h->mode_w = w, h->mode_h = hgt;
 
     for (int i = 0; i < HV_REIMS_SLOTS; i++)
