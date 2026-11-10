@@ -84,7 +84,16 @@ Seventh run: no segfault this time; 114 presents, 2669 interrupts, then WindowSe
 pipeline was refused: `Unsupported { feature: RasterOrderGroups, needs: FragmentShaderPixelInterlock }`.
 `[[raster_order_group]]` runs a fragment function's body in the fragment interlock, which Qualcomm's
 driver lacks; on Android the body now runs without the critical section (the same tiler bet as the
-fetch; `m2v_unordered_fetch.py`). What to expect next, in order:
+fetch; `m2v_unordered_fetch.py`).
+
+Runs 6 and 8 (0.3.8 and 0.3.9, with the backtrace): the same SIGSEGV inside `vulkan.adreno.so`
+(pc 0x2255f4, 0x132cec) from metal2vulkan's `CommandBuffer::commit`, right after the 2-attachment
+RGBA16Float pass that fetches: Qualcomm's driver dies committing a pass that reads an attachment as
+an input while writing it as a colour (legal with the subpass's self-dependency; a driver bug).
+`m2v_unordered_fetch.py` now takes metal2vulkan's STORAGE form instead (the profile claims the pixel
+interlock; the attachment is left out of the subpass and read and written as a storage image, with
+a barrier between draws, the path RADV/ANV/NVIDIA take) and never emits the interlock
+instructions, which answer by the enabled features. What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
   `reims` lines in `adb logcat -s henge-gpu`, and a `reims-vgpu: fatal` line ends the app's process;
