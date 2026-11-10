@@ -1,42 +1,129 @@
-# Henge on Android (bring-up)
+# Henge on Android
 
-The engine (arm64 JIT, MMU, vmapple devices) builds for Linux/Android arm64 and passes its tests.
-- **Network:** libslirp NAT, like the iOS app (`android/build_deps.sh` builds the static deps). DNS comes from
-  `/etc/resolv.conf`, Termux's resolv.conf, `SLIRP_RESOLV_CONF`, or falls back to 1.1.1.1/8.8.8.8.
-- **Graphics: Vulkan** (`--gpu vulkan`, the app's Graphics setting): the app's own renderer shows the screen and
-  translates macOS's shaders on the device ([gpu/README.md](gpu/README.md)). It does clears, copies and the
-  pointer so far, not draws.
-- **Display:** a built-in VNC server (`--vnc 5900`, localhost; set `HV_VNC_ANY=1` to listen on all interfaces)
-  shows the boot framebuffer and forwards pointer and keys. The macOS desktop itself is drawn by Apple-GPU
-  shader binaries that only Apple's Metal stack can load, so it does not render here.
-- **Install on the device:** `--install FOLDER` fetches the boot ROM from Apple (under 1 MB), downloads the
-  macOS restore image (resumable; 8 parallel connections in 32 MB chunks, `HV_DL_CONNECTIONS` to change), and restores it with the vendored idevicerestore/usbmuxd stack
-  (`android/build_restore.sh`), as the iOS app does. About 45 GB free: 17 GB image (deletable after), ~26 GB Mac.
-  `--cache DIR` keeps the image and boot ROM there: a reinstall reuses them, and a `--mac` run whose boot
-  ROM is missing restores it from there (or Apple). The app keeps downloads in Henge/ on shared storage when
-  given all-files access (outlives an uninstall), else in its own folder; Settings lists them, imports an
-  .ipsw, and runs the device check (`android/tools/device_check.sh`, root used when granted). Every build is
-  signed with `android/apk/henge-debug.keystore`, so a new APK installs over the old one and keeps the Mac.
-- **Not yet:** sound.
+macOS on an arm64 Android tablet or phone. Henge emulates a Mac (the same `vmapple` machine the iOS
+app runs), installs macOS on the device from Apple's restore image, and shows its desktop in the app.
 
-    android/build_deps.sh             # static zlib/libffi/pcre2/glib/libslirp in ~/deps/arm64
+**Experimental.** It boots macOS Sequoia 15.6 to the desktop on one tablet, slowly. This page says
+what works there, what does not, and what nobody has checked.
+
+- Status as of **0.3.27 (2026-11-10)**.
+- Tested on one device: Xiaomi Pad 7 (Snapdragon 7+ Gen 3, Adreno 732, Android 14, Linux 6.1), rooted.
+  Nothing here is known about any other device.
+- Branch `android-port`. Each push builds an APK and publishes it as the
+  [`android-latest`](https://github.com/mohamedt1996/Henge/releases/tag/android-latest) release.
+
+## What works, and what does not
+
+"Works" means it was seen working in a log from the test tablet. "Unconfirmed" means the code is
+there and builds, and no run has shown it working (or failing).
+
+| Area | Status | Notes |
+|---|---|---|
+| Boot to the macOS desktop | **Works** (0.3.11 to 0.3.24) | JIT engine, Graphics: reims, the system's Vulkan driver, 4 CPUs, 4 GB. |
+| Desktop drawing (Graphics: reims) | **Works, slow** | 17 to 22 frames a second at best in animations up to 0.3.24, with long stalls. |
+| 0.3.26 | **Broken: draws nothing** | Every GPU task failed to start. Do not use it. |
+| 0.3.27 | **Unconfirmed** | Meant to fix 0.3.26 and keep its faster GPU register path. Not yet run. |
+| Wallpaper | **Not drawn** | The desktop picture does not appear. Cause unknown. |
+| Touch, pointer, on-screen and hardware keyboard | **Works** | Touch: Direct or Trackpad. A captured mouse moves the Mac's pointer itself. |
+| Mac's RAM in memory (not on flash) | **Works** (0.3.24) | Handed from the engine to the app as a descriptor. |
+| Internet in the Mac | **Unconfirmed** | Names stopped resolving a second after boot until 0.3.25, which fixes that. Not yet checked on the tablet. |
+| Sound | **Unconfirmed** | Played through the app since 0.3.16; the log shows the player connected, nobody has reported hearing it. |
+| Install macOS on the device | **Unconfirmed here** | Downloads the restore image and restores it, as the iOS app does. Takes hours; needs about 45 GB free. |
+| Vulkan driver: Turnip | **Unconfirmed** | Bundled since 0.3.15. It took the app down on 0.3.16; fixes went in after, and the logged runs since used the system's driver. |
+| CPU engine: Gunyah | **Broken: resets the tablet** | Starting the Mac on it panics the Xiaomi Pad 7. No crash record has been recovered yet (`/sys/fs/pstore` was empty). |
+| Gunyah with Graphics: reims | **Not done** | The engine switches reims off under Gunyah. |
+| Graphics: Vulkan (the older renderer) | **Partial** | Clears, copies and the pointer; no draws. Superseded by reims. |
+| Video decoding, camera, USB devices | **Not done** | |
+
+## Why it is slow
+
+Two costs set the ceiling, and neither is fixed:
+
+1. **The CPU is emulated.** Android gives apps no hypervisor, so every instruction of the Mac's
+   runs through Henge's JIT. Apps open slowly because of this, whatever the graphics do. Gunyah
+   would run the Mac's code directly, and it resets the test tablet.
+2. **Every surface is copied.** Neither Adreno driver (Qualcomm's or Turnip) can use the Mac's
+   memory directly (`VK_EXT_external_memory_host`), so each window surface is a copy that is
+   compared on the CPU at every GPU command buffer.
+
+What has been taken out so far is in [gpu/REIMS.md](gpu/REIMS.md), run by run.
+
+## Requirements
+
+- arm64, Android 10 or later.
+- About 8 GB of RAM in the device (the Mac gets 4 GB) and about 45 GB free to install: a 17 GB
+  restore image, deletable afterwards, and a Mac of about 26 GB.
+- **Root for Graphics: reims in practice.** The app raises `vm.max_map_count` through `su`; without
+  it the GPU's views of the Mac's memory run out after about 190 MB. Root is also what Gunyah and
+  the engine's scheduling boost need.
+
+## Install and run
+
+1. Install `Henge-android.apk` from the `android-latest` release. Every build is signed with the
+   same debug key, so a new APK installs over the old one and keeps the Mac.
+2. In the app, install macOS (keep the tablet plugged in), or import an `.ipsw` you already have.
+3. In Settings choose **Graphics: reims** and **CPU engine: JIT**, then start the Mac.
+
+Settings that matter:
+
+| Setting | Choices | Use |
+|---|---|---|
+| Graphics | GPU, Off, Capture, Vulkan, reims | **reims** is the only one that draws the desktop. |
+| Mac screen | 1024, 1280, 1600, 1920 | Fewer pixels is faster: every pixel is copied. Default 1280x800. |
+| Vulkan driver | Turnip, System | System is the one seen working. |
+| CPU engine | JIT, Gunyah | JIT. Gunyah resets the Xiaomi Pad 7. |
+| Mac's memory | In RAM, On storage | In RAM. On storage is the fallback where the hand-over fails. |
+| GPU memory checks | Used, Everything | Used. Everything is for a window that shows stale pixels. |
+| Touch | Direct, Trackpad | |
+| Sound | On, Off | |
+
+In macOS, a still wallpaper, no screen saver, and Reduce Motion and Reduce Transparency
+(System Settings, Accessibility) lower the GPU work.
+
+## Reporting a problem
+
+The app's log is the evidence: Settings saves it to `Download/Henge/`. The lines that say the most:
+
+- `reims: guest RAM mapped at ... (on the guest's 16 KiB pages)`: must say "on" (0.3.27).
+- `command 56 faulted: task N not created`: no GPU task could start, so nothing is drawn.
+- `reims: ... frames/s, each ... ms to draw`: the frame rate and each frame's cost, every 10 s.
+- `reims: registers: ...`: what a GPU register access costs, and the slowest ones.
+- `henge: guest N s: ... CPUs waited X s on it`: how long the Mac's CPUs stood waiting for the GPU
+  in each 30 s.
+- `metal2vulkan: copied host buffers: ...` and `host mappings: ...`: the cost of the copies.
+
+For a Gunyah reset, the kernel's last messages are needed. `/sys/fs/pstore` was empty on the test
+tablet, so record them live before starting the Mac, as root:
+
+    dmesg -w | while read l; do echo "$l" >> /sdcard/Henge/gunyah-dmesg.txt; sync; done
+
+## Building
+
+CI does all of this on each push (`.github/workflows/android-apk.yml`).
+
+    android/build_deps.sh             # static zlib, libffi, pcre2, glib, libslirp, mbedtls, curl in ~/deps/arm64
     make -f android/Makefile          # build/android/hengevm-android, libhengevm.a, test_*
     make -f android/Makefile test     # under qemu-aarch64 when not on arm64
+    android/gpu/reims/build.sh        # reims-vgpu and metal2vulkan for the tablet (needs rustup and an NDK)
 
-Install macOS on the device (keep it plugged in; hours under emulation):
+The engine alone runs from Termux or `adb shell`, with a VNC viewer on 127.0.0.1:5900:
 
     ./hengevm-android --install ~/mac --release 15.6.1 --ram 4096 --cpus 2
-
-Then boot it:
-
     ./hengevm-android --mac ~/mac --vnc 5900
 
-Or boot explicit files (e.g. from an iOS install):
+`test_mem`'s three `dczva` failures under `qemu -cpu max` are the emulator's (it reports a 512-byte DC ZVA).
 
-    ./hengevm-android --rom AVPBooter.vmapple2.bin --disk Disk.img --aux AuxiliaryStorage \
-        --ecid <ECID> --seed <SEED> --ram 4096 --cpus 2 --vnc 5900
+## How it is put together
 
-Then open a VNC viewer (e.g. AVNC) to 127.0.0.1:5900.
+- **Engine** (`hengevm-android`, a static arm64 program started by the app): the JIT or Gunyah, the
+  MMU, the vmapple devices, the disk, NAT networking through libslirp, a VNC server for input, and
+  sound over a local socket.
+- **App** (`apk/`): settings, the install, the screen, and the Mac's GPU. With Graphics: reims the
+  paravirtual GPU device runs in the app on [reims-vgpu](https://github.com/steelbrain/reims-vgpu),
+  which draws the Mac's Metal work on Vulkan through
+  [metal2vulkan](https://github.com/steelbrain/metal2vulkan). Both are fetched at pinned commits and
+  patched for Android by `gpu/reims/android_port.py`.
+- The engine and the app share the Mac's RAM and a small file of register slots (`gpu/reims_link.h`).
 
-Guest RAM is backed by `<disk>.ram` (set `HV_RAM_FILE` to move it).
-`test_mem`'s three `dczva` failures under `qemu -cpu max` are emulator-only (it reports 512-byte DC ZVA).
+More: [gpu/REIMS.md](gpu/REIMS.md) (Graphics: reims, every run on the tablet),
+[gpu/README.md](gpu/README.md) and [VULKAN.md](VULKAN.md) (the older renderer).
