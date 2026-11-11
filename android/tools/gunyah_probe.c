@@ -43,6 +43,11 @@
      --gic ADDR      the interrupt controller's address (hex; the redistributors 64 KB after it)
      --size-max MB   the tree's limit of the VM's own memory above the base address
      --ram-at ADDR   the memory beyond the first region at ADDR (hex), not where the layout has it
+     --ram-rw        the memory beyond the first region given readable and writable, not executable
+     --shm-alloc     with --ram shm: no address in the tree; the resource manager is to choose one
+     --peek          after the guest ran, this program reads a byte of the first region: whether memory lent
+                     to the VM is still the host's to read (Henge's devices read and write the Mac's memory).
+                     Read in a child process, so a refusal is a signal to the child; it may also reset the tablet.
      --tree-only F   no VM: the tree this run would give, written to F
      --kmsg FILE     the kernel's messages from now on copied to FILE, each forced to storage as it comes:
                      what the kernel said last before a reset
@@ -57,6 +62,13 @@
    of Qualcomm's source of late 2023): the tree is taken; a first region that is shared is refused at the start
    and one that is lent starts, at 0x80000000; base address 0 is refused; 64 MB more, lent, is refused whichever
    way the tree names it. The guest's ID register shows no 16 KB pages.
+
+   And to 0.3.41: 16 KB pages work in the guest, whatever the ID register says. A lent first region works up to
+   256 MB, as long as the kernel takes it as one piece; any second piece of memory, lent or shared, named in the
+   tree or not, is refused at the start. Base addresses 0x70000000 and 0x80000000 start, 0, 2 MB and 0x40000000
+   do not; the interrupt controller may be at 0x10000000. Stores below 1 GB with no memory there come out to
+   the VMM; at 0x40000000 and 0x50000000 the guest takes an external abort. (More than one CPU was refused,
+   but with the probe layout's redistributor region, which has room for one.)
 
    What the resource manager wants of the tree (Qualcomm's source, vm_config_parser.c and vm_creation.c; the
    tablet answered "memory invalid" to VM_INIT, which in the 2023 source is also what a tree it cannot accept
@@ -80,6 +92,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "gunyah_probe_blobs.h"
@@ -144,6 +157,7 @@ static int npieces;
 enum { RAM_SHM, RAM_RESMEM, RAM_PRIVATE, RAM_PLAIN };
 static int ram_how = RAM_SHM;
 static uint64_t size_max_mb;
+static int shm_alloc, ram_rw;
 
 /* ---- crumbs: a line forced to storage before each step ---- */
 static const char *crumb_path;
@@ -348,7 +362,8 @@ static size_t build_dtb(uint8_t *out, size_t cap, const Layout *L, int ncpus, in
         prop_u32(&f, "qcom,label", pieces[i].label);
         prop_u32(&f, "label", pieces[i].label);
         uint32_t at[2] = {(uint32_t)(pieces[i].pa >> 32), (uint32_t)pieces[i].pa};
-        prop_u32s(&f, "base", at, 2);
+        if (shm_alloc) prop(&f, "allocate-base", NULL, 0);
+        else prop_u32s(&f, "base", at, 2);
         end(&f);
         end(&f);
     }
@@ -462,7 +477,7 @@ static int share(int vm, uint32_t *label, uint64_t pa, uint8_t *host, uint64_t s
     int count = 0;
     while (done < size) {
         uint64_t n = size - done < chunk ? size - done : chunk;
-        struct gh_userspace_memory_region r = {.label = *label, .flags = GH_MEM_RWX, .guest_phys_addr = pa + done,
+        struct gh_userspace_memory_region r = {.label = *label, .flags = declare && ram_rw ? 3 : GH_MEM_RWX, .guest_phys_addr = pa + done,
                                                .memory_size = n, .userspace_addr = (uintptr_t)host + done};
         crumb("try: give the VM %s: %llu MB at %#llx (piece %d)", what, (unsigned long long)(n >> 20),
               (unsigned long long)(pa + done), count + 1);
@@ -491,7 +506,7 @@ int main(int argc, char **argv) {
     Layout *L = &layout;
     layout = SMALL;
     uint64_t mem_mb = 2, image_mb = 0, dtb_room_kb = 0, poke = 0, base = ~0ull, gic = 0, ram_at = ~0ull;
-    int mmu16k = 0;
+    int mmu16k = 0, peek = 0;
     const char *kmsg_path = NULL, *tree_only = NULL;
     int touch = 0, ncpus = 1, bells = 0, seconds = 6;
     const char *until = "";
@@ -502,6 +517,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--lend")) lend_image = lend_rest = 1;
         else if (!strcmp(a, "--lend-image")) lend_image = 1;
         else if (!strcmp(a, "--mmu16k")) mmu16k = 1;
+        else if (!strcmp(a, "--ram-rw")) ram_rw = 1;
+        else if (!strcmp(a, "--shm-alloc")) shm_alloc = 1;
+        else if (!strcmp(a, "--peek")) peek = 1;
         else if (!strcmp(a, "--bells")) bells = 1;
         else if (!v) { fprintf(stderr, "gunyah-probe: %s needs a value\n", a); return 2; }
         else if (!strcmp(a, "--mem")) mem_mb = strtoull(v, NULL, 10), i++;
@@ -742,6 +760,21 @@ int main(int argc, char **argv) {
         why = whybuf;
     }
 
+    if (peek) {
+        crumb("try: read a byte of the first region from the host (it is %s)", lend_image ? "lent" : "shared");
+        fflush(stdout);
+        pid_t child = fork();
+        if (child == 0) {
+            volatile uint8_t b = image[0x200000 - 0x1000 < L->image_size ? 0x200000 - 0x1000 : 0];
+            _exit(b == 0 ? 0 : 1); /* either way it was read */
+        }
+        int st = 0;
+        waitpid(child, &st, 0);
+        if (WIFEXITED(st)) printf("host reads its memory  yes: the first region is still the host's to read\n");
+        else printf("host reads its memory  NO: the read was stopped by signal %d\n", WIFSIGNALED(st) ? WTERMSIG(st) : -1);
+        crumb("ok: the read ended (%s)", WIFEXITED(st) ? "read" : "signal");
+        if (!WIFEXITED(st) && !why) why = "the host cannot read memory lent to the VM";
+    }
     crumb("try: take the VM down");
     for (int i = 0; i < ncpus; i++) close(vcpu_fd[i]);
     close(vm);

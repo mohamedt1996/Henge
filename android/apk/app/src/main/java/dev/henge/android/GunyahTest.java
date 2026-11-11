@@ -27,13 +27,10 @@ final class GunyahTest {
      * the guest can write is the way the later steps use (%R). "use": must pass before the next. "info": an
      * answer either way, about what the Mac will need.
      *
-     * 0.3.35 to 0.3.39 were all refused at the same request (VM_INIT, "memory invalid"): the tree named its
-     * memory node `memory@80000000`, and the resource manager fails a tree with any memory node not named
-     * exactly `memory`. With 0.3.40's tree the Pad 7 started a VM and ran the guest: the first region lent, 2 MB at
-     * 0x80000000. Shared, at base 0, or with 64 MB more (lent) it was refused at the start, and the guest's ID
-     * register showed no 16 KB pages. These steps ask what was left open: 16 KB pages tried, not read; how long
-     * the first region may be; more memory shared while the first region is lent, small first; where the base
-     * address and the interrupt controller may be.
+     * What the Pad 7 has answered so far is at the top of android/tools/gunyah_probe.c. In short: a VM starts with
+     * one piece of memory, lent, at 0x70000000 or 0x80000000, up to 256 MB; 16 KB pages work; any second piece is
+     * refused. These steps ask: more than one CPU with room for their redistributors; a second, shared piece in
+     * the ways not tried; and, last, whether the host can still read memory it lent (it may reset the tablet).
      */
     static final String[][] STEPS = {
             {"Open /dev/gunyah", "--until open", "6", "pre"},
@@ -43,35 +40,21 @@ final class GunyahTest {
             {"Add a CPU", "--until vcpu", "6", "pre"},
             {"Start: 2 MB at 0x80000000, lent", "--lend", "6", "start"},
             {"Run a tiny program in it", "%L", "6", "use"},
-            {"16 KB pages (what macOS has), turned on in the guest", "%L --mmu16k", "6", "info"},
-            {"First region 4 MB, lent, every page written", "--lend --image-mb 4 --touch", "10", "info"},
-            {"First region 16 MB", "--lend --image-mb 16 --touch", "10", "info"},
-            {"First region 64 MB", "--lend --image-mb 64 --touch", "15", "info"},
-            {"First region 256 MB", "--lend --image-mb 256 --touch", "25", "info"},
-            {"First region 512 MB", "--lend --image-mb 512 --touch", "40", "info"},
-            {"2 MB more, shared, a shm device in the tree (first region lent)", "--lend-image --mem 4 --touch --ram shm", "10", "ram"},
-            {"2 MB more, shared, a reserved-memory node", "--lend-image --mem 4 --touch --ram resmem", "10", "ram"},
-            {"2 MB more, shared, said nowhere in the tree", "--lend-image --mem 4 --touch --ram plain", "10", "ram"},
-            {"2 MB more, lent, a shm device", "--lend --mem 4 --touch --ram shm", "10", "info"},
-            {"2 MB more, lent, one private piece after the first region", "--lend --mem 4 --touch --ram private", "10", "info"},
-            {"64 MB more, shared, the way that worked", "--lend-image %R --mem 66 --touch", "15", "info"},
-            {"256 MB more, shared, the way that worked", "--lend-image %R --mem 258 --touch", "25", "info"},
-            {"The interrupt controller at the Mac's address (0x10000000)", "--lend --gic 10000000", "6", "info"},
-            {"Base address 2 MB", "--lend --base 200000", "6", "info"},
-            {"Base address 0x40000000", "--lend --base 40000000", "6", "info"},
-            {"Base address 0x70000000 (the Mac's memory), interrupt controller at 0x10000000", "--lend --base 70000000 --gic 10000000", "6", "info"},
-            {"Base address 0, the VM's own memory limited to 256 MB", "--lend --layout zero --mem 0 --size-max 256", "6", "info"},
-            {"Base address 0, interrupt controller at 0x3fff0000", "--lend --layout zero --mem 0 --gic 3fff0000", "6", "info"},
-            {"2 MB below the base address (0x100000, the Mac's ROM), shared, a shm device", "--lend-image --mem 4 --touch --ram shm --ram-at 100000", "10", "info"},
-            {"2 MB below the base address, shared, a reserved-memory node", "--lend-image --mem 4 --touch --ram resmem --ram-at 100000", "10", "info"},
-            {"2 CPUs", "%L --cpus 2", "10", "info"},
-            {"4 CPUs", "%L --cpus 4", "10", "info"},
-            {"The Mac's interrupt doorbells", "%L --cpus 4 --bells", "10", "info"},
-            {"A store at 0x50000000 (the Mac's PCI devices) comes out to Henge", "%L --poke 50000000", "6", "info"},
-            {"A store at 0x40000000 (the Mac's PCI configuration) comes out to Henge", "%L --poke 40000000", "6", "info"},
-            {"A store at 0x20010000 (the Mac's serial port) comes out to Henge", "%L --poke 20010000", "6", "info"},
+            {"2 CPUs (interrupt controller at 0x10000000, room for each)", "--lend --gic 10000000 --cpus 2", "10", "info"},
+            {"4 CPUs", "--lend --gic 10000000 --cpus 4", "10", "info"},
+            {"4 CPUs and the Mac's interrupt doorbells", "--lend --gic 10000000 --cpus 4 --bells", "10", "info"},
+            {"As the Mac would be: 256 MB at 0x70000000, 4 CPUs, 16 KB pages", "--lend --base 70000000 --gic 10000000 --image-mb 256 --touch --mmu16k --cpus 4", "30", "info"},
+            {"A second piece, shared, shm, the VM's own memory limited to the first", "--lend-image --mem 4 --touch --ram shm --size-max 2", "10", "ram"},
+            {"A second piece, shared, shm, not executable", "--lend-image --mem 4 --touch --ram shm --ram-rw", "10", "ram"},
+            {"A second piece, shared, shm, not executable, own memory limited", "--lend-image --mem 4 --touch --ram shm --ram-rw --size-max 2", "10", "ram"},
+            {"A second piece, shared, reserved-memory, own memory limited", "--lend-image --mem 4 --touch --ram resmem --size-max 2", "10", "ram"},
+            {"A second piece, shared, shm, far above the first (0x90000000)", "--lend-image --mem 4 --touch --ram shm --ram-at 90000000", "10", "ram"},
+            {"A second piece, shared, shm, at 0x60000000 (below the base, above 1 GB)", "--lend-image --mem 4 --touch --ram shm --ram-at 60000000", "10", "ram"},
+            {"A second piece, shared, shm, where the resource manager chooses", "--lend-image --mem 4 --ram shm --shm-alloc", "10", "info"},
+            {"A second piece, shared, shm, not executable, where it chooses", "--lend-image --mem 4 --ram shm --shm-alloc --ram-rw", "10", "info"},
+            {"The host reads memory it lent to the VM (may reset the tablet)", "--lend --peek", "6", "info"},
     };
-    private static final int VERSION = 6; // of STEPS: progress saved by another list starts over
+    private static final int VERSION = 7; // of STEPS: progress saved by another list starts over
 
     static volatile boolean running;
 
@@ -211,7 +194,7 @@ final class GunyahTest {
                     said += "  This layout starts: the steps after the layouts use it.\n";
                 }
                 if (pass && kind.equals("ram") && ram == null) {
-                    String how = STEPS[k][1].replaceAll(".*(--ram \\w+).*", "$1");
+                    String how = STEPS[k][1].replaceAll("^--lend-image --mem 4 --touch ", "");
                     e.putString("ram", how);
                     said += "  The guest wrote all of it: the steps after use this way (" + how + ").\n";
                 }
