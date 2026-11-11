@@ -313,6 +313,12 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
             setenv("HV_RAM_FD", number, 1);
             fprintf(stderr, "hengevm: guest RAM (%llu MB) is in memory (%s), not written to storage\n",
                     (unsigned long long)(ram_size >> 20), name);
+            /* HV_RAM_THP (Android, Settings > Huge pages; the app sets the kernel's shmem huge pages to
+               `advise` with root): 2 MB pages for the Mac's RAM, so the JIT's loads and stores miss the host's
+               TLB less. Not on Gunyah, which takes its own memory and resets the tablet on huge pages. */
+            if (getenv("HV_RAM_THP"))
+                fprintf(stderr, "hengevm: guest RAM asked for in huge pages: %s\n",
+                        madvise(b->ram, ram_size, MADV_HUGEPAGE) == 0 ? "the kernel took the request" : strerror(errno));
         } else {
             fprintf(stderr, "hengevm: guest RAM in memory failed (%s); a file instead\n", strerror(errno));
             if (fd >= 0) close(fd);

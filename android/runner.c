@@ -51,15 +51,17 @@ static void host_state(FILE *out) {
     FILE *f = fopen("/proc/meminfo", "r");
     if (f) {
         char line[160];
-        long long total = -1, avail = -1, swap_total = -1, swap_free = -1, v;
+        long long total = -1, avail = -1, swap_total = -1, swap_free = -1, huge = -1, v;
         while (fgets(line, sizeof line, f)) {
             if (sscanf(line, "MemTotal: %lld kB", &v) == 1) total = v;
             else if (sscanf(line, "MemAvailable: %lld kB", &v) == 1) avail = v;
             else if (sscanf(line, "SwapTotal: %lld kB", &v) == 1) swap_total = v;
             else if (sscanf(line, "SwapFree: %lld kB", &v) == 1) swap_free = v;
+            else if (sscanf(line, "ShmemHugePages: %lld kB", &v) == 1) huge = v;
         }
         fclose(f);
         if (total > 0 && avail >= 0) fprintf(out, " | tablet: %lld of %lld MB of memory available", avail >> 10, total >> 10);
+        if (huge > 0) fprintf(out, ", %lld MB in huge pages", huge >> 10);
         if (swap_total > 0 && swap_free >= 0) fprintf(out, ", %lld of %lld MB of swap used", (swap_total - swap_free) >> 10, swap_total >> 10);
     }
     f = fopen("/proc/pressure/memory", "r");

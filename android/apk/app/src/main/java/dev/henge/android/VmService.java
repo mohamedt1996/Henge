@@ -296,6 +296,8 @@ public class VmService extends Service {
             boolean ramInMemory = !install && !"storage".equals(prefs.getString("ram", "memory"))
                     && !build.equals(prefs.getString("ramFileBuild", ""));
             if (ramInMemory) pb.environment().put("HV_RAM_MEMFD", "1");
+            if (!install && hugePages(log, ramInMemory && !gunyah() && "on".equals(prefs.getString("hugepages", "off"))))
+                pb.environment().put("HV_RAM_THP", "1");
             // The Mac's disk: the data is flushed at each of macOS's flushes (fdatasync), not the file's times too.
             pb.environment().put("HV_FLUSH", "2");
             // Graphics: reims: the Mac's screen size (Settings), every pixel of which is copied on this driver.
@@ -323,6 +325,7 @@ public class VmService extends Service {
             }
         }
         if (!install) fullSpeed(log, false);
+        if (!install) hugePages(log, false);
         if (reims && GpuView.loaded) GpuView.nativeReimsStop();
         active.delete();
         if (!install) appendLog(log, "henge app: the engine exited (" + code + ")");
@@ -456,6 +459,39 @@ public class VmService extends Service {
         DeviceCheck.sh(true, "for p in /sys/devices/system/cpu/cpufreq/policy*; do echo performance > $p/scaling_governor; done; true");
         appendLog(log, "henge app: full speed: CPU governors set to performance (were " + was + "); now "
                 + DeviceCheck.sh(true, "cat /sys/devices/system/cpu/cpufreq/policy*/scaling_governor | tr '\\n' ' '; true").trim());
+    }
+
+    /**
+     * Settings > Huge pages (root): the kernel's huge pages for shared memory set to `advise` while the Mac
+     * runs, so the Mac's RAM (a memfd the engine asks huge pages for, devices/vmapple.c) is in 2 MB pages.
+     * The setting as it was is kept and put back when the Mac stops, or at the next start. Answers whether
+     * the kernel now gives them.
+     */
+    private boolean hugePages(File log, boolean on) {
+        android.content.SharedPreferences p = getSharedPreferences("henge", MODE_PRIVATE);
+        final String file = "/sys/kernel/mm/transparent_hugepage/shmem_enabled";
+        String saved = p.getString("shmemHuge", "");
+        if (saved.matches("[a-z_]+")) {
+            DeviceCheck.sh(true, "echo " + saved + " > " + file + "; true");
+            p.edit().remove("shmemHuge").commit();
+            appendLog(log, "henge app: huge pages off: shared memory's are `" + saved + "` again");
+        }
+        if (!on) return false;
+        // The file reads like "always within_size advise [never] deny force": the one in brackets is set.
+        String now = DeviceCheck.sh(true, "cat " + file + "; true").trim();
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\[([a-z_]+)\\]").matcher(now);
+        if (!m.find() || !now.contains("advise")) {
+            appendLog(log, "henge app: huge pages: no root, or this kernel has none for shared memory (" + now + ")");
+            return false;
+        }
+        String was = m.group(1);
+        if (was.equals("never") || was.equals("deny")) {
+            p.edit().putString("shmemHuge", was).commit();
+            DeviceCheck.sh(true, "echo advise > " + file + "; true");
+        }
+        String after = DeviceCheck.sh(true, "cat " + file + "; true").trim();
+        appendLog(log, "henge app: huge pages: shared memory's were `" + was + "`, now: " + after);
+        return after.contains("[advise]") || after.contains("[always]") || after.contains("[within_size]") || after.contains("[force]");
     }
 
     private static int le32(byte[] b, int at) {

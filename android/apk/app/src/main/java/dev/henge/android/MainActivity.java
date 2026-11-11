@@ -606,6 +606,13 @@ public class MainActivity extends Activity {
         fnote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(fnote);
         c.addView(hairline());
+        c.addView(choiceRow("Huge pages", new String[]{"Off", "On"}, "on".equals(prefs.getString("hugepages", "off")) ? 1 : 0,
+                i -> { prefs.edit().putString("hugepages", i == 1 ? "on" : "off").apply(); render(true); }));
+        TextView hnote = text("Needs root. The Mac's RAM in 2 MB pages (JIT engine, Mac's memory: In RAM): the CPU engine finds "
+                + "the Mac's memory faster. The Mac's memory is then taken 2 MB at a time. Experimental; put back when the Mac stops.", 13, DIM, false);
+        hnote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(hnote);
+        c.addView(hairline());
         c.addView(choiceRow("CPU engine", ENGINE_LABELS, java.util.Arrays.asList(ENGINE_MODES).indexOf(engineMode()),
                 i -> { prefs.edit().putString("engine", ENGINE_MODES[i]).apply(); render(true); }));
         TextView enote = text(ENGINE_NOTES[Math.max(0, java.util.Arrays.asList(ENGINE_MODES).indexOf(engineMode()))], 13, DIM, false);
