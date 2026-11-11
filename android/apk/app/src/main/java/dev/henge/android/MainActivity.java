@@ -835,6 +835,10 @@ public class MainActivity extends Activity {
         }
         if (!report.isEmpty() && !GunyahTest.running) {
             c.addView(gap(10));
+            if (next < n - 1) {
+                c.addView(link("Skip step " + (next + 1), v -> { GunyahTest.skip(this); render(true); }));
+                c.addView(gap(10));
+            }
             c.addView(link("Start over", v -> { GunyahTest.startOver(this); render(true); }));
         }
         page.addView(gap(14));

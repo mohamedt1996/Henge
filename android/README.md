@@ -102,7 +102,11 @@ which step, and which request in it, the tablet did not survive (also `gunyah-te
 
 On the tablet (2026-11-11, 0.3.30; Android 17, kernel 6.1.138-android14-11): steps 1-5 pass (open, create,
 2 MB, device tree, vCPU) and step 6, `GH_VM_START` of the 2 MB VM, is refused with EINVAL, with no reset.
-0.3.31 adds the kernel's messages during a failed step to the report. The same check: no udmabuf
+0.3.31 adds the kernel's messages during a failed step to the report. They say `gh_rsc_mgr: RM rejected
+message 5600000b. Error: 10` and `Failed to initialize VM: -22`: the resource manager refuses VM_INIT with
+"memory invalid" for the probe's VM (2 MB at 0x80000000), after accepting its configuration, so an
+unsigned VM as such is not what it refuses. 0.3.32 lets a refused step be skipped and runs every later
+step at the engine's addresses, starting with a VM that has no memory but the boot region and ROM. The same check: no udmabuf
 (`# CONFIG_UDMABUF is not set`, no module), so no zero-copy without a kernel module built for it.
 
 For a Gunyah reset, the kernel's last messages are needed. `/sys/fs/pstore` was empty on the test

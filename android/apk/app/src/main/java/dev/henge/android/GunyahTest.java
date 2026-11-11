@@ -27,16 +27,18 @@ final class GunyahTest {
             {"Give it its device tree", "--until tree", "6"},
             {"Add a CPU", "--until vcpu", "6"},
             {"Start it, without running it", "--until start", "6"},
-            {"Run a tiny program in it", "", "6"},
-            {"256 MB of memory", "--mem 256", "6"},
-            {"256 MB, every page written", "--mem 256 --touch", "20"},
-            {"1 GB, every page written", "--mem 1024 --touch", "40"},
-            {"3 GB, every page written", "--mem 3072 --touch", "90"},
-            {"2 CPUs", "--mem 256 --cpus 2", "10"},
-            {"4 CPUs", "--mem 256 --cpus 4", "10"},
-            {"The Mac's interrupt doorbells", "--mem 256 --cpus 4 --bells", "10"},
-            {"The Mac's memory layout, 256 MB", "--layout engine --mem 256 --cpus 4 --bells --touch", "20"},
-            {"The Mac's memory layout, 3 GB", "--layout engine --mem 3072 --cpus 4 --bells --touch", "90"},
+            // The tablet's resource manager refuses the step above (VM_INIT: error 10, memory invalid) and starts
+            // the engine's VM far enough to reset the tablet, so from here everything is at the engine's addresses.
+            {"Start it at the Mac's addresses, without running it", "--layout engine --mem 0 --until start", "6"},
+            {"Run a tiny program in it", "--layout engine --mem 0", "6"},
+            {"256 MB of memory", "--layout engine --mem 256", "6"},
+            {"256 MB, every page written", "--layout engine --mem 256 --touch", "20"},
+            {"1 GB, every page written", "--layout engine --mem 1024 --touch", "40"},
+            {"3 GB, every page written", "--layout engine --mem 3072 --touch", "90"},
+            {"2 CPUs", "--layout engine --mem 256 --cpus 2", "10"},
+            {"4 CPUs", "--layout engine --mem 256 --cpus 4", "10"},
+            {"The Mac's interrupt doorbells", "--layout engine --mem 256 --cpus 4 --bells", "10"},
+            {"All of it: 3 GB, 4 CPUs, doorbells", "--layout engine --mem 3072 --cpus 4 --bells --touch", "90"},
     };
 
     static volatile boolean running;
@@ -77,6 +79,16 @@ final class GunyahTest {
         p.edit().putInt("began", -1).putInt("reset", k).putString("report", p.getString("report", "") + said + "\n").commit();
         save(c);
         return true;
+    }
+
+    /** Past a step that was refused cleanly: the steps after it may not depend on it. */
+    static void skip(Context c) {
+        SharedPreferences p = prefs(c);
+        int k = next(c);
+        if (k >= STEPS.length) return;
+        p.edit().putInt("next", k + 1).putInt("reset", -1)
+                .putString("report", p.getString("report", "") + "Step " + (k + 1) + " (" + STEPS[k][0] + ") skipped.\n\n").commit();
+        save(c);
     }
 
     /** The step the tablet last reset in, -1 if none: running it again is the user's choice, said plainly. */
