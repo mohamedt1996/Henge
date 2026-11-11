@@ -17,3 +17,8 @@ echo "page size:   $(sh getconf PAGE_SIZE)"
 echo "huge pages:  $(su_sh cat /sys/kernel/mm/transparent_hugepage/enabled || echo unknown)"
 echo "SELinux:     $(sh getenforce)"
 echo "big cores:   $(for c in $(sh ls /sys/devices/system/cpu/ | grep -E '^cpu[0-9]+$'); do printf '%s=%s ' $c $(sh cat /sys/devices/system/cpu/$c/cpufreq/cpuinfo_max_freq); done)"
+# /dev/udmabuf: dma-bufs of memfd pages, which reims-vgpu's views and a no-copy import of the Mac's memory need.
+echo "udmabuf:     $(su_sh ls -lZ /dev/udmabuf || echo absent)"
+echo "  config:    $(su_sh 'zcat /proc/config.gz | grep -i UDMABUF' | tr '\n' ' ')"
+echo "  module:    $(su_sh "find /vendor_dlkm /system_dlkm /vendor/lib/modules /system/lib/modules /odm/lib/modules -name '*udmabuf*'" | head -3 | tr '\n' ' ')"
+echo "  loaded:    $(su_sh ls -d /sys/module/udmabuf /sys/class/misc/udmabuf | tr '\n' ' ')"

@@ -35,6 +35,7 @@ final class DeviceCheck {
             String r = root ? sh(true, "ls -lZ " + d).trim() : "";
             line(b, d, !r.isEmpty() ? r : new File(d).exists() ? "present (no root to read it)" : "absent");
         }
+        line(b, "udmabuf", udmabuf(root));
         ActivityManager.MemoryInfo mi = new ActivityManager.MemoryInfo();
         c.getSystemService(ActivityManager.class).getMemoryInfo(mi);
         line(b, "memory", (mi.totalMem >> 20) + " MB, " + (mi.availMem >> 20) + " MB free now");
@@ -69,6 +70,38 @@ final class DeviceCheck {
             o.write(out.getBytes(StandardCharsets.UTF_8));
         } catch (Exception ignored) { }
         return out;
+    }
+
+    /**
+     * /dev/udmabuf: the kernel device that makes a dma-buf of memfd pages. With it reims-vgpu views the Mac's
+     * memory a mapping a view, not a mapping a run of pages, and a Vulkan driver that imports dma-bufs can use
+     * the Mac's memory in place, with no copies (android/gpu/REIMS.md). Is it there; if not, is it in this
+     * kernel's configuration, and is there a module of it that could be loaded?
+     */
+    private static String udmabuf(boolean root) {
+        if (new File("/dev/udmabuf").exists()) {
+            String ls = root ? sh(true, "ls -lZ /dev/udmabuf").trim() : "";
+            String limits = read("/sys/module/udmabuf/parameters/list_limit");
+            String size = read("/sys/module/udmabuf/parameters/size_limit_mb");
+            return "present" + (ls.isEmpty() ? "" : ": " + ls)
+                    + (limits.isEmpty() ? "" : "; at most " + limits + " pieces and " + size + " MB a buffer");
+        }
+        if (!root) return "absent (/dev/udmabuf); root would say whether the kernel has it";
+        // Each command ends in true: a grep or find that matches nothing is an answer, not a failure.
+        String config = sh(true, "zcat /proc/config.gz 2>/dev/null | grep -i UDMABUF; true").trim().replace('\n', ' ');
+        String module = sh(true, "find /vendor_dlkm /system_dlkm /vendor/lib/modules /system/lib/modules /odm/lib/modules "
+                + "-name '*udmabuf*' 2>/dev/null | head -3; true").trim().replace('\n', ' ');
+        String loaded = sh(true, "ls -d /sys/module/udmabuf /sys/class/misc/udmabuf 2>/dev/null; true").trim().replace('\n', ' ');
+        StringBuilder s = new StringBuilder("absent (/dev/udmabuf). kernel config: ");
+        s.append(config.isEmpty() ? "no answer (/proc/config.gz unreadable or silent on it)" : config);
+        s.append("; module file: ").append(module.isEmpty() ? "none found" : module);
+        if (!loaded.isEmpty()) s.append("; in the running kernel: ").append(loaded);
+        s.append(". ");
+        if (!module.isEmpty()) s.append("Verdict: a module exists and is not loaded; it could be loaded with root.");
+        else if (!loaded.isEmpty() || config.contains("=y")) s.append("Verdict: the kernel has it, and no device node was made for it.");
+        else if (config.contains("=m")) s.append("Verdict: built as a module, and its file was not found.");
+        else s.append("Verdict: this kernel does not have it; it would take a kernel module built for this kernel.");
+        return s.toString();
     }
 
     private static String vulkan(Context c) {
