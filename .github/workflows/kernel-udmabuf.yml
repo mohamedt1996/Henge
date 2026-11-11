@@ -1,0 +1,104 @@
+name: Kernel with udmabuf (Xiaomi Pad 7)
+# android/kernel/README.md. Google's android14-6.1 kernel at the tablet's commit, with CONFIG_UDMABUF=y.
+on:
+  workflow_dispatch:
+  push:
+    branches: [android-port]
+    paths: ['.github/workflows/kernel-udmabuf.yml']
+permissions:
+  contents: write
+env:
+  COMMIT: 0c3d559bcd85
+  RELEASE: 6.1.138-android14-11-g0c3d559bcd85-ab14529422
+  LOCALVERSION: -android14-11-g0c3d559bcd85-ab14529422
+jobs:
+  kernel:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - name: Room on the disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+      - name: The commit's full name
+        run: |
+          mkdir find && cd find && git init -q
+          git fetch -q --filter=tree:0 https://android.googlesource.com/kernel/common '+refs/heads/android14-6.1*:refs/remotes/o/*'
+          full=$(git rev-parse --verify "$COMMIT^{commit}")
+          echo "FULL=$full" >> "$GITHUB_ENV"
+          git log -1 --format='%H %cd %s' "$full"
+          git branch -r --contains "$full" | head -20
+      - name: Kernel source and Google's build tools
+        run: |
+          mkdir -p ~/bin && curl -sS https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo && chmod +x ~/bin/repo
+          mkdir k && cd k
+          ~/bin/repo init -q -u https://android.googlesource.com/kernel/manifest -b common-android14-6.1 --depth=1
+          ~/bin/repo sync -q -c --no-tags -j8
+          cd common
+          git fetch -q --depth=1 https://android.googlesource.com/kernel/common "$FULL"
+          git checkout -q FETCH_HEAD
+          git log -1 --format='%H %s'
+          df -h /
+      - name: udmabuf on, the original's release string
+        working-directory: k/common
+        run: |
+          grep -n 'CONFIG_MODULE_SIG_PROTECT\|CONFIG_UDMABUF' arch/arm64/configs/gki_defconfig || true
+          sed -i '/^CONFIG_MODULE_SIG_PROTECT=y$/d' arch/arm64/configs/gki_defconfig
+          echo 'CONFIG_UDMABUF=y' >> arch/arm64/configs/gki_defconfig
+          # The build's check that gki_defconfig is in `savedefconfig` order would refuse the appended line.
+          grep -rn 'check_defconfig' build.config.* || true
+          sed -i 's/check_defconfig//g' build.config.*
+          # The release string, whatever the build would have made of this tree's state.
+          printf '#!/bin/sh\necho "%s"\n' "$LOCALVERSION" > scripts/setlocalversion
+          git diff --stat
+      - name: Build
+        working-directory: k
+        run: |
+          tools/bazel run //common:kernel_aarch64_dist -- --dist_dir=$PWD/out/dist
+          ls -la out/dist | head -60
+      - name: It is the kernel asked for
+        working-directory: k
+        run: |
+          strings out/dist/Image | grep -m1 '^Linux version' | tee version.txt
+          grep -q "Linux version $RELEASE " version.txt
+          python3 - <<'PY'
+          import zlib
+          k = open('out/dist/Image', 'rb').read()
+          i = k.find(b'IKCFG_ST')
+          c = zlib.decompressobj(31).decompress(k[i + 8:]).decode()
+          for key in ('CONFIG_UDMABUF', 'CONFIG_MODULE_SIG_PROTECT', 'CONFIG_MODVERSIONS', 'CONFIG_GUNYAH=', 'CONFIG_TRIM_UNUSED_KSYMS'):
+              print([l for l in c.splitlines() if key in l])
+          assert 'CONFIG_UDMABUF=y' in c and 'CONFIG_MODULE_SIG_PROTECT=y' not in c
+          PY
+      - name: boot image
+        working-directory: k
+        run: |
+          # As the tablet's own: header v4, the kernel alone and uncompressed, Android 17.0.0 / 2026-10, 96 MB.
+          python3 tools/mkbootimg/mkbootimg.py --header_version 4 --kernel out/dist/Image \
+            --os_version 17.0.0 --os_patch_level 2026-10 -o boot-udmabuf.img
+          avb=$(ls external/avb/avbtool.py prebuilts/kernel-build-tools/linux-x86/bin/avbtool 2>/dev/null | head -1)
+          echo "avbtool: $avb"
+          python3 "$avb" add_hash_footer --image boot-udmabuf.img --partition_name boot --partition_size 100663296 \
+            || "$avb" add_hash_footer --image boot-udmabuf.img --partition_name boot --partition_size 100663296
+          ls -la boot-udmabuf.img
+          sha256sum boot-udmabuf.img out/dist/Image | tee sha256.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-udmabuf
+          path: |
+            k/boot-udmabuf.img
+            k/out/dist/Image
+            k/out/dist/System.map
+            k/out/dist/vmlinux.symvers
+            k/sha256.txt
+            k/version.txt
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: k
+        run: |
+          gh release delete kernel-udmabuf -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create kernel-udmabuf -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "Kernel with udmabuf for the Xiaomi Pad 7 (untested)" \
+            --notes "$RELEASE with CONFIG_UDMABUF=y. Untested: keep your original boot image and fastboot at hand. See android/kernel/README.md." \
+            boot-udmabuf.img sha256.txt
