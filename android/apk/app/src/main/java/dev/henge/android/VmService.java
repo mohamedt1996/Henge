@@ -509,11 +509,13 @@ public class VmService extends Service {
 
     /**
      * Settings > Zero-copy (root, a kernel with /dev/udmabuf: android/kernel/README.md). The device is root's
-     * and of a kind Android lets no app open, so with the setting on it is made this app's to open (mode 666
-     * and the GPU device's SELinux type, which apps may open and send requests to), and its limits are raised
+     * and of a kind Android lets no app open, so with the setting on it is made this app's alone to open: a
+     * SELinux type of its own that app domains may open and send requests to (live policy, until reboot), and
+     * this app's UID as owner with mode 600, so every other app is still refused. Its limits are raised
      * (pieces and MB a dma-buf) so a view of the Mac's scattered pages is few dma-bufs. reims-vgpu then maps
      * views of the Mac's memory as dma-bufs, and a Vulkan driver that imports dma-bufs (Turnip) uses the Mac's
-     * pages in place of copies. Off: the device is root's alone again, and reims-vgpu works as without it.
+     * pages in place of copies. Off: the device is root's alone again (owner, mode and SELinux type), and
+     * reims-vgpu works as without it.
      * reims-vgpu opens the device once a process, so a change takes hold when the app is started afresh.
      */
     private void udmabuf(File log, boolean on) {
@@ -522,10 +524,16 @@ public class VmService extends Service {
             return;
         }
         if (!on) {
-            DeviceCheck.sh(true, "chmod 600 /dev/udmabuf; true");
+            DeviceCheck.sh(true, "chown 0:0 /dev/udmabuf; chmod 600 /dev/udmabuf; chcon u:object_r:device:s0 /dev/udmabuf; true");
             return;
         }
-        String out = DeviceCheck.sh(true, "chmod 666 /dev/udmabuf; chcon u:object_r:gpu_device:s0 /dev/udmabuf; "
+        int uid = android.os.Process.myUid();
+        String out = DeviceCheck.sh(true, "magiskpolicy --live 'type henge_udmabuf' 'typeattribute henge_udmabuf dev_type' "
+                + "'typeattribute henge_udmabuf mlstrustedobject' 'allow henge_udmabuf tmpfs filesystem associate' "
+                + "'allow henge_udmabuf device filesystem associate' "
+                + "'allow untrusted_app_all henge_udmabuf chr_file { getattr open read write ioctl map }' >/dev/null 2>&1 "
+                + "&& chcon u:object_r:henge_udmabuf:s0 /dev/udmabuf || echo 'own SELinux type failed;'; "
+                + "chown " + uid + ":" + uid + " /dev/udmabuf; chmod 600 /dev/udmabuf; "
                 + "echo 8192 > /sys/module/udmabuf/parameters/list_limit; echo 256 > /sys/module/udmabuf/parameters/size_limit_mb; "
                 + "ls -lZ /dev/udmabuf; echo limits $(cat /sys/module/udmabuf/parameters/list_limit) pieces, "
                 + "$(cat /sys/module/udmabuf/parameters/size_limit_mb) MB; true").trim().replace('\n', ' ');

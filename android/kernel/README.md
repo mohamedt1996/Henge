@@ -10,8 +10,14 @@ loaded into it.
 
 - `CONFIG_UDMABUF=y`: `/dev/udmabuf`, a dma-buf of memfd pages, which is what lets a Vulkan driver use the
   Mac's memory in place (`android/gpu/REIMS.md`).
-- `CONFIG_MODULE_SIG_PROTECT` off: the modules in `system_dlkm` are signed with the key of Google's build,
-  which a rebuilt kernel does not have; with the protection on it would refuse them the symbols they need.
+- `CONFIG_SYSTEM_TRUSTED_KEYS`: the module-signing certificate of Google's build, taken from the stock kernel
+  image (Google CI build 14529422, or an `Image`/`boot.img` given to the workflow). The modules in `system_dlkm`
+  are signed with that build's key; trusted here, they verify as signed, so `CONFIG_MODULE_SIG_PROTECT` stays
+  on and module protection is the same as the stock kernel's. The build checks the certificate is in the result.
+
+`/dev/udmabuf` is root's alone as the kernel makes it (mode 0600, SELinux type `device`). With Settings > Zero-copy
+on, the app (with root) gives it a SELinux type of its own and its own UID as owner, mode 0600: only Henge can
+open it. Both last until reboot and are redone at each Mac start; with the setting off it is root's alone again.
 
 The release string is forced to the original's, so module directories named after it are still found. The
 result is `boot-udmabuf.img` (100663296 bytes, as the partition), released as `kernel-udmabuf`.
