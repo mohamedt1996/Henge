@@ -27,10 +27,11 @@ final class GunyahTest {
      * the guest can write is the way the later steps use (%R). "use": must pass before the next. "info": an
      * answer either way, about what the Mac will need.
      *
-     * What the Pad 7 has answered so far is at the top of android/tools/gunyah_probe.c. In short: a VM starts with
-     * one piece of memory, lent, at 0x70000000 or 0x80000000, up to 256 MB; 16 KB pages work; any second piece is
-     * refused. These steps ask: more than one CPU with room for their redistributors; a second, shared piece in
-     * the ways not tried; and, last, whether the host can still read memory it lent (it may reset the tablet).
+     * Everything the Pad 7 has answered is at the top of android/tools/gunyah_probe.c. In short: a VM runs with
+     * one lent piece of memory (<=256 MB) and up to 4 CPUs, 16 KB pages work, but the host cannot read memory it
+     * lent and no second piece can be added. The one road left: a program inside the guest asks the resource
+     * manager to share the VM's memory back to the host. Phase 1, here, only asks whether an unauthenticated VM
+     * may have a channel to the resource manager at all; if not, that road is closed with no kernel flash.
      */
     static final String[][] STEPS = {
             {"Open /dev/gunyah", "--until open", "6", "pre"},
@@ -40,21 +41,11 @@ final class GunyahTest {
             {"Add a CPU", "--until vcpu", "6", "pre"},
             {"Start: 2 MB at 0x80000000, lent", "--lend", "6", "start"},
             {"Run a tiny program in it", "%L", "6", "use"},
-            {"2 CPUs (interrupt controller at 0x10000000, room for each)", "--lend --gic 10000000 --cpus 2", "10", "info"},
-            {"4 CPUs", "--lend --gic 10000000 --cpus 4", "10", "info"},
-            {"4 CPUs and the Mac's interrupt doorbells", "--lend --gic 10000000 --cpus 4 --bells", "10", "info"},
-            {"As the Mac would be: 256 MB at 0x70000000, 4 CPUs, 16 KB pages", "--lend --base 70000000 --gic 10000000 --image-mb 256 --touch --mmu16k --cpus 4", "30", "info"},
-            {"A second piece, shared, shm, the VM's own memory limited to the first", "--lend-image --mem 4 --touch --ram shm --size-max 2", "10", "ram"},
-            {"A second piece, shared, shm, not executable", "--lend-image --mem 4 --touch --ram shm --ram-rw", "10", "ram"},
-            {"A second piece, shared, shm, not executable, own memory limited", "--lend-image --mem 4 --touch --ram shm --ram-rw --size-max 2", "10", "ram"},
-            {"A second piece, shared, reserved-memory, own memory limited", "--lend-image --mem 4 --touch --ram resmem --size-max 2", "10", "ram"},
-            {"A second piece, shared, shm, far above the first (0x90000000)", "--lend-image --mem 4 --touch --ram shm --ram-at 90000000", "10", "ram"},
-            {"A second piece, shared, shm, at 0x60000000 (below the base, above 1 GB)", "--lend-image --mem 4 --touch --ram shm --ram-at 60000000", "10", "ram"},
-            {"A second piece, shared, shm, where the resource manager chooses", "--lend-image --mem 4 --ram shm --shm-alloc", "10", "info"},
-            {"A second piece, shared, shm, not executable, where it chooses", "--lend-image --mem 4 --ram shm --shm-alloc --ram-rw", "10", "info"},
-            {"The host reads memory it lent to the VM (may reset the tablet)", "--lend --peek", "6", "info"},
+            {"A channel to the resource manager in the tree, started", "--lend --rm-rpc --until start", "6", "info"},
+            {"A channel to the resource manager, the guest then runs", "--lend --rm-rpc", "6", "info"},
+            {"A channel to the resource manager, 4 CPUs, 16 KB pages, as the Mac would be", "--lend --base 70000000 --gic 10000000 --image-mb 16 --touch --mmu16k --cpus 4 --rm-rpc", "20", "info"},
     };
-    private static final int VERSION = 7; // of STEPS: progress saved by another list starts over
+    private static final int VERSION = 8; // of STEPS: progress saved by another list starts over
 
     static volatile boolean running;
 

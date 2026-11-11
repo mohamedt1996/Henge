@@ -48,6 +48,10 @@
      --peek          after the guest ran, this program reads a byte of the first region: whether memory lent
                      to the VM is still the host's to read (Henge's devices read and write the Mac's memory).
                      Read in a child process, so a refusal is a signal to the child; it may also reset the tablet.
+     --rm-rpc        add an rm-rpc message-queue channel to the resource manager to the VM's tree, as Qualcomm's
+                     own guests have. Phase 1 of asking the resource manager, from inside the guest, to share the
+                     VM's memory back to the host: this only tests whether the firmware lets an unauthenticated
+                     VM have the channel at all (the VM still starts).
      --tree-only F   no VM: the tree this run would give, written to F
      --kmsg FILE     the kernel's messages from now on copied to FILE, each forced to storage as it comes:
                      what the kernel said last before a reset
@@ -157,7 +161,7 @@ static int npieces;
 enum { RAM_SHM, RAM_RESMEM, RAM_PRIVATE, RAM_PLAIN };
 static int ram_how = RAM_SHM;
 static uint64_t size_max_mb;
-static int shm_alloc, ram_rw;
+static int shm_alloc, ram_rw, rm_rpc;
 
 /* ---- crumbs: a line forced to storage before each step ---- */
 static const char *crumb_path;
@@ -347,6 +351,19 @@ static size_t build_dtb(uint8_t *out, size_t cap, const Layout *L, int ncpus, in
     end(&f);
     begin(&f, "vdevices");
     prop_str(&f, "generate", "/hypervisor");
+    if (rm_rpc) {
+        /* A message-queue channel to the resource manager, as crosvm gives its guests: the guest can then make
+           RM calls (MEM_SHARE and the rest). The resource manager writes the queue's capability IDs into the
+           guest's own tree; this only asks whether an unauthenticated VM may have the channel. */
+        begin(&f, "rm-rpc");
+        prop_str(&f, "vdevice-type", "rm-rpc");
+        prop_str(&f, "generate", "/hypervisor/qcom,resource-mgr");
+        prop_u32(&f, "label", 0);
+        prop(&f, "console-dev", NULL, 0);
+        prop_u32(&f, "message-size", 240);
+        prop_u32(&f, "queue-depth", 8);
+        end(&f);
+    }
     for (int i = 0; ram_how == RAM_SHM && i < npieces; i++) {
         /* Shared memory at an address of its own: the parcel of this label, placed at `base`. */
         char n[32], path[48];
@@ -520,6 +537,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--ram-rw")) ram_rw = 1;
         else if (!strcmp(a, "--shm-alloc")) shm_alloc = 1;
         else if (!strcmp(a, "--peek")) peek = 1;
+        else if (!strcmp(a, "--rm-rpc")) rm_rpc = 1;
         else if (!strcmp(a, "--bells")) bells = 1;
         else if (!v) { fprintf(stderr, "gunyah-probe: %s needs a value\n", a); return 2; }
         else if (!strcmp(a, "--mem")) mem_mb = strtoull(v, NULL, 10), i++;
