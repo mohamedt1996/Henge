@@ -299,9 +299,15 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
        per-app memory ledger to dodge, which is what the file is for on iOS.) No prefault: memory is taken as
        the guest touches it. */
     if (b->ram == MAP_FAILED && ram_file && *ram_file && getenv("HV_RAM_MEMFD")) {
-        int fd = (int)syscall(SYS_memfd_create, "henge-ram", 0u);
-        if (fd >= 0 && ftruncate(fd, (off_t)ram_size) == 0)
+        /* Sealable, and sealed against shrinking once it has its size: /dev/udmabuf makes dma-bufs only of such
+           a memfd's pages, which is how a Vulkan driver gets the Mac's memory in place (android/gpu/REIMS.md). */
+        int fd = (int)syscall(SYS_memfd_create, "henge-ram", 2u /* MFD_ALLOW_SEALING */);
+        if (fd < 0) fd = (int)syscall(SYS_memfd_create, "henge-ram", 0u);
+        if (fd >= 0 && ftruncate(fd, (off_t)ram_size) == 0) {
+            if (fcntl(fd, 1033 /* F_ADD_SEALS */, 2 /* F_SEAL_SHRINK */) != 0)
+                fprintf(stderr, "hengevm: guest RAM could not be sealed against shrinking (%s): no dma-bufs of it\n", strerror(errno));
             b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        }
         if (b->ram != MAP_FAILED) {
             static char name[64];
             snprintf(name, sizeof name, "/proc/%d/fd/%d", (int)getpid(), fd); /* the fd stays open: it is the name */

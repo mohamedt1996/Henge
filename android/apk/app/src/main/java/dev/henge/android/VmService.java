@@ -255,6 +255,7 @@ public class VmService extends Service {
                 appendLog(log, "henge app: " + (p.waitFor() == 0 ? out : "could not raise vm.max_map_count (no root?): " + out));
             } catch (Exception e) { appendLog(log, "henge app: could not raise vm.max_map_count: " + e); }
         }
+        if (reims) udmabuf(log, "on".equals(prefs.getString("zerocopy", "off")));
         // The last run's gpu.reims is stale: the app must attach only to the one this engine is about to make.
         if (reims) new File(mac, "gpu.reims").delete();
 
@@ -504,6 +505,39 @@ public class VmService extends Service {
         String after = DeviceCheck.sh(true, "cat " + file + "; true").trim();
         appendLog(log, "henge app: huge pages: shared memory's were `" + was + "`, now: " + after);
         return after.contains("[advise]") || after.contains("[always]") || after.contains("[within_size]") || after.contains("[force]");
+    }
+
+    /**
+     * Settings > Zero-copy (root, a kernel with /dev/udmabuf: android/kernel/README.md). The device is root's
+     * and of a kind Android lets no app open, so with the setting on it is made this app's to open (mode 666
+     * and the GPU device's SELinux type, which apps may open and send requests to), and its limits are raised
+     * (pieces and MB a dma-buf) so a view of the Mac's scattered pages is few dma-bufs. reims-vgpu then maps
+     * views of the Mac's memory as dma-bufs, and a Vulkan driver that imports dma-bufs (Turnip) uses the Mac's
+     * pages in place of copies. Off: the device is root's alone again, and reims-vgpu works as without it.
+     * reims-vgpu opens the device once a process, so a change takes hold when the app is started afresh.
+     */
+    private void udmabuf(File log, boolean on) {
+        if (!new File("/dev/udmabuf").exists()) {
+            if (on) appendLog(log, "henge app: zero-copy: this kernel has no /dev/udmabuf (android/kernel/README.md)");
+            return;
+        }
+        if (!on) {
+            DeviceCheck.sh(true, "chmod 600 /dev/udmabuf; true");
+            return;
+        }
+        String out = DeviceCheck.sh(true, "chmod 666 /dev/udmabuf; chcon u:object_r:gpu_device:s0 /dev/udmabuf; "
+                + "echo 8192 > /sys/module/udmabuf/parameters/list_limit; echo 256 > /sys/module/udmabuf/parameters/size_limit_mb; "
+                + "ls -lZ /dev/udmabuf; echo limits $(cat /sys/module/udmabuf/parameters/list_limit) pieces, "
+                + "$(cat /sys/module/udmabuf/parameters/size_limit_mb) MB; true").trim().replace('\n', ' ');
+        String opens;
+        try {
+            java.io.FileDescriptor fd = android.system.Os.open("/dev/udmabuf", android.system.OsConstants.O_RDWR, 0);
+            android.system.Os.close(fd);
+            opens = "this app opens it";
+        } catch (Exception e) {
+            opens = "this app CANNOT open it (" + e.getMessage() + "): reims-vgpu will work as without it";
+        }
+        appendLog(log, "henge app: zero-copy: " + (out.isEmpty() ? "no root" : out) + "; " + opens);
     }
 
     private static int le32(byte[] b, int at) {

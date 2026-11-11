@@ -319,6 +319,15 @@ SDL3), it passed on lavapipe (2026-11-09):
        android/gpu/reims/selftest.c libreims_vgpu_c.a -lpthread -ldl -lm -o reims-selftest
     VK_ICD_FILENAMES=<lavapipe>/lvp_icd.json ./reims-selftest /tmp/x
 
+0.3.37, a kernel with udmabuf (`android/kernel/README.md`; the tablet booted it 2026-11-11): Settings >
+Zero-copy makes `/dev/udmabuf` the app's to open (root: mode 666, the GPU device's SELinux type) and raises
+its limits; the engine's RAM memfd is sealed against shrinking, which udmabuf requires; and the runtime's
+importer on a device without VK_EXT_external_memory_host keeps the dma-buf route where the driver has
+VK_EXT_external_memory_dma_buf (`m2v_no_host_import.py`), so on Turnip a no-copy buffer or IOSurface
+texture is the Mac's pages, not a copy. Untested on the tablet: the log says `henge app: zero-copy: ...`,
+`metal2vulkan: no VK_EXT_external_memory_host; dma-bufs of host pages: ...`, and the 10 s
+`copied host buffers` line shows what is still copied.
+
 On a host without `/dev/udmabuf` (Android), reims-vgpu views guest memory a 4 KB mapping at a time,
 counted against `vm.max_map_count`: at 65530 that covers about 190 MB of guest RAM. The app raises it
 through su when Graphics: reims starts, and logs whether it could.

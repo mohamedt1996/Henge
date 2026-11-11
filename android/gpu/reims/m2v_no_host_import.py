@@ -15,9 +15,11 @@ memory, compared with the pages on the CPU at each commit and completion (`copie
 This patch gives a device without the extension an Importer that imports nothing (`absent`):
 
   - Importer::new returns such an importer instead of the refusal, with the host page as its
-    alignment and no dma-buf route;
+    alignment, and with the dma-buf route where the device has its extensions (0.3.37: Turnip
+    does, and with /dev/udmabuf reims-vgpu gives the pages a source of dma-bufs);
   - import_backing, the one place the pages' pointer reaches the driver, answers the runtime's own
-    `unpinnable` refusal first, which every caller already turns into a copy;
+    `unpinnable` refusal first, which every caller already turns into dma-bufs of the pages where
+    the device imports them and the pages come with a source of them, and into a copy otherwise;
   - memory_types never calls the (unloaded) extension function;
   - fresh_page_buffer and use_host_ram, which need real imports, decline on it.
 
@@ -55,14 +57,32 @@ EDITS = {
             .extensions
             .contains(&VkExtension::ExtExternalMemoryHost)
         {
-            // Henge's Android port: no import, so every no-copy object is a copy of its pages.
+            // Henge's Android port: no import of the pointer, so a no-copy object is a copy of its
+            // pages, or, where the device imports dma-bufs (Turnip) and its pages come with a
+            // dma-buf source (reims-vgpu's, of /dev/udmabuf), those dma-bufs: the pages in place.
+            let handle = device.handle();
+            let load = |name: &std::ffi::CStr| {
+                // SAFETY: as below: the device is live and the extensions are enabled.
+                let function = unsafe {
+                    loader_word.restore();
+                    instance.get_device_proc_addr(handle, name.as_ptr())
+                };
+                function.map_or(std::ptr::null(), |function| function as *const c_void)
+            };
+            let dma_buf = dma_buf.then(|| ash::khr::external_memory_fd::DeviceFn::load(load));
+            let dma_buf_images = dma_buf.is_some() && dma_buf_images;
+            eprintln!(
+                "metal2vulkan: no VK_EXT_external_memory_host; dma-bufs of host pages: {}, images over them: {}",
+                if dma_buf.is_some() { "imported" } else { "not offered by this driver (copies)" },
+                dma_buf_images,
+            );
             return Ok(Importer {
                 functions: ash::ext::external_memory_host::DeviceFn::load(|_| std::ptr::null()),
                 page,
                 alignment: page,
                 absent: true,
-                dma_buf: None,
-                dma_buf_images: false,
+                dma_buf,
+                dma_buf_images,
                 sparse_granule: std::sync::OnceLock::new(),
             });
         }
