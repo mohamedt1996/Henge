@@ -62,6 +62,17 @@ final class DeviceCheck {
         // Gunyah itself is not tried here: making a VM can reset this tablet. "Test Gunyah" (GunyahTest) does,
         // a step a tap.
         line(b, "Gunyah", new File(lib, "libghprobe.so").canExecute() ? "tested a step at a time, under \"Test Gunyah\"" : "probe missing");
+        if (root) {
+            // Where Gunyah's resource manager might say why it refuses a VM: its log does not reach dmesg.
+            String found = sh(true, "mount -t debugfs none /sys/kernel/debug 2>/dev/null; "
+                    + "echo '-- debugfs:'; ls /sys/kernel/debug 2>/dev/null | grep -iE 'gunyah|^gh|hyp|rsc|vmm|haven'; "
+                    + "for d in /sys/kernel/debug/gunyah* /sys/kernel/debug/gh* /sys/kernel/debug/hyp*; do [ -e $d ] && ls -la $d 2>/dev/null | head -20; done; "
+                    + "echo '-- devices:'; ls /dev 2>/dev/null | grep -iE 'gunyah|^gh|hyp|vm_|rm_'; "
+                    + "echo '-- device tree /hypervisor:'; ls /sys/firmware/devicetree/base/hypervisor 2>/dev/null | head -40; "
+                    + "echo '-- modules:'; lsmod 2>/dev/null | grep -iE 'gunyah|^gh_|hyp|crosvm|vm_' | head -30; "
+                    + "echo '-- the kernel about Gunyah and KVM since boot:'; dmesg 2>/dev/null | grep -iE 'gunyah|gh_rsc|gh_|hypervisor|kvm|HYP mode|EL2' | head -40; true", 20);
+            if (!found.trim().isEmpty()) b.append("\nGunyah, what this system has:\n").append(found);
+        }
         String gunyah = GunyahTest.report(c);
         if (!gunyah.isEmpty()) b.append("\nGunyah test so far:\n").append(gunyah);
         String out = b.toString();
