@@ -70,7 +70,10 @@ final class DeviceCheck {
                     + "echo '-- devices:'; ls /dev 2>/dev/null | grep -iE 'gunyah|^gh|hyp|vm_|rm_'; "
                     + "echo '-- device tree /hypervisor:'; ls /sys/firmware/devicetree/base/hypervisor 2>/dev/null | head -40; "
                     + "echo '-- modules:'; lsmod 2>/dev/null | grep -iE 'gunyah|^gh_|hyp|crosvm|vm_' | head -30; "
-                    + "echo '-- the kernel about Gunyah and KVM since boot:'; dmesg 2>/dev/null | grep -iE 'gunyah|gh_rsc|gh_|hypervisor|kvm|HYP mode|EL2' | head -40; true", 20);
+                    + "echo '-- VMs of Android itself (AVF):'; getprop | grep -iE 'hypervisor|virtualization|pvmfw|protected_vm' | head -12; "
+                    + "ls /apex/com.android.virt/bin 2>/dev/null | head -12; ls -la /dev/block/by-name 2>/dev/null | grep -iE 'pvmfw|vm-|hyp' | head -8; "
+                    + "ls /vendor/vm-system /vendor/bin 2>/dev/null | grep -iE 'vm|crosvm|qcrosvm|gunyah' | head -12; "
+                    +"echo '-- the kernel about Gunyah and KVM since boot:'; dmesg 2>/dev/null | grep -iE 'gunyah|gh_rsc|gh_|hypervisor|kvm|HYP mode|EL2' | head -40; true", 20);
             if (!found.trim().isEmpty()) b.append("\nGunyah, what this system has:\n").append(found);
         }
         String gunyah = GunyahTest.report(c);

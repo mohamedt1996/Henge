@@ -21,6 +21,8 @@
                      the tree, and the ROM's place at 1 MB inside it), base address 0. Qualcomm's resource
                      manager keeps what lies below the base address for devices.
      --image-mb N    the first region N MB, not 2 (probe layout)
+     --dtb-room KB   the device tree's region given as KB long, not as the tree's own length rounded to a page:
+                     the resource manager writes its own nodes into the tree where it lies (crosvm gives 2 MB)
      --lend          memory lent to the VM (GH_VM_ANDROID_LEND_USER_MEM), not shared with it
      --kmsg FILE     the kernel's messages from now on copied to FILE, each forced to storage as it comes:
                      what the kernel said last before a reset
@@ -411,7 +413,7 @@ int main(int argc, char **argv) {
     static Layout layout;
     Layout *L = &layout;
     layout = SMALL;
-    uint64_t mem_mb = 2, image_mb = 0;
+    uint64_t mem_mb = 2, image_mb = 0, dtb_room_kb = 0;
     const char *kmsg_path = NULL;
     int touch = 0, ncpus = 1, bells = 0, seconds = 6;
     const char *until = "";
@@ -429,6 +431,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--until")) until = v, i++;
         else if (!strcmp(a, "--kmsg")) kmsg_path = v, i++;
         else if (!strcmp(a, "--image-mb")) image_mb = strtoull(v, NULL, 10), i++;
+        else if (!strcmp(a, "--dtb-room")) dtb_room_kb = strtoull(v, NULL, 10), i++;
         else if (!strcmp(a, "--layout")) layout = !strcmp(v, "engine") ? ENGINE : !strcmp(v, "zero") ? ZERO : SMALL, i++;
         else { fprintf(stderr, "gunyah-probe: unknown argument %s\n", a); return 2; }
     }
@@ -486,7 +489,10 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(until, "memory")) goto early;
     struct gh_vm_dtb_config dtb = {.guest_phys_addr = L->image_pa + L->dtb_off, .size = (dtb_len + 0xfff) & ~0xfffull};
-    crumb("try: set device tree (%zu bytes)", dtb_len);
+    if ((dtb_room_kb << 10) > dtb.size) dtb.size = (dtb_room_kb << 10) & ~0xfffull;
+    if (dtb.size > L->image_size - L->dtb_off) dtb.size = L->image_size - L->dtb_off;
+    printf("device tree            %zu bytes in a region of %llu KB\n", dtb_len, (unsigned long long)(dtb.size >> 10));
+    crumb("try: set device tree (%zu bytes, region %llu KB)", dtb_len, (unsigned long long)(dtb.size >> 10));
     if (step("set device tree", ioctl(vm, GH_VM_SET_DTB_CONFIG, &dtb))) goto fail;
     if (!strcmp(until, "tree")) goto early;
 

@@ -32,11 +32,13 @@ final class GunyahTest {
             {"Give it its device tree", "--until tree", "6", "pre"},
             {"Add a CPU", "--until vcpu", "6", "pre"},
             {"Start: 2 MB at 0x80000000 (refused on the Pad 7: memory invalid)", "", "6", "start"},
-            {"Start: everything at or above the base address (base 0)", "--layout zero", "6", "start"},
-            {"Start: 16 MB at 0x80000000", "--image-mb 16", "6", "start"},
-            {"Start: 2 MB at 0x80000000, memory lent", "--lend", "6", "start"},
-            {"Start: base 0, memory lent", "--layout zero --lend", "6", "start"},
-            {"Start: the engine's layout (ROM below the base address; may reset)", "--layout engine", "6", "start"},
+            // All six layouts of 0.3.35 were refused alike, so what they share is tried: the tree's region was
+            // the tree's own length, and the resource manager writes its nodes into the tree where it lies.
+            {"Start: the same, 1 MB of room for the device tree", "--dtb-room 1024", "6", "start"},
+            {"Start: 16 MB at 0x80000000, 2 MB of room for the tree", "--image-mb 16 --dtb-room 2048", "6", "start"},
+            {"Start: base 0, room for the tree", "--layout zero --dtb-room 1020", "6", "start"},
+            {"Start: 2 MB at 0x80000000, room for the tree, memory lent", "--dtb-room 1024 --lend", "6", "start"},
+            {"Start: the engine's layout, room for the tree (may reset)", "--layout engine --dtb-room 60", "6", "start"},
             {"Run a tiny program in it", "%L", "6", "use"},
             {"256 MB of memory", "%L --mem 256", "6", "use"},
             {"256 MB, every page written", "%L --mem 256 --touch", "20", "use"},
@@ -47,7 +49,7 @@ final class GunyahTest {
             {"The Mac's interrupt doorbells", "%L --mem 256 --cpus 4 --bells", "10", "use"},
             {"All of it: 3 GB, 4 CPUs, doorbells", "%L --mem 3072 --cpus 4 --bells --touch", "90", "use"},
     };
-    private static final int VERSION = 3; // of STEPS: progress saved by another list starts over
+    private static final int VERSION = 4; // of STEPS: progress saved by another list starts over
 
     static volatile boolean running;
 
