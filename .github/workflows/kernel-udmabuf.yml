@@ -28,8 +28,10 @@ jobs:
           full=$(gh api "repos/aosp-mirror/kernel_common/commits/$COMMIT" -q .sha 2>/dev/null || true)
           if ! echo "$full" | grep -Eq '^[0-9a-f]{40}$'; then
             mkdir find && cd find && git init -q
-            git fetch -q --filter=tree:0 https://android.googlesource.com/kernel/common '+refs/heads/android14-6.1*:refs/remotes/o/android14-6.1*'
-            git branch -r | head -80
+            # Branches of past releases are deleted; their tags stay.
+            git fetch -q --filter=tree:0 --no-tags https://android.googlesource.com/kernel/common \
+              '+refs/heads/android14-6.1*:refs/remotes/o/android14-6.1*' '+refs/tags/android14-6.1*:refs/tags/android14-6.1*'
+            git tag | tail -60
             full=$(git rev-parse --verify "$COMMIT^{commit}")
           fi
           echo "$full"
