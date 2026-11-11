@@ -406,6 +406,34 @@ static void mark(const char *fmt, ...) {
     fsync(2);
 }
 
+/* HV_GUNYAH_KMSG=FILE: the kernel's messages from the start of the run copied to FILE, each on storage when its
+   write returns, so that after a reset the file ends with what the kernel said last (the app shows it). */
+static void *kmsg_thread(void *arg) {
+    int in = open("/dev/kmsg", O_RDONLY | O_CLOEXEC);
+    int out = open((const char *)arg, O_WRONLY | O_TRUNC | O_CREAT | O_DSYNC | O_CLOEXEC, 0644);
+    if (in < 0 || out < 0) {
+        fprintf(stderr, "gunyah: the kernel's messages are not being kept (%s)\n", strerror(errno));
+        return NULL;
+    }
+    lseek(in, 0, SEEK_END);
+    char rec[4096];
+    for (;;) {
+        ssize_t n = read(in, rec, sizeof rec - 1); /* one record: "level,sequence,microseconds,flags;text\n" */
+        if (n < 0) {
+            if (errno == EPIPE || errno == EINTR) continue;
+            return NULL;
+        }
+        rec[n] = 0;
+        char *text = strchr(rec, ';'), *end = text ? strchr(text, '\n') : NULL;
+        if (!text || !end) continue;
+        unsigned long long us = 0;
+        sscanf(rec, "%*u,%*u,%llu", &us);
+        char line[4200];
+        int len = snprintf(line, sizeof line, "[%5llu.%06llu] %.*s\n", us / 1000000, us % 1000000, (int)(end - text - 1), text + 1);
+        (void)!write(out, line, (size_t)len);
+    }
+}
+
 static int fail(const char *what) {
     fprintf(stderr, "gunyah: %s failed: %s (errno %d)\n", what, strerror(errno), errno);
     return -1;
@@ -420,6 +448,11 @@ int hv_gunyah_run(void) {
     for (int i = 0; i < HV_MAX_CPUS; i++) vcpu_fd[i] = -1;
     for (int i = 0; i < NIRQ; i++) irq_fd[i] = -1;
 
+    if (getenv("HV_GUNYAH_KMSG")) {
+        pthread_t k;
+        if (pthread_create(&k, NULL, kmsg_thread, getenv("HV_GUNYAH_KMSG")) == 0) pthread_detach(k);
+        usleep(50000); /* reading before the first request */
+    }
     mark("open /dev/gunyah");
     int dev = open("/dev/gunyah", O_RDWR | O_CLOEXEC);
     if (dev < 0) return fail("opening /dev/gunyah (it needs root)");

@@ -831,8 +831,11 @@ public class MainActivity extends Activity {
             }));
             c.addView(gap(10));
         }
+        boolean stuck = next < n && "use".equals(GunyahTest.STEPS[next][3]) && GunyahTest.layout(this) == null;
         if (next >= n) {
-            c.addView(text("Every step passed: Gunyah gives this tablet what the Mac's VM asks for.", 13, TEXT, false));
+            c.addView(text("Every step was run. Layout that works: " + GunyahTest.layout(this), 13, TEXT, false));
+        } else if (stuck) {
+            c.addView(text("None of the layouts started a VM, so the remaining steps cannot run. Copy the report.", 13, TEXT, false));
         } else {
             String label = GunyahTest.running ? "Running step " + (next + 1) + "…"
                     : (reset == next ? "Run step " + (next + 1) + " again (it reset the tablet): " : "Run step " + (next + 1) + " of " + n + ": ")

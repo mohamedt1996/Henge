@@ -109,6 +109,15 @@ unsigned VM as such is not what it refuses. 0.3.32 lets a refused step be skippe
 step at the engine's addresses, starting with a VM that has no memory but the boot region and ROM. The same check: no udmabuf
 (`# CONFIG_UDMABUF is not set`, no module), so no zero-copy without a kernel module built for it.
 
+0.3.35: the refusal is Qualcomm's resource manager's, not the kernel driver's (VM_INIT, error 10: the
+driver's share and configure succeed). Its published source keeps a VM's addresses below its base address
+for devices; the engine has the ROM at 1 MB and the base at 8 MB. The test now tries six layouts, started
+and not run (the probe's, base 0 with everything above it, 16 MB, each lent or shared, and the engine's
+last), goes on to the next when one is refused, and runs the later steps with the first that starts. Each
+step, and each run of the Mac on Gunyah, copies the kernel's messages to a file as they come (`--kmsg`,
+`HV_GUNYAH_KMSG`): after a reset the report and `henge.log` end with what the kernel said last
+(`gunyah-kmsg-last.txt`).
+
 For a Gunyah reset, the kernel's last messages are needed. `/sys/fs/pstore` was empty on the test
 tablet, so record them live before starting the Mac, as root:
 

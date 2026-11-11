@@ -17,6 +17,13 @@
      --bells         the engine's interrupt doorbells (INTIDs 33-67 and 96-159), made and left alone
      --layout engine the engine's addresses: the boot region at 8 MB, a ROM-sized region at 1 MB, memory at
                      0x70000000, the interrupt controller at 0x10000000
+     --layout zero   the same, with nothing below the VM's base address: one 2 MB region at 0 (the start code,
+                     the tree, and the ROM's place at 1 MB inside it), base address 0. Qualcomm's resource
+                     manager keeps what lies below the base address for devices.
+     --image-mb N    the first region N MB, not 2 (probe layout)
+     --lend          memory lent to the VM (GH_VM_ANDROID_LEND_USER_MEM), not shared with it
+     --kmsg FILE     the kernel's messages from now on copied to FILE, each forced to storage as it comes:
+                     what the kernel said last before a reset
      --seconds S     how long the guest may run (6)
      --until STEP    stop, and take the VM down, after `open`, `create`, `memory`, `tree`, `vcpu` or `start`:
                      the steps before the guest runs, one at a time
@@ -53,6 +60,7 @@ struct gh_fn_desc { uint32_t type, arg_size; uint64_t arg; };
 #define GH_VM_ADD_FUNCTION _IOW(GH_IOCTL_TYPE, 0x4, struct gh_fn_desc)
 #define GH_VCPU_RUN _IO(GH_IOCTL_TYPE, 0x5)
 #define GH_VCPU_MMAP_SIZE _IO(GH_IOCTL_TYPE, 0x6)
+#define GH_VM_ANDROID_LEND_USER_MEM _IOW('A', 0x11, struct gh_userspace_memory_region)
 #define GH_FN_VCPU 1
 #define GH_FN_IRQFD 2
 struct gh_fn_irqfd_arg { uint32_t fd, label, flags, padding; };
@@ -83,11 +91,14 @@ typedef struct {
     uint64_t gic_dist, gic_redist, redist_each;
     uint64_t report;                        /* a page with nothing behind it: the guest's stores there exit */
     uint32_t ppi_flags;
+    int nodes;                              /* the tree's memory: 0 image and RAM as one, 1 ROM and RAM, 2 image, RAM */
 } Layout;
 static const Layout SMALL = {"probe", 0x80000000ull, 0x200000, 0x100000, 0, 0, 0x80200000ull,
-                             0x3fff0000ull, 0x3ffd0000ull, 0, 0x10000000ull, 0x108};
+                             0x3fff0000ull, 0x3ffd0000ull, 0, 0x10000000ull, 0x108, 0};
 static const Layout ENGINE = {"engine", 0x00800000ull, 0x10000, 0x1000, 0x00100000ull, 0x100000, 0x70000000ull,
-                              0x10000000ull, 0x10010000ull, 0x20000, 0x20010000ull, 0x104};
+                              0x10000000ull, 0x10010000ull, 0x20000, 0x20010000ull, 0x104, 1};
+static const Layout ZERO = {"zero", 0, 0x200000, 0x1000, 0, 0, 0x70000000ull,
+                            0x10000000ull, 0x10010000ull, 0x20000, 0x20010000ull, 0x104, 2};
 
 /* ---- crumbs: a line forced to storage before each step ---- */
 static const char *crumb_path;
@@ -106,6 +117,36 @@ static void crumb(const char *fmt, ...) {
     (void)!write(fd, line, (size_t)n);
     fsync(fd);
     close(fd);
+}
+
+/* --kmsg: a child that copies the kernel's messages, from now on, to a file opened so each write is on storage
+   when it returns. It dies with this process. */
+#include <sys/prctl.h>
+static void kmsg_start(const char *path) {
+    if (!path) return;
+    pid_t pid = fork();
+    if (pid != 0) return;
+    prctl(PR_SET_PDEATHSIG, SIGKILL);
+    int in = open("/dev/kmsg", O_RDONLY | O_CLOEXEC);
+    int out = open(path, O_WRONLY | O_APPEND | O_CREAT | O_DSYNC | O_CLOEXEC, 0644);
+    if (in < 0 || out < 0) _exit(0);
+    lseek(in, 0, SEEK_END);
+    char rec[4096];
+    for (;;) {
+        ssize_t n = read(in, rec, sizeof rec - 1); /* one record: "level,sequence,microseconds,flags;text\n" */
+        if (n < 0) {
+            if (errno == EPIPE) continue; /* records were overwritten before they were read */
+            _exit(0);
+        }
+        rec[n] = 0;
+        char *text = strchr(rec, ';'), *end = text ? strchr(text, '\n') : NULL;
+        if (!text || !end) continue;
+        unsigned long long us = 0;
+        sscanf(rec, "%*u,%*u,%llu", &us);
+        char line[4200];
+        int len = snprintf(line, sizeof line, "[%5llu.%06llu] %.*s\n", us / 1000000, us % 1000000, (int)(end - text - 1), text + 1);
+        (void)!write(out, line, (size_t)len);
+    }
 }
 
 static int step(const char *what, long r) {
@@ -173,9 +214,12 @@ static size_t build_dtb(uint8_t *out, size_t cap, const Layout *L, uint64_t ram_
     prop_u32(&f, "#size-cells", 2);
     prop_str(&f, "compatible", "linux,dummy-virt");
     prop_u32(&f, "interrupt-parent", GIC);
-    if (L->rom_size) {
+    if (L->nodes == 1) {
         /* As the engine lists its memory: the ROM and the RAM, and not the boot region. */
         memory_node(&f, L->rom_pa, L->rom_size);
+        if (ram_size) memory_node(&f, L->ram_pa, ram_size);
+    } else if (L->nodes == 2) {
+        memory_node(&f, L->image_pa, L->image_size);
         if (ram_size) memory_node(&f, L->ram_pa, ram_size);
     } else {
         memory_node(&f, L->image_pa, L->image_size + ram_size); /* the image's region and the memory after it */
@@ -334,6 +378,7 @@ static const char *hvc_result(uint64_t v) {
 
 /* `size` bytes of `host` given to the VM at `pa`, in pieces of 256 MB at most, halved where the kernel has no
    room for a piece's page list (ENOMEM), as the engine does. */
+static int lend; /* --lend */
 static int share(int vm, uint32_t *label, uint64_t pa, uint8_t *host, uint64_t size, const char *what) {
     uint64_t chunk = 256ull << 20, done = 0;
     int pieces = 0;
@@ -343,7 +388,7 @@ static int share(int vm, uint32_t *label, uint64_t pa, uint8_t *host, uint64_t s
                                                .memory_size = n, .userspace_addr = (uintptr_t)host + done};
         crumb("try: give the VM %s: %llu MB at %#llx (piece %d)", what, (unsigned long long)(n >> 20),
               (unsigned long long)(pa + done), pieces + 1);
-        if (ioctl(vm, GH_VM_SET_USER_MEM_REGION, &r) == 0) {
+        if (ioctl(vm, lend ? GH_VM_ANDROID_LEND_USER_MEM : GH_VM_SET_USER_MEM_REGION, &r) == 0) {
             (*label)++, pieces++, done += n;
             continue;
         }
@@ -363,14 +408,18 @@ static int share(int vm, uint32_t *label, uint64_t pa, uint8_t *host, uint64_t s
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
-    const Layout *L = &SMALL;
-    uint64_t mem_mb = 2;
+    static Layout layout;
+    Layout *L = &layout;
+    layout = SMALL;
+    uint64_t mem_mb = 2, image_mb = 0;
+    const char *kmsg_path = NULL;
     int touch = 0, ncpus = 1, bells = 0, seconds = 6;
     const char *until = "";
     int dev = -1, vm = -1;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         if (!strcmp(a, "--touch")) touch = 1;
+        else if (!strcmp(a, "--lend")) lend = 1;
         else if (!strcmp(a, "--bells")) bells = 1;
         else if (!v) { fprintf(stderr, "gunyah-probe: %s needs a value\n", a); return 2; }
         else if (!strcmp(a, "--mem")) mem_mb = strtoull(v, NULL, 10), i++;
@@ -378,17 +427,27 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--seconds")) seconds = atoi(v), i++;
         else if (!strcmp(a, "--crumb")) crumb_path = v, i++;
         else if (!strcmp(a, "--until")) until = v, i++;
-        else if (!strcmp(a, "--layout")) L = !strcmp(v, "engine") ? &ENGINE : &SMALL, i++;
+        else if (!strcmp(a, "--kmsg")) kmsg_path = v, i++;
+        else if (!strcmp(a, "--image-mb")) image_mb = strtoull(v, NULL, 10), i++;
+        else if (!strcmp(a, "--layout")) layout = !strcmp(v, "engine") ? ENGINE : !strcmp(v, "zero") ? ZERO : SMALL, i++;
         else { fprintf(stderr, "gunyah-probe: unknown argument %s\n", a); return 2; }
     }
     if (ncpus < 1) ncpus = 1;
     if (ncpus > MAX_CPUS) ncpus = MAX_CPUS;
     if (seconds < 1) seconds = 1;
     /* The probe layout's first 2 MB hold the image; the engine layout's memory is all apart from it. */
-    uint64_t ram_size = L == &SMALL ? (mem_mb > 2 ? (mem_mb - 2) << 20 : 0) : mem_mb << 20;
+    int small = L->nodes == 0;
+    if (small && image_mb >= 2 && image_mb <= 512) {
+        L->image_size = image_mb << 20, L->ram_pa = L->image_pa + L->image_size;
+        if (mem_mb < image_mb) mem_mb = image_mb;
+    }
+    uint64_t image_now = L->image_size >> 20;
+    uint64_t ram_size = small ? (mem_mb > image_now ? (mem_mb - image_now) << 20 : 0) : mem_mb << 20;
+    kmsg_start(kmsg_path);
     report_pa = L->report;
-    printf("gunyah-probe: uid %d; %s layout, %llu MB, %d CPU%s%s%s\n", (int)getuid(), L->name, (unsigned long long)mem_mb, ncpus,
-           ncpus == 1 ? "" : "s", touch ? ", every page touched" : "", bells ? ", the engine's doorbells" : "");
+    printf("gunyah-probe: uid %d; %s layout (base %#llx, first region %llu MB), %llu MB, %d CPU%s%s%s%s\n", (int)getuid(), L->name,
+           (unsigned long long)L->image_pa, (unsigned long long)image_now, (unsigned long long)mem_mb, ncpus,
+           ncpus == 1 ? "" : "s", touch ? ", every page touched" : "", bells ? ", the engine's doorbells" : "", lend ? ", memory lent" : "");
     crumb("begin: %s layout, %llu MB, %d CPUs%s%s", L->name, (unsigned long long)mem_mb, ncpus, touch ? ", touch" : "",
           bells ? ", doorbells" : "");
 

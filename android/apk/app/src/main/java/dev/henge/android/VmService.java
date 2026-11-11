@@ -184,6 +184,16 @@ public class VmService extends Service {
             String lastBuild = last.contains("@") ? last.substring(last.indexOf('@') + 1) : "";
             appendLog(log, "henge app: the last run ended with this app killed (a crash or Android's low-memory killer) "
                     + "and the engine with it; no exit code was seen");
+            // A run on Gunyah that ended so: the tablet reset. What the kernel said last (host/gunyah.c kept it).
+            File kmsg = new File(files, "gunyah-kmsg.txt");
+            if (kmsg.exists()) {
+                String tail = DeviceCheck.sh(true, "tail -n 80 " + sq(kmsg.getPath()) + "; true");
+                appendLog(log, "henge app: that run was on Gunyah; the kernel's last messages in it:\n"
+                        + (tail.trim().isEmpty() ? "  (none were kept)" : tail));
+                File ext = getExternalFilesDir(null);
+                if (ext != null) DeviceCheck.sh(true, "cp " + sq(kmsg.getPath()) + " " + sq(new File(ext, "gunyah-kmsg-last.txt").getPath())
+                        + "; rm -f " + sq(kmsg.getPath()) + "; true");
+            }
             if ("reims-turnip".equals(lastMode) && "reims".equals(gpu) && !"install".equals(mode) && build.equals(lastBuild)) {
                 // Turnip's death is not reims's: the same screen on the system's driver, until the app is updated.
                 prefs.edit().putString("turnipCrashed", build).apply();
@@ -271,6 +281,7 @@ public class VmService extends Service {
                 q.append("export HOME=").append(sq(files.getPath())).append(" TMPDIR=").append(sq(getCacheDir().getPath()))
                  .append(" HENGE_PID=").append(sq(pidFile.getPath()))
                  .append(" HENGE_APP_UID=").append(android.os.Process.myUid()) // files the renderer opens while it runs
+                 .append(" HV_GUNYAH_KMSG=").append(sq(new File(files, "gunyah-kmsg.txt").getPath())) // host/gunyah.c
                  .append(" GLIBC_TUNABLES=glibc.pthread.rseq=0; cd ")
                  .append(sq(files.getPath())).append(" && ulimit -s 65520 2>/dev/null; touch engine.root; ");
                 for (String a : cmd.subList(3, cmd.size())) q.append(sq(a)).append(' ');
@@ -326,6 +337,7 @@ public class VmService extends Service {
         }
         if (!install) fullSpeed(log, false);
         if (!install) hugePages(log, false);
+        if (gunyah()) DeviceCheck.sh(true, "rm -f " + sq(new File(files, "gunyah-kmsg.txt").getPath()) + "; true"); // it ended: no reset
         if (reims && GpuView.loaded) GpuView.nativeReimsStop();
         active.delete();
         if (!install) appendLog(log, "henge app: the engine exited (" + code + ")");
