@@ -22,8 +22,14 @@ final class GunyahTest {
     /**
      * {what the step does, the probe's arguments, seconds the guest may run, kind}.
      * "pre": before the VM starts. "start": one way of laying the VM out, started and not run; a refusal goes on
-     * to the next way, and the first that starts is the layout the "use" steps run with (%L in their arguments).
-     * The ways are in the order of how little they resemble what resets the tablet: the engine's own is last.
+     * to the next way, and the first that starts is the layout the later steps run with (%L in their arguments).
+     * "ram": one way of telling the resource manager of memory beyond the first region; the first whose memory
+     * the guest can write is the way the later steps use (%R). "use": must pass before the next. "info": an
+     * answer either way, about what the Mac will need.
+     *
+     * 0.3.35 to 0.3.39 were all refused at the same request (VM_INIT, "memory invalid"): the tree named its
+     * memory node `memory@80000000`, and the resource manager fails a tree with any memory node not named
+     * exactly `memory`. The probe's tree is now as it reads it (gunyah_probe.c).
      */
     static final String[][] STEPS = {
             {"Open /dev/gunyah", "--until open", "6", "pre"},
@@ -31,25 +37,30 @@ final class GunyahTest {
             {"Give it 2 MB of memory", "--until memory", "6", "pre"},
             {"Give it its device tree", "--until tree", "6", "pre"},
             {"Add a CPU", "--until vcpu", "6", "pre"},
-            {"Start: 2 MB at 0x80000000 (refused on the Pad 7: memory invalid)", "", "6", "start"},
-            // All six layouts of 0.3.35 were refused alike, so what they share is tried: the tree's region was
-            // the tree's own length, and the resource manager writes its nodes into the tree where it lies.
-            {"Start: the same, 1 MB of room for the device tree", "--dtb-room 1024", "6", "start"},
-            {"Start: 16 MB at 0x80000000, 2 MB of room for the tree", "--image-mb 16 --dtb-room 2048", "6", "start"},
-            {"Start: base 0, room for the tree", "--layout zero --dtb-room 1020", "6", "start"},
-            {"Start: 2 MB at 0x80000000, room for the tree, memory lent", "--dtb-room 1024 --lend", "6", "start"},
-            {"Start: the engine's layout, room for the tree (may reset)", "--layout engine --dtb-room 60", "6", "start"},
+            {"Start: 2 MB at 0x80000000, the tree as the resource manager reads it", "", "6", "start"},
+            {"Start: the same, memory lent", "--lend", "6", "start"},
+            {"Start: base 0", "--layout zero --mem 0", "6", "start"},
+            {"Start: base 0, memory lent", "--layout zero --mem 0 --lend", "6", "start"},
+            {"Start: 16 MB at 0x80000000", "--image-mb 16", "6", "start"},
             {"Run a tiny program in it", "%L", "6", "use"},
-            {"256 MB of memory", "%L --mem 256", "6", "use"},
-            {"256 MB, every page written", "%L --mem 256 --touch", "20", "use"},
-            {"1 GB, every page written", "%L --mem 1024 --touch", "40", "use"},
-            {"3 GB, every page written", "%L --mem 3072 --touch", "90", "use"},
-            {"2 CPUs", "%L --mem 256 --cpus 2", "10", "use"},
-            {"4 CPUs", "%L --mem 256 --cpus 4", "10", "use"},
-            {"The Mac's interrupt doorbells", "%L --mem 256 --cpus 4 --bells", "10", "use"},
-            {"All of it: 3 GB, 4 CPUs, doorbells", "%L --mem 3072 --cpus 4 --bells --touch", "90", "use"},
+            {"64 MB more, each piece a shm device in the tree", "%L --mem 66 --touch --ram shm", "10", "ram"},
+            {"64 MB more, each piece a reserved-memory node", "%L --mem 66 --touch --ram resmem", "10", "ram"},
+            {"64 MB more, one private piece after the first region", "%L --mem 66 --touch --ram private", "10", "ram"},
+            {"64 MB more, said nowhere in the tree", "%L --mem 66 --touch --ram plain", "10", "ram"},
+            {"256 MB, every page written", "%L %R --mem 256 --touch", "20", "use"},
+            {"1 GB, every page written", "%L %R --mem 1024 --touch", "40", "use"},
+            {"3 GB, every page written", "%L %R --mem 3072 --touch", "90", "use"},
+            {"2 CPUs", "%L %R --mem 256 --cpus 2", "10", "use"},
+            {"4 CPUs", "%L %R --mem 256 --cpus 4", "10", "use"},
+            {"The Mac's interrupt doorbells", "%L %R --mem 256 --cpus 4 --bells", "10", "use"},
+            {"All of it: 3 GB, 4 CPUs, doorbells", "%L %R --mem 3072 --cpus 4 --bells --touch", "90", "use"},
+            {"The Mac's map: base 0, memory at 0x70000000, shared", "--layout zero %R --mem 256 --touch --cpus 4 --bells", "20", "info"},
+            {"The Mac's map, only the first region lent", "--layout zero --lend-image %R --mem 256 --touch --cpus 4 --bells", "20", "info"},
+            {"A store at 0x50000000 (the Mac's PCI devices) comes out to Henge", "--layout zero --mem 0 %S --poke 50000000", "6", "info"},
+            {"A store at 0x40000000 (the Mac's PCI configuration) comes out to Henge", "--layout zero --mem 0 %S --poke 40000000", "6", "info"},
+            {"A store at 0x20010000 (the Mac's serial port) comes out to Henge", "--layout zero --mem 0 %S --poke 20010000", "6", "info"},
     };
-    private static final int VERSION = 4; // of STEPS: progress saved by another list starts over
+    private static final int VERSION = 5; // of STEPS: progress saved by another list starts over
 
     static volatile boolean running;
 
@@ -68,6 +79,8 @@ final class GunyahTest {
 
     /** The first layout that started: what the later steps run with. Empty: none has yet. */
     static String layout(Context c) { return prefs(c).getString("layout", null); }
+    /** The first way of giving more memory that the guest could write through. Null: none has yet. */
+    static String ram(Context c) { return prefs(c).getString("ram", null); }
     private static File crumbs(Context c) { return new File(c.getFilesDir(), "gunyah-crumbs.txt"); }
 
     /** The step a tap runs next: the first not passed. STEPS.length when all passed. */
@@ -133,9 +146,12 @@ final class GunyahTest {
         if (k >= STEPS.length) return "Every step passed.";
         File probe = new File(c.getApplicationInfo().nativeLibraryDir, "libghprobe.so");
         String said;
-        String kind = STEPS[k][3], layout = layout(c);
-        if (kind.equals("use") && layout == null) {
+        String kind = STEPS[k][3], layout = layout(c), ram = ram(c);
+        boolean pastStarts = !kind.equals("pre") && !kind.equals("start");
+        if (pastStarts && layout == null) {
             return "None of the layouts started a VM: there is nothing to run the remaining steps with.";
+        } else if (STEPS[k][1].contains("%R") && ram == null) {
+            said = "No way of giving the VM more memory worked: this step needs one. Skip it to go on.";
         } else if (!"0".equals(DeviceCheck.sh(true, "id -u").trim())) {
             said = "No root (su was denied): the test needs it.";
         } else if (!new File("/dev/gunyah").exists() && DeviceCheck.sh(true, "ls /dev/gunyah").trim().isEmpty()) {
@@ -152,7 +168,9 @@ final class GunyahTest {
                     o.getFD().sync();
                 } catch (Exception ignored) { }
                 try (FileOutputStream o = new FileOutputStream(kmsg(c))) { o.getFD().sync(); } catch (Exception ignored) { }
-                String args = STEPS[k][1].replace("%L", layout == null ? "" : layout);
+                // %S: lent, if only a lent VM started.
+                String args = STEPS[k][1].replace("%L", layout == null ? "" : layout).replace("%R", ram == null ? "" : ram)
+                        .replace("%S", layout != null && layout.contains("--lend") ? "--lend" : "");
                 p.edit().putInt("began", k).commit(); // commit: on storage before the step
                 // A mark in the kernel's log: what the kernel says after it is this step's.
                 String mark = "henge-gunyah-step-" + (k + 1) + "-" + System.currentTimeMillis();
@@ -166,6 +184,10 @@ final class GunyahTest {
                 if (!pass) {
                     // Why the kernel or Gunyah's resource manager refused: the kernel's lines since the mark.
                     String kernel = DeviceCheck.sh(true, "dmesg | sed -n '/" + mark + "/,$p' | grep -v " + mark + " | tail -n 60; true");
+                    // Gunyah's own lines first: on a busy tablet the rest pushes them out of sight.
+                    String own = DeviceCheck.sh(true, "dmesg | sed -n '/" + mark + "/,$p' | grep -v " + mark
+                            + " | grep -iE 'gunyah|gh_rsc|gh_vm|gh_rm|hypervisor' | tail -n 20; true");
+                    if (!own.trim().isEmpty()) said += "  Gunyah in the kernel's log during it:\n" + indent(own);
                     said += kernel.trim().isEmpty() ? "  The kernel said nothing during it (or dmesg is not readable).\n"
                             : "  The kernel during it:\n" + indent(kernel);
                 }
@@ -174,8 +196,13 @@ final class GunyahTest {
                     e.putString("layout", STEPS[k][1]);
                     said += "  This layout starts: the steps after the layouts use it.\n";
                 }
-                // A layout that is refused is an answer: on to the next one.
-                if (pass || kind.equals("start")) e.putInt("next", k + 1).putInt("reset", -1);
+                if (pass && kind.equals("ram") && ram == null) {
+                    String how = STEPS[k][1].replaceAll(".*(--ram \\w+).*", "$1");
+                    e.putString("ram", how);
+                    said += "  The guest wrote all of it: the steps after use this way (" + how + ").\n";
+                }
+                // A layout or a way that is refused is an answer, as an "info" step's is: on to the next one.
+                if (pass || !kind.equals("pre") && !kind.equals("use")) e.putInt("next", k + 1).putInt("reset", -1);
                 e.putString("report", p.getString("report", "") + said + "\n").commit();
                 save(c);
                 return said;

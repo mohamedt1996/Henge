@@ -73,6 +73,13 @@ final class DeviceCheck {
                     + "echo '-- VMs of Android itself (AVF):'; getprop | grep -iE 'hypervisor|virtualization|pvmfw|protected_vm' | head -12; "
                     + "ls /apex/com.android.virt/bin 2>/dev/null | head -12; ls -la /dev/block/by-name 2>/dev/null | grep -iE 'pvmfw|vm-|hyp' | head -8; "
                     + "ls /vendor/vm-system /vendor/bin 2>/dev/null | grep -iE 'vm|crosvm|qcrosvm|gunyah' | head -12; "
+                    // The resource manager's own messages, from the hypervisor image: which version's rules it has
+                    // (android/tools/gunyah_probe.c reads Qualcomm's source; these say how far that source is its).
+                    + "echo \"-- the resource manager's own words (hyp partition):\"; "
+                    + "h=/dev/block/by-name/hyp$(getprop ro.boot.slot_suffix); [ -e $h ] && strings -n 8 $h 2>/dev/null | grep -iE "
+                    + "'neither shared nor exclusive|must be private|parse device tree|map device tree|accept image memparcel|"
+                    + "ACL validation disabled|invalid base tag|only one memparcel|memory node|allow-unprotected|"
+                    + "address space limits|gunyah-[0-9a-f]{6,}|RM version|resource-manager.*(20[0-9]{2}|v[0-9])' | sort -u | head -40; "
                     +"echo '-- the kernel about Gunyah and KVM since boot:'; dmesg 2>/dev/null | grep -iE 'gunyah|gh_rsc|gh_|hypervisor|kvm|HYP mode|EL2' | head -40; true", 20);
             if (!found.trim().isEmpty()) b.append("\nGunyah, what this system has:\n").append(found);
         }

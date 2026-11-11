@@ -841,7 +841,8 @@ public class MainActivity extends Activity {
             }));
             c.addView(gap(10));
         }
-        boolean stuck = next < n && "use".equals(GunyahTest.STEPS[next][3]) && GunyahTest.layout(this) == null;
+        boolean stuck = next < n && !"pre".equals(GunyahTest.STEPS[next][3]) && !"start".equals(GunyahTest.STEPS[next][3])
+                && GunyahTest.layout(this) == null;
         if (next >= n) {
             c.addView(text("Every step was run. Layout that works: " + GunyahTest.layout(this), 13, TEXT, false));
         } else if (stuck) {

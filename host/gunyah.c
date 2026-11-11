@@ -3,11 +3,21 @@
    How the vmapple machine is laid onto a Gunyah VM:
    - Memory: every RAM range the machine has (boot ROM at 0x100000, the config window, guest RAM at 0x70000000)
      is shared with the VM at the same address. Henge keeps its own mapping, so its devices DMA as before.
+     Gunyah's resource manager is not told the addresses the kernel is given: by itself it places only the
+     region that holds the tree, at the tree's base-address, and keeps everything below that address for
+     devices. So the base address is 0 (the boot region, below the ROM), and every other piece is named in the
+     tree with its label and its address: a `shm` device each (HV_GUNYAH_RAM=resmem: a /reserved-memory node
+     each; =plain: not named). Which of these the tablet's resource manager takes is what the app's Gunyah test
+     finds (android/tools/gunyah_probe.c has the rules, from Qualcomm's source); the app passes what it found.
    - Boot: Gunyah starts an unauthenticated VM at the base of the memory region that holds its device tree, with
      x0 = the tree. That region (BOOT_PA) starts with a five-instruction trampoline to the boot ROM, so AVPBooter
-     starts as on Apple's hypervisor: EL1, MMU off, x0-x3 zero.
+     starts as on Apple's hypervisor: EL1, MMU off, x0-x3 zero. HV_GUNYAH_LEND_BOOT=1 lends that region to
+     the VM (the resource manager of 2023 takes a VM's first region only as the VM's own); Henge never
+     touches it after the start.
    - The device tree here is only for Gunyah's resource manager (gunyah-vm-config: vCPUs, the GIC, doorbells);
-     the Mac never reads it (iBoot builds the kernel's device tree from the config device, as always).
+     the Mac never reads it (iBoot builds the kernel's device tree from the config device, as always). The
+     resource manager fails a tree with a memory node not named exactly `memory`, or with no /chosen, and
+     writes the tree back with its own nodes added: the tree's region is all of the boot region after it.
    - GIC and timer: Gunyah's virtual GICv3, placed at vmapple's addresses, and the CPU's own virtual timer.
      Henge's emulated GIC is left in place but unused; its MMIO never exits here unless Gunyah put its GIC
      elsewhere, which this logs.
@@ -62,6 +72,7 @@ struct gh_fn_desc { uint32_t type, arg_size; uint64_t arg; };
 #define GH_VM_ADD_FUNCTION _IOW(GH_IOCTL_TYPE, 0x4, struct gh_fn_desc)
 #define GH_VCPU_RUN _IO(GH_IOCTL_TYPE, 0x5)
 #define GH_VCPU_MMAP_SIZE _IO(GH_IOCTL_TYPE, 0x6)
+#define GH_VM_ANDROID_LEND_USER_MEM _IOW('A', 0x11, struct gh_userspace_memory_region)
 #define GH_FN_VCPU 1
 #define GH_FN_IRQFD 2
 struct gh_fn_irqfd_arg { uint32_t fd, label, flags, padding; };
@@ -79,9 +90,10 @@ struct gh_vcpu_run {
     };
 };
 
-#define BOOT_PA 0x00800000ull   /* trampoline + the VM's device tree: unused space in vmapple's map */
-#define BOOT_SIZE 0x10000ull
+#define BOOT_PA 0x00000000ull   /* trampoline + the VM's device tree: the megabyte below vmapple's boot ROM */
+#define BOOT_SIZE 0x100000ull
 #define DTB_OFF 0x1000ull
+#define MAX_PIECES 96           /* 256 MB pieces of the machine's RAM ranges, halved where the kernel is short */
 #define SPI_LOW_FIRST 32        /* UART, RTC, GPIO, AES, graphics: INTIDs 33..63 */
 #define SPI_LOW_LAST 67         /* and PCIe INTx 64..67 */
 #define NIRQ 160
@@ -101,7 +113,7 @@ static volatile uint8_t irq_level[NIRQ];
 
 /* ---- a minimal flattened device tree writer ---- */
 
-typedef struct { uint8_t s[16384]; size_t n; char str[2048]; size_t ns; } Fdt;
+typedef struct { uint8_t s[60000]; size_t n; char str[4096]; size_t ns; } Fdt;
 
 static void be32(Fdt *f, uint32_t v) { f->s[f->n++] = v >> 24; f->s[f->n++] = v >> 16; f->s[f->n++] = v >> 8; f->s[f->n++] = v; }
 static void pad4(Fdt *f) { while (f->n & 3) f->s[f->n++] = 0; }
@@ -125,7 +137,7 @@ static void prop(Fdt *f, const char *name, const void *v, size_t len) {
     be32(f, 3);
     be32(f, (uint32_t)len);
     be32(f, stroff(f, name));
-    memcpy(f->s + f->n, v, len);
+    if (len) memcpy(f->s + f->n, v, len);
     f->n += len;
     pad4(f);
 }
@@ -143,6 +155,12 @@ static int irq_wanted(int intid) {
 }
 static int irq_is_msi(int intid) { return intid >= VMAPPLE_MSI_BASE; }
 
+/* The pieces given to the VM beyond the boot region, as the tree names them. */
+static struct { uint32_t label; uint64_t pa, size; } piece[MAX_PIECES];
+static int npiece;
+enum { RAM_SHM, RAM_RESMEM, RAM_PLAIN };
+static int ram_how;
+
 /* The VM's configuration for Gunyah's resource manager, in the shape crosvm gives it. */
 static size_t build_dtb(uint8_t *out, size_t cap, int ncpus) {
     static Fdt f;
@@ -153,14 +171,30 @@ static size_t build_dtb(uint8_t *out, size_t cap, int ncpus) {
     prop_u32(&f, "#size-cells", 2);
     prop_str(&f, "compatible", "linux,dummy-virt");
     prop_u32(&f, "interrupt-parent", GIC);
-    for (int i = 0; i < M->nram; i++) {
-        char n[48];
-        snprintf(n, sizeof n, "memory@%llx", (unsigned long long)M->ram[i].pa);
-        begin(&f, n);
-        prop_str(&f, "device_type", "memory");
-        uint32_t reg[4] = {(uint32_t)(M->ram[i].pa >> 32), (uint32_t)M->ram[i].pa, (uint32_t)(M->ram[i].size >> 32),
-                           (uint32_t)M->ram[i].size};
-        prop_u32s(&f, "reg", reg, 4);
+    /* One memory node, named `memory` and nothing more: the resource manager fails the tree for any other, and
+       replaces this one with what it gave the VM. */
+    begin(&f, "memory");
+    prop_str(&f, "device_type", "memory");
+    uint32_t boot_reg[4] = {(uint32_t)(BOOT_PA >> 32), (uint32_t)BOOT_PA, 0, (uint32_t)BOOT_SIZE};
+    prop_u32s(&f, "reg", boot_reg, 4);
+    end(&f);
+    begin(&f, "chosen"); /* the resource manager adds to it, and refuses its changes whole if it is not there */
+    end(&f);
+    if (ram_how == RAM_RESMEM && npiece) {
+        begin(&f, "reserved-memory");
+        prop_u32(&f, "#address-cells", 2);
+        prop_u32(&f, "#size-cells", 2);
+        prop(&f, "ranges", NULL, 0);
+        for (int i = 0; i < npiece; i++) {
+            char n[48];
+            snprintf(n, sizeof n, "henge@%llx", (unsigned long long)piece[i].pa);
+            begin(&f, n);
+            uint32_t reg[4] = {(uint32_t)(piece[i].pa >> 32), (uint32_t)piece[i].pa, (uint32_t)(piece[i].size >> 32),
+                               (uint32_t)piece[i].size};
+            prop_u32s(&f, "reg", reg, 4);
+            prop_u32(&f, "qcom,label", piece[i].label);
+            end(&f);
+        }
         end(&f);
     }
     begin(&f, "cpus");
@@ -214,6 +248,25 @@ static size_t build_dtb(uint8_t *out, size_t cap, int ncpus) {
     end(&f);
     begin(&f, "vdevices");
     prop_str(&f, "generate", "/hypervisor");
+    for (int i = 0; ram_how == RAM_SHM && i < npiece; i++) {
+        /* Shared memory at an address of its own: the parcel of this label, placed at `base`. */
+        char n[32], path[48];
+        snprintf(n, sizeof n, "shm-%x", piece[i].label);
+        snprintf(path, sizeof path, "/hypervisor/shm-%x", piece[i].label);
+        begin(&f, n);
+        prop_str(&f, "vdevice-type", "shm");
+        prop_str(&f, "generate", path);
+        prop(&f, "peer-default", NULL, 0);
+        prop_u32(&f, "#address-cells", 2);
+        prop_u32(&f, "#size-cells", 2);
+        begin(&f, "memory");
+        prop_u32(&f, "qcom,label", piece[i].label);
+        prop_u32(&f, "label", piece[i].label);
+        uint32_t at[2] = {(uint32_t)(piece[i].pa >> 32), (uint32_t)piece[i].pa};
+        prop_u32s(&f, "base", at, 2);
+        end(&f);
+        end(&f);
+    }
     for (int id = 0; id < NIRQ; id++) {
         if (!irq_wanted(id)) continue;
         char n[32], path[48];
@@ -469,15 +522,23 @@ int hv_gunyah_run(void) {
         0xd61f0200u,                                              /* br x16 */
     };
     memcpy(boot, tramp, sizeof tramp);
-    size_t dtb_len = build_dtb(boot + DTB_OFF, BOOT_SIZE - DTB_OFF, nvcpu);
-    if (!dtb_len) { fprintf(stderr, "gunyah: the VM device tree is too big\n"); return -1; }
+    const char *how = getenv("HV_GUNYAH_RAM");
+    ram_how = how && !strcmp(how, "resmem") ? RAM_RESMEM : how && !strcmp(how, "plain") ? RAM_PLAIN : RAM_SHM;
+    int lend_boot = getenv("HV_GUNYAH_LEND_BOOT") != NULL;
+    fprintf(stderr, "gunyah: boot region at %#llx (%s); memory named to the resource manager as %s\n", (unsigned long long)BOOT_PA,
+            lend_boot ? "lent" : "shared", ram_how == RAM_SHM ? "shm devices" : ram_how == RAM_RESMEM ? "reserved-memory nodes" : "nothing");
+    for (int i = 0; i < M->nram; i++)
+        if (M->ram[i].pa < BOOT_PA + BOOT_SIZE && M->ram[i].pa + M->ram[i].size > BOOT_PA) {
+            fprintf(stderr, "gunyah: the machine has memory at %#llx, where the boot region is\n", (unsigned long long)M->ram[i].pa);
+            return -1;
+        }
 
     uint32_t label = 0;
     struct gh_userspace_memory_region r = {.label = label++, .flags = GH_MEM_R | GH_MEM_W | GH_MEM_X,
                                            .guest_phys_addr = BOOT_PA, .memory_size = BOOT_SIZE,
                                            .userspace_addr = (uintptr_t)boot};
-    mark("share the boot region");
-    if (ioctl(vm_fd, GH_VM_SET_USER_MEM_REGION, &r) < 0) return fail("sharing the boot region");
+    mark(lend_boot ? "lend the boot region" : "share the boot region");
+    if (ioctl(vm_fd, lend_boot ? GH_VM_ANDROID_LEND_USER_MEM : GH_VM_SET_USER_MEM_REGION, &r) < 0) return fail("giving the boot region");
     /* Gunyah pins every page and keeps one kcalloc'd array entry per 4 KB page (plus one parcel entry per run),
        so one 3 GB region needs a 6 MB+ physically contiguous kernel allocation and fails with ENOMEM. Large
        regions are shared in chunks, halved on ENOMEM down to 8 MB. Root may also need a higher memlock limit. */
@@ -502,6 +563,8 @@ int hv_gunyah_run(void) {
                                                     .userspace_addr = (uintptr_t)ram->host + done};
             mark("share %llu MB of memory at %llx", (unsigned long long)(n >> 20), (unsigned long long)(ram->pa + done));
             if (ioctl(vm_fd, GH_VM_SET_USER_MEM_REGION, &r) == 0) {
+                if (npiece == MAX_PIECES) { fprintf(stderr, "gunyah: memory in more than %d pieces\n", MAX_PIECES); return -1; }
+                piece[npiece].label = label, piece[npiece].pa = ram->pa + done, piece[npiece].size = n, npiece++;
                 label++, pieces++, done += n;
                 continue;
             }
@@ -515,7 +578,14 @@ int hv_gunyah_run(void) {
         if (pieces > 1) fprintf(stderr, "gunyah:   shared as %d pieces (%llu MB each at the end)\n", pieces,
                                 (unsigned long long)(chunk >> 20));
     }
-    struct gh_vm_dtb_config dtb = {.guest_phys_addr = BOOT_PA + DTB_OFF, .size = (dtb_len + 0xfff) & ~0xfffull};
+    /* The tree, now that the pieces and their labels are known (the boot region's pages are pinned, and still
+       this process's to write until the VM starts). Its region is all of the boot region after it: the resource
+       manager writes the tree back there with its own nodes added. */
+    size_t dtb_len = build_dtb(boot + DTB_OFF, BOOT_SIZE - DTB_OFF, nvcpu);
+    if (!dtb_len) { fprintf(stderr, "gunyah: the VM device tree is too big\n"); return -1; }
+    fprintf(stderr, "gunyah: device tree %zu bytes in a region of %llu KB, %d pieces of memory\n", dtb_len,
+            (unsigned long long)((BOOT_SIZE - DTB_OFF) >> 10), npiece);
+    struct gh_vm_dtb_config dtb = {.guest_phys_addr = BOOT_PA + DTB_OFF, .size = BOOT_SIZE - DTB_OFF};
     mark("set the VM device tree");
     if (ioctl(vm_fd, GH_VM_SET_DTB_CONFIG, &dtb) < 0) return fail("setting the VM device tree");
 

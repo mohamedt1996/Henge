@@ -283,6 +283,7 @@ public class VmService extends Service {
                  .append(" HENGE_PID=").append(sq(pidFile.getPath()))
                  .append(" HENGE_APP_UID=").append(android.os.Process.myUid()) // files the renderer opens while it runs
                  .append(" HV_GUNYAH_KMSG=").append(sq(new File(files, "gunyah-kmsg.txt").getPath())) // host/gunyah.c
+                 .append(gunyahFound()) // what the Gunyah test found this tablet's resource manager takes
                  .append(" GLIBC_TUNABLES=glibc.pthread.rseq=0; cd ")
                  .append(sq(files.getPath())).append(" && ulimit -s 65520 2>/dev/null; touch engine.root; ");
                 for (String a : cmd.subList(3, cmd.size())) q.append(sq(a)).append(' ');
@@ -636,6 +637,20 @@ public class VmService extends Service {
 
     static volatile String engineMode = "jit";
     static boolean gunyah() { return "gunyah".equals(engineMode); }
+
+    /**
+     * How the engine gives its VM to Gunyah (host/gunyah.c), from what the Gunyah test found: the first region lent
+     * if only a lent VM started, and the way of naming memory whose memory the guest could write. Nothing found:
+     * the engine's own choices.
+     */
+    private String gunyahFound() {
+        String layout = GunyahTest.layout(this), ram = GunyahTest.ram(this);
+        StringBuilder b = new StringBuilder();
+        if (layout != null && layout.contains("--lend")) b.append(" HV_GUNYAH_LEND_BOOT=1");
+        if (ram != null && ram.contains("resmem")) b.append(" HV_GUNYAH_RAM=resmem");
+        else if (ram != null && ram.contains("plain")) b.append(" HV_GUNYAH_RAM=plain");
+        return b.toString();
+    }
     static String sq(String s) { return "'" + s.replace("'", "'\\''") + "'"; }
 
     /** SIGTERM: the engine stops the Mac at the next block and flushes its disks. */

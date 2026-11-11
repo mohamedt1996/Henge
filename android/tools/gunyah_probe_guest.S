@@ -6,12 +6,13 @@
      +0x08  memory to touch, first byte (0: touch nothing)
      +0x10  memory to touch, bytes
      +0x18  CPUs                        (more than 1: the others are started through PSCI)
+     +0x20  an address to store to, last (0: none): whether a store there leaves the guest, as a device's would
    and reads `flags` (image + 0x440): a byte a started CPU sets, by its number.
 
    Report slots (8 bytes each): 0x00 MIDR, 0x08 MMFR0, 0x10 ISAR1, 0x18 CurrentEL, 0x20 the PAC hypercall's
    answer, 0x28 SMCCC OEM UID, 0x30 PSCI version, 0x38 PFR0, 0x40 ESR and 0x48 ELR of an exception taken,
    0x50 pages written, 0x58 pages that read back wrong, 0x60 the PSCI CPU_ON answers or'ed together,
-   0x68 CPUs that came up, 0x78 done (0xd0e) or failed (0xbad). */
+   0x68 CPUs that came up, 0x70 the address stored to once that store has returned, 0x78 done (0xd0e) or failed (0xbad). */
     .text
     .global _start
 _start:
@@ -100,7 +101,11 @@ cpus:
 6:  str  x16, [x9, #0x68]
 
 done:
-    movz x1, #0xd0e
+    ldr  x11, [x10, #0x20]              /* a store where the Mac has a device: an exit, or an exception */
+    cbz  x11, 10f
+    str  x11, [x11]
+    str  x11, [x9, #0x70]
+10: movz x1, #0xd0e
     str  x1, [x9, #0x78]
     movz x0, #0x8400, lsl #16
     movk x0, #0x0008                    /* PSCI SYSTEM_OFF */
@@ -121,7 +126,7 @@ secondary:
 
     .org 0x400
 params:
-    .quad 0x10000000, 0, 0, 1
+    .quad 0x10000000, 0, 0, 1, 0
     .org 0x440
 flags:
     .fill 64, 1, 0

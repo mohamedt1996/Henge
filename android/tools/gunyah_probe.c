@@ -21,9 +21,23 @@
                      the tree, and the ROM's place at 1 MB inside it), base address 0. Qualcomm's resource
                      manager keeps what lies below the base address for devices.
      --image-mb N    the first region N MB, not 2 (probe layout)
-     --dtb-room KB   the device tree's region given as KB long, not as the tree's own length rounded to a page:
-                     the resource manager writes its own nodes into the tree where it lies (crosvm gives 2 MB)
-     --lend          memory lent to the VM (GH_VM_ANDROID_LEND_USER_MEM), not shared with it
+     --dtb-room KB   the device tree's region, KB long (default: 1 MB, or what the first region has after the
+                     tree). The resource manager writes the tree back where it lies with its own nodes added,
+                     and with too little room it writes past what it mapped (crosvm gives 2 MB).
+     --lend          all memory lent to the VM (GH_VM_ANDROID_LEND_USER_MEM), not shared with it
+     --lend-image    only the first region lent (the resource manager of 2023 takes a VM's first region only
+                     as its own); the rest shared, so Henge still reads and writes it
+     --ram HOW       how memory beyond the first region is made known to the resource manager, which places
+                     only the first region by itself (at the base address) and does not hear the addresses
+                     the kernel was given:
+                       shm      (default) each piece a `shm` device in the tree: its label and its address
+                       resmem   each piece a /reserved-memory node: its label and its address
+                       private  one piece, labelled 0 and lent: the resource manager adds such a piece right
+                                after the first region (which is then labelled 1)
+                       plain    said nowhere, as before 0.3.40
+     --poke ADDR     last, the guest stores to ADDR (hex): whether a store where the Mac has a device (its PCI
+                     windows are above 1 GB) comes out to Henge, or is an exception in the guest
+     --tree-only F   no VM: the tree this run would give, written to F
      --kmsg FILE     the kernel's messages from now on copied to FILE, each forced to storage as it comes:
                      what the kernel said last before a reset
      --seconds S     how long the guest may run (6)
@@ -31,7 +45,16 @@
                      the steps before the guest runs, one at a time
      --crumb FILE    before each step, a line appended to FILE and forced to storage (fsync): after a reset
                      the file's last line is the step the tablet did not survive
-   The last line printed is `RESULT: PASS` or `RESULT: FAIL ...`. */
+   The last line printed is `RESULT: PASS` or `RESULT: FAIL ...`.
+
+   What the resource manager wants of the tree (Qualcomm's source, vm_config_parser.c and vm_creation.c; the
+   tablet answered "memory invalid" to VM_INIT, which in the 2023 source is also what a tree it cannot accept
+   gives):
+     - one memory node, named exactly `memory`, under the root. Any other node with device_type = "memory"
+       (`memory@80000000` is another) fails the whole tree. The resource manager replaces it with what it
+       really gave the VM.
+     - a `/chosen` node: its changes to the tree include one there, and are refused whole without it.
+     - no `/hypervisor` node: that is its own to make. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -101,6 +124,14 @@ static const Layout ENGINE = {"engine", 0x00800000ull, 0x10000, 0x1000, 0x001000
                               0x10000000ull, 0x10010000ull, 0x20000, 0x20010000ull, 0x104, 1};
 static const Layout ZERO = {"zero", 0, 0x200000, 0x1000, 0, 0, 0x70000000ull,
                             0x10000000ull, 0x10010000ull, 0x20000, 0x20010000ull, 0x104, 2};
+
+/* Memory beyond the first region, a piece a parcel: what the tree must tell the resource manager of. */
+typedef struct { uint32_t label; uint64_t pa, size; } Piece;
+#define MAX_PIECES 96
+static Piece pieces[MAX_PIECES];
+static int npieces;
+enum { RAM_SHM, RAM_RESMEM, RAM_PRIVATE, RAM_PLAIN };
+static int ram_how = RAM_SHM;
 
 /* ---- crumbs: a line forced to storage before each step ---- */
 static const char *crumb_path;
@@ -197,17 +228,12 @@ static void prop_u32s(Fdt *f, const char *name, const uint32_t *v, int count) {
     prop(f, name, b, (size_t)count * 4);
 }
 static void prop_u32(Fdt *f, const char *name, uint32_t v) { prop_u32s(f, name, &v, 1); }
-static void memory_node(Fdt *f, uint64_t pa, uint64_t size) {
-    char n[48];
-    snprintf(n, sizeof n, "memory@%llx", (unsigned long long)pa);
-    begin(f, n);
-    prop_str(f, "device_type", "memory");
+static void prop_reg(Fdt *f, const char *name, uint64_t pa, uint64_t size) {
     uint32_t reg[4] = {(uint32_t)(pa >> 32), (uint32_t)pa, (uint32_t)(size >> 32), (uint32_t)size};
-    prop_u32s(f, "reg", reg, 4);
-    end(f);
+    prop_u32s(f, name, reg, 4);
 }
 
-static size_t build_dtb(uint8_t *out, size_t cap, const Layout *L, uint64_t ram_size, int ncpus, int bells) {
+static size_t build_dtb(uint8_t *out, size_t cap, const Layout *L, int ncpus, int bells) {
     static Fdt f;
     memset(&f, 0, sizeof f);
     const uint32_t GIC = 1;
@@ -216,15 +242,27 @@ static size_t build_dtb(uint8_t *out, size_t cap, const Layout *L, uint64_t ram_
     prop_u32(&f, "#size-cells", 2);
     prop_str(&f, "compatible", "linux,dummy-virt");
     prop_u32(&f, "interrupt-parent", GIC);
-    if (L->nodes == 1) {
-        /* As the engine lists its memory: the ROM and the RAM, and not the boot region. */
-        memory_node(&f, L->rom_pa, L->rom_size);
-        if (ram_size) memory_node(&f, L->ram_pa, ram_size);
-    } else if (L->nodes == 2) {
-        memory_node(&f, L->image_pa, L->image_size);
-        if (ram_size) memory_node(&f, L->ram_pa, ram_size);
-    } else {
-        memory_node(&f, L->image_pa, L->image_size + ram_size); /* the image's region and the memory after it */
+    /* The one memory node, named `memory` and nothing more: the resource manager replaces it. */
+    begin(&f, "memory");
+    prop_str(&f, "device_type", "memory");
+    prop_reg(&f, "reg", L->image_pa, L->image_size);
+    end(&f);
+    begin(&f, "chosen"); /* the resource manager adds to it (a seed), and must find it */
+    end(&f);
+    if (ram_how == RAM_RESMEM && npieces) {
+        begin(&f, "reserved-memory");
+        prop_u32(&f, "#address-cells", 2);
+        prop_u32(&f, "#size-cells", 2);
+        prop(&f, "ranges", NULL, 0);
+        for (int i = 0; i < npieces; i++) {
+            char n[48];
+            snprintf(n, sizeof n, "henge@%llx", (unsigned long long)pieces[i].pa);
+            begin(&f, n);
+            prop_reg(&f, "reg", pieces[i].pa, pieces[i].size);
+            prop_u32(&f, "qcom,label", pieces[i].label);
+            end(&f);
+        }
+        end(&f);
     }
     begin(&f, "cpus");
     prop_u32(&f, "#address-cells", 1);
@@ -280,6 +318,25 @@ static size_t build_dtb(uint8_t *out, size_t cap, const Layout *L, uint64_t ram_
     end(&f);
     begin(&f, "vdevices");
     prop_str(&f, "generate", "/hypervisor");
+    for (int i = 0; ram_how == RAM_SHM && i < npieces; i++) {
+        /* Shared memory at an address of its own: the parcel of this label, placed at `base`. */
+        char n[32], path[48];
+        snprintf(n, sizeof n, "shm-%x", pieces[i].label);
+        snprintf(path, sizeof path, "/hypervisor/shm-%x", pieces[i].label);
+        begin(&f, n);
+        prop_str(&f, "vdevice-type", "shm");
+        prop_str(&f, "generate", path);
+        prop(&f, "peer-default", NULL, 0);
+        prop_u32(&f, "#address-cells", 2);
+        prop_u32(&f, "#size-cells", 2);
+        begin(&f, "memory");
+        prop_u32(&f, "qcom,label", pieces[i].label);
+        prop_u32(&f, "label", pieces[i].label);
+        uint32_t at[2] = {(uint32_t)(pieces[i].pa >> 32), (uint32_t)pieces[i].pa};
+        prop_u32s(&f, "base", at, 2);
+        end(&f);
+        end(&f);
+    }
     for (int id = 0; bells && id < NIRQ; id++) {
         if (!bell_wanted(id)) continue;
         char n[32], path[48];
@@ -314,7 +371,8 @@ static size_t build_dtb(uint8_t *out, size_t cap, const Layout *L, uint64_t ram_
 /* ---- running ---- */
 static uint64_t rep[16];
 static unsigned seen;
-static uint64_t report_pa;
+static uint64_t report_pa, poke_at;
+static int poked;
 static volatile sig_atomic_t timed_out;
 static volatile int vm_over;
 static void on_alarm(int s) { (void)s; timed_out = 1; }
@@ -337,6 +395,8 @@ static int handle_exit(int cpu) {
             if (i == 15) return 1;
         } else if (!run->mmio.is_write) {
             memset(run->mmio.data, 0, sizeof run->mmio.data);
+        } else if (poke_at && a == poke_at) {
+            poked = 1;
         } else {
             memcpy(&v, run->mmio.data, run->mmio.len < 8 ? run->mmio.len : 8);
             printf("guest (cpu %d) wrote %#llx at %#llx\n", cpu, (unsigned long long)v, (unsigned long long)a);
@@ -380,18 +440,20 @@ static const char *hvc_result(uint64_t v) {
 
 /* `size` bytes of `host` given to the VM at `pa`, in pieces of 256 MB at most, halved where the kernel has no
    room for a piece's page list (ENOMEM), as the engine does. */
-static int lend; /* --lend */
-static int share(int vm, uint32_t *label, uint64_t pa, uint8_t *host, uint64_t size, const char *what) {
+static int lend_image, lend_rest; /* --lend: both; --lend-image */
+static int share(int vm, uint32_t *label, uint64_t pa, uint8_t *host, uint64_t size, const char *what, int lend, int declare) {
     uint64_t chunk = 256ull << 20, done = 0;
-    int pieces = 0;
+    if (ram_how == RAM_PRIVATE && declare) chunk = size; /* one piece: only one can be labelled 0 */
+    int count = 0;
     while (done < size) {
         uint64_t n = size - done < chunk ? size - done : chunk;
         struct gh_userspace_memory_region r = {.label = *label, .flags = GH_MEM_RWX, .guest_phys_addr = pa + done,
                                                .memory_size = n, .userspace_addr = (uintptr_t)host + done};
         crumb("try: give the VM %s: %llu MB at %#llx (piece %d)", what, (unsigned long long)(n >> 20),
-              (unsigned long long)(pa + done), pieces + 1);
+              (unsigned long long)(pa + done), count + 1);
         if (ioctl(vm, lend ? GH_VM_ANDROID_LEND_USER_MEM : GH_VM_SET_USER_MEM_REGION, &r) == 0) {
-            (*label)++, pieces++, done += n;
+            if (declare && npieces < MAX_PIECES) pieces[npieces++] = (Piece){*label, pa + done, n};
+            (*label)++, count++, done += n;
             continue;
         }
         if (errno != ENOMEM || chunk <= (8ull << 20)) {
@@ -404,7 +466,7 @@ static int share(int vm, uint32_t *label, uint64_t pa, uint8_t *host, uint64_t s
     char w[96];
     snprintf(w, sizeof w, "give %s", what);
     step(w, 0);
-    if (pieces > 1) printf("                       in %d pieces\n", pieces);
+    if (count > 1) printf("                       in %d pieces\n", count);
     return 0;
 }
 
@@ -413,15 +475,16 @@ int main(int argc, char **argv) {
     static Layout layout;
     Layout *L = &layout;
     layout = SMALL;
-    uint64_t mem_mb = 2, image_mb = 0, dtb_room_kb = 0;
-    const char *kmsg_path = NULL;
+    uint64_t mem_mb = 2, image_mb = 0, dtb_room_kb = 0, poke = 0;
+    const char *kmsg_path = NULL, *tree_only = NULL;
     int touch = 0, ncpus = 1, bells = 0, seconds = 6;
     const char *until = "";
     int dev = -1, vm = -1;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         if (!strcmp(a, "--touch")) touch = 1;
-        else if (!strcmp(a, "--lend")) lend = 1;
+        else if (!strcmp(a, "--lend")) lend_image = lend_rest = 1;
+        else if (!strcmp(a, "--lend-image")) lend_image = 1;
         else if (!strcmp(a, "--bells")) bells = 1;
         else if (!v) { fprintf(stderr, "gunyah-probe: %s needs a value\n", a); return 2; }
         else if (!strcmp(a, "--mem")) mem_mb = strtoull(v, NULL, 10), i++;
@@ -432,6 +495,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--kmsg")) kmsg_path = v, i++;
         else if (!strcmp(a, "--image-mb")) image_mb = strtoull(v, NULL, 10), i++;
         else if (!strcmp(a, "--dtb-room")) dtb_room_kb = strtoull(v, NULL, 10), i++;
+        else if (!strcmp(a, "--poke")) poke = strtoull(v, NULL, 16), i++;
+        else if (!strcmp(a, "--tree-only")) tree_only = v, i++;
+        else if (!strcmp(a, "--ram")) {
+            ram_how = !strcmp(v, "resmem") ? RAM_RESMEM : !strcmp(v, "private") ? RAM_PRIVATE : !strcmp(v, "plain") ? RAM_PLAIN : RAM_SHM;
+            i++;
+        }
         else if (!strcmp(a, "--layout")) layout = !strcmp(v, "engine") ? ENGINE : !strcmp(v, "zero") ? ZERO : SMALL, i++;
         else { fprintf(stderr, "gunyah-probe: unknown argument %s\n", a); return 2; }
     }
@@ -443,14 +512,40 @@ int main(int argc, char **argv) {
     if (small && image_mb >= 2 && image_mb <= 512) {
         L->image_size = image_mb << 20, L->ram_pa = L->image_pa + L->image_size;
         if (mem_mb < image_mb) mem_mb = image_mb;
+    } else if (L->nodes == 2 && image_mb >= 2 && image_mb <= 512) {
+        L->image_size = image_mb << 20; /* base 0: a longer first region, the memory still at 0x70000000 */
     }
     uint64_t image_now = L->image_size >> 20;
     uint64_t ram_size = small ? (mem_mb > image_now ? (mem_mb - image_now) << 20 : 0) : mem_mb << 20;
+    /* A piece the resource manager adds by itself lies right after the first region, whatever the layout. */
+    if (ram_how == RAM_PRIVATE) L->ram_pa = L->image_pa + L->image_size;
+    static const char *const how_name[] = {"a shm device each", "a reserved-memory node each", "one private piece, lent", "said nowhere"};
     kmsg_start(kmsg_path);
-    report_pa = L->report;
+    report_pa = L->report, poke_at = poke;
     printf("gunyah-probe: uid %d; %s layout (base %#llx, first region %llu MB), %llu MB, %d CPU%s%s%s%s\n", (int)getuid(), L->name,
            (unsigned long long)L->image_pa, (unsigned long long)image_now, (unsigned long long)mem_mb, ncpus,
-           ncpus == 1 ? "" : "s", touch ? ", every page touched" : "", bells ? ", the engine's doorbells" : "", lend ? ", memory lent" : "");
+           ncpus == 1 ? "" : "s", touch ? ", every page touched" : "", bells ? ", the engine's doorbells" : "",
+           lend_image && lend_rest ? ", memory lent" : lend_image ? ", first region lent" : "");
+    if (ram_size || L->rom_size)
+        printf("                       memory beyond the first region: %s%s\n", how_name[ram_how],
+               ram_size ? "" : " (the ROM's place)");
+    if (tree_only) {
+        /* The pieces as sharing would make them, 256 MB each. */
+        uint32_t l = ram_how == RAM_PRIVATE ? 0 : 1;
+        if (L->rom_size) pieces[npieces++] = (Piece){l++, L->rom_pa, L->rom_size};
+        for (uint64_t d = 0; d < ram_size && npieces < MAX_PIECES;) {
+            uint64_t n = ram_how == RAM_PRIVATE || ram_size - d < (256ull << 20) ? ram_size - d : 256ull << 20;
+            pieces[npieces++] = (Piece){l++, L->ram_pa + d, n};
+            d += n;
+        }
+        static uint8_t t[65536];
+        size_t n = build_dtb(t, sizeof t, L, ncpus, bells);
+        FILE *o = fopen(tree_only, "wb");
+        if (!n || !o || fwrite(t, 1, n, o) != n) { printf("RESULT: FAIL the tree was not written\n"); return 1; }
+        fclose(o);
+        printf("device tree            %zu bytes, written to %s\nRESULT: PASS\n", n, tree_only);
+        return 0;
+    }
     crumb("begin: %s layout, %llu MB, %d CPUs%s%s", L->name, (unsigned long long)mem_mb, ncpus, touch ? ", touch" : "",
           bells ? ", doorbells" : "");
 
@@ -466,31 +561,42 @@ int main(int argc, char **argv) {
     uint8_t *image = mmap(NULL, L->image_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
     if (image == MAP_FAILED) { step("map the image", -1); goto fail; }
     memcpy(image, probe_guest, sizeof probe_guest);
-    uint64_t params[4] = {L->report, touch && ram_size ? L->ram_pa : 0, touch ? ram_size : 0, (uint64_t)ncpus};
+    uint64_t params[5] = {L->report, touch && ram_size ? L->ram_pa : 0, touch ? ram_size : 0, (uint64_t)ncpus, poke};
     memcpy(image + PROBE_GUEST_PARAMS, params, sizeof params);
-    size_t dtb_len = build_dtb(image + L->dtb_off, L->image_size - L->dtb_off, L, ram_size, ncpus, bells);
-    if (!dtb_len) { printf("the VM's device tree does not fit\n"); goto fail; }
 
     struct rlimit nolimit = {RLIM_INFINITY, RLIM_INFINITY};
     setrlimit(RLIMIT_MEMLOCK, &nolimit); /* Gunyah pins what it is given */
-    uint32_t label = 0;
-    if (share(vm, &label, L->image_pa, image, L->image_size, "the image")) goto fail;
+    /* Labels: the first region 0 and the rest from 1; with --ram private the piece after it is 0 (the resource
+       manager adds only a piece labelled 0 by itself) and the first region, which it finds by its handle, 1. */
+    uint32_t label = ram_how == RAM_PRIVATE ? 1 : 0, rest_label = ram_how == RAM_PRIVATE ? 0 : 1;
+    if (share(vm, &label, L->image_pa, image, L->image_size, "the image", lend_image, 0)) goto fail;
+    int declare = ram_how != RAM_PLAIN, lend_ram = lend_rest || ram_how == RAM_PRIVATE;
     if (L->rom_size) {
         uint8_t *rom = mmap(NULL, L->rom_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
         if (rom == MAP_FAILED) { step("map the ROM's place", -1); goto fail; }
-        if (share(vm, &label, L->rom_pa, rom, L->rom_size, "the ROM's place")) goto fail;
+        if (ram_how == RAM_PRIVATE) rest_label = 2; /* not the piece labelled 0: that is the memory's */
+        if (share(vm, &rest_label, L->rom_pa, rom, L->rom_size, "the ROM's place", lend_rest, declare && ram_how != RAM_PRIVATE)) goto fail;
+        if (ram_how == RAM_PRIVATE) rest_label = 0;
     }
     if (ram_size) {
         /* Anonymous memory of plain 4 KB pages, as the engine's: no file's pages, no transparent huge pages. */
         uint8_t *ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (ram == MAP_FAILED) { step("map guest memory", -1); goto fail; }
         madvise(ram, ram_size, MADV_NOHUGEPAGE);
-        if (share(vm, &label, L->ram_pa, ram, ram_size, "guest memory")) goto fail;
+        if (share(vm, &rest_label, L->ram_pa, ram, ram_size, "guest memory", lend_ram, declare)) goto fail;
     }
     if (!strcmp(until, "memory")) goto early;
-    struct gh_vm_dtb_config dtb = {.guest_phys_addr = L->image_pa + L->dtb_off, .size = (dtb_len + 0xfff) & ~0xfffull};
-    if ((dtb_room_kb << 10) > dtb.size) dtb.size = (dtb_room_kb << 10) & ~0xfffull;
-    if (dtb.size > L->image_size - L->dtb_off) dtb.size = L->image_size - L->dtb_off;
+    /* The tree, written now that the pieces and their labels are known. The first region's pages are pinned
+       and still this process's to write until the VM starts. */
+    size_t dtb_len = build_dtb(image + L->dtb_off, L->image_size - L->dtb_off, L, ncpus, bells);
+    if (!dtb_len) { printf("the VM's device tree does not fit\n"); goto fail; }
+    /* Room after the tree: up to the ROM's place when that lies in the first region (base 0), else its end. */
+    uint64_t room_cap = (L->dtb_off < 0x100000 && L->image_size > 0x100000 ? 0x100000 : L->image_size) - L->dtb_off;
+    struct gh_vm_dtb_config dtb = {.guest_phys_addr = L->image_pa + L->dtb_off, .size = dtb_room_kb ? dtb_room_kb << 10 : 1024 << 10};
+    dtb.size &= ~0xfffull;
+    if (dtb.size < ((dtb_len + 0xfff) & ~0xfffull)) dtb.size = (dtb_len + 0xfff) & ~0xfffull;
+    if (dtb.size > room_cap) dtb.size = room_cap;
+    if (dtb_len > dtb.size) { printf("the VM's device tree does not fit\n"); goto fail; }
     printf("device tree            %zu bytes in a region of %llu KB\n", dtb_len, (unsigned long long)(dtb.size >> 10));
     crumb("try: set device tree (%zu bytes, region %llu KB)", dtb_len, (unsigned long long)(dtb.size >> 10));
     if (step("set device tree", ioctl(vm, GH_VM_SET_DTB_CONFIG, &dtb))) goto fail;
@@ -579,6 +685,9 @@ int main(int argc, char **argv) {
     if (HAVE(6)) printf("PSCI version           %#llx\n", (unsigned long long)rep[6]);
     if (HAVE(7)) printf("PFR0                   %#llx\n", (unsigned long long)rep[7]);
     if (HAVE(8)) printf("guest exception        ESR %#llx at %#llx\n", (unsigned long long)rep[8], (unsigned long long)rep[9]);
+    if (poke) printf("store at %#llx        %s\n", (unsigned long long)poke,
+                     poked ? "came out to this program, as a device's must" : HAVE(14) ? "did NOT come out: it went to memory, or nowhere"
+                           : "did NOT come out: the guest took an exception there");
     const char *why = NULL;
     static char whybuf[160];
     uint64_t pages = touch ? ram_size >> 12 : 0;
@@ -594,6 +703,7 @@ int main(int argc, char **argv) {
     else if (rep[15] != 0xd0e) why = "the guest took an exception";
     else if (touch && ram_size && (!HAVE(10) || rep[10] != pages)) why = "not every page was written";
     else if (touch && ram_size && (!HAVE(11) || rep[11] != 0)) why = "pages read back wrong";
+    else if (poke && !poked) why = "a store at a device's address did not come out of the guest";
     else if (ncpus > 1 && (!HAVE(13) || rep[13] != (uint64_t)(ncpus - 1))) {
         snprintf(whybuf, sizeof whybuf, "%llu of %d other CPUs came up", HAVE(13) ? (unsigned long long)rep[13] : 0ull, ncpus - 1);
         why = whybuf;
