@@ -27,11 +27,10 @@ final class GunyahTest {
      * the guest can write is the way the later steps use (%R). "use": must pass before the next. "info": an
      * answer either way, about what the Mac will need.
      *
-     * Everything the Pad 7 has answered is at the top of android/tools/gunyah_probe.c. In short: a VM runs with
-     * one lent piece of memory (<=256 MB) and up to 4 CPUs, 16 KB pages work, but the host cannot read memory it
-     * lent and no second piece can be added. The one road left: a program inside the guest asks the resource
-     * manager to share the VM's memory back to the host. Phase 1, here, only asks whether an unauthenticated VM
-     * may have a channel to the resource manager at all; if not, that road is closed with no kernel flash.
+     * Phase 2a of the one road left to the Mac (a program inside the guest asking the resource manager to share
+     * the VM's memory back to the host): these steps give the guest a channel to the resource manager and have it
+     * ask the resource manager its own VM id. If the reply comes back, the guest can drive the resource manager
+     * and the memory-share request is worth building; if not, the report shows where it stopped. No kernel flash.
      */
     static final String[][] STEPS = {
             {"Open /dev/gunyah", "--until open", "6", "pre"},
@@ -41,11 +40,10 @@ final class GunyahTest {
             {"Add a CPU", "--until vcpu", "6", "pre"},
             {"Start: 2 MB at 0x80000000, lent", "--lend", "6", "start"},
             {"Run a tiny program in it", "%L", "6", "use"},
-            {"A channel to the resource manager in the tree, started", "--lend --rm-rpc --until start", "6", "info"},
-            {"A channel to the resource manager, the guest then runs", "--lend --rm-rpc", "6", "info"},
-            {"A channel to the resource manager, 4 CPUs, 16 KB pages, as the Mac would be", "--lend --base 70000000 --gic 10000000 --image-mb 16 --touch --mmu16k --cpus 4 --rm-rpc", "20", "info"},
+            {"The guest asks the resource manager its VM id", "--lend --rm-call", "8", "info"},
+            {"The guest asks again, 4 CPUs, as the Mac would be", "--lend --base 70000000 --gic 10000000 --image-mb 16 --mmu16k --cpus 4 --rm-call", "15", "info"},
     };
-    private static final int VERSION = 8; // of STEPS: progress saved by another list starts over
+    private static final int VERSION = 9; // of STEPS: progress saved by another list starts over
 
     static volatile boolean running;
 

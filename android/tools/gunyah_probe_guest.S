@@ -9,13 +9,17 @@
      +0x20  an address to store to, last (0: none): whether a store there leaves the guest, as a device's would
      +0x28  16 KB of zeroed memory for a page table (0: none): the MMU is turned on with 16 KB pages, as macOS
             has it, whatever ID_AA64MMFR0 says of them
+     +0x30  the VM's device tree (0: none): the guest parses it for the resource-manager message queue and asks
+            the resource manager its own VM id (VM_GET_VMID), to prove the guest can drive the resource manager
    and reads `flags` (image + 0x440): a byte a started CPU sets, by its number.
 
    Report slots (8 bytes each): 0x00 MIDR, 0x08 MMFR0, 0x10 ISAR1, 0x18 CurrentEL, 0x20 the PAC hypercall's
    answer, 0x28 SMCCC OEM UID, 0x30 PSCI version, 0x38 PFR0, 0x40 ESR and 0x48 ELR of an exception taken,
    0x50 pages written, 0x58 pages that read back wrong, 0x60 the PSCI CPU_ON answers or'ed together,
    0x68 CPUs that came up, 0x70 the address stored to once that store has returned, 0x80 what was read back
-   through 16 KB pages (0x16c), 0x78 done (0xd0e) or failed (0xbad). */
+   through 16 KB pages (0x16c), 0x88 resource-manager message queue found in the tree (1), 0x90/0x98 its send and
+   receive capabilities, 0xa0 MSGQ_SEND result, 0xa8 MSGQ_RECV result, 0xb0 the reply's error code, 0xb8 the VM
+   id the resource manager returned, 0x78 done (0xd0e) or failed (0xbad). */
     .text
     .global _start
 _start:
@@ -104,6 +108,7 @@ cpus:
 6:  str  x16, [x9, #0x68]
 
 done:
+    bl   rmcall                         /* ask the resource manager its VM id, if a tree was given */
     ldr  x11, [x10, #0x20]              /* a store where the Mac has a device: an exit, or an exception */
     cbz  x11, 10f
     str  x11, [x11]
@@ -163,10 +168,152 @@ secondary:
 
     .org 0x400
 params:
-    .quad 0x10000000, 0, 0, 1, 0, 0
+    .quad 0x10000000, 0, 0, 1, 0, 0, 0
     .org 0x440
 flags:
     .fill 64, 1, 0
+
+    .org 0x480
+rmbuf:
+    .fill 256, 1, 0
+
+/* ---- the resource-manager conversation ----
+   Parse the VM's device tree for the message-queue the resource manager gave this VM (a node whose compatible is
+   "qcom,gunyah-message-queue", its reg = <tx-cap rx-cap>, two big-endian 64-bit values), then send one request
+   (VM_GET_VMID) over it and read the reply. The message queues are Gunyah's own ABI (GH_HYPERCALL_MSGQ_SEND/RECV,
+   function 0xc600801b/0xc600801c); the request is the resource manager's RPC: an 8-byte header (api 0x21, type 1
+   request, seq, message id) with no payload, and the reply is that header, a 32-bit error code, then the id. */
+    .org 0x580
+rmcall:
+    mov  x19, x30
+    ldr  x20, [x10, #0x30]              /* the device tree (0: nothing to do) */
+    cbz  x20, rmret
+    ldr  w21, [x20, #8]
+    rev  w21, w21                       /* off_dt_struct */
+    ldr  w22, [x20, #12]
+    rev  w22, w22                       /* off_dt_strings */
+    add  x23, x20, x21                  /* the structure block */
+    add  x24, x20, x22                  /* the strings block */
+    mov  x25, #0                        /* in a message-queue node */
+    mov  x28, #0                        /* its caps were found */
+rmwalk:
+    ldr  w0, [x23], #4
+    rev  w0, w0
+    cmp  w0, #1
+    b.eq rmnode
+    cmp  w0, #2
+    b.eq rmclr
+    cmp  w0, #3
+    b.eq rmprop
+    cmp  w0, #4
+    b.eq rmwalk
+    b    rmsend                         /* end of tree, or a token we do not expect */
+rmnode:
+1:  ldrb w1, [x23], #1                  /* skip the node name, then align to four */
+    cbnz w1, 1b
+    add  x23, x23, #3
+    bic  x23, x23, #3
+rmclr:
+    mov  x25, #0
+    b    rmwalk
+rmprop:
+    ldr  w1, [x23], #4
+    rev  w1, w1                         /* the property's length */
+    ldr  w2, [x23], #4
+    rev  w2, w2                         /* its name's offset in the strings block */
+    add  x3, x24, x2                    /* the name */
+    mov  x4, x23                        /* the data */
+    add  x5, x1, #3
+    bic  x5, x5, #3
+    add  x23, x23, x5                   /* past the data, aligned to four */
+    adr  x6, s_compatible
+    bl   streq
+    cbz  w0, rmreg
+    mov  x3, x4                         /* compatible: does its first string name the message queue? */
+    adr  x6, s_msgq
+    bl   streq
+    cbz  w0, rmwalk
+    mov  x25, #1
+    b    rmwalk
+rmreg:
+    adr  x6, s_reg
+    bl   streq
+    cbz  w0, rmwalk
+    cbz  x25, rmwalk
+    cmp  w1, #16
+    b.lo rmwalk
+    ldr  x26, [x4]
+    rev  x26, x26                       /* the send capability */
+    ldr  x27, [x4, #8]
+    rev  x27, x27                       /* the receive capability */
+    mov  x28, #1
+    b    rmwalk
+rmsend:
+    cbz  x28, rmret                     /* no message queue: the guest cannot reach the resource manager */
+    mov  x0, #1
+    str  x0, [x9, #0x88]
+    str  x26, [x9, #0x90]
+    str  x27, [x9, #0x98]
+    adr  x5, rmbuf                      /* the request: api 0x21, type 1, seq 1, message id 0x56000024 */
+    movz w0, #0x0121
+    strh w0, [x5]
+    movz w0, #0x0001
+    strh w0, [x5, #2]
+    movz w0, #0x0024
+    movk w0, #0x5600, lsl #16
+    str  w0, [x5, #4]
+    movz x0, #0x801b                    /* MSGQ_SEND */
+    movk x0, #0xc600, lsl #16
+    mov  x1, x26
+    mov  x2, #8
+    mov  x3, x5
+    mov  x4, #1                         /* push the message */
+    hvc  #0
+    str  x0, [x9, #0xa0]
+    cbnz x0, rmret
+    movz x12, #0x0020, lsl #16          /* wait a bounded while for the reply */
+rmrecv:
+    adr  x5, rmbuf
+    movz x0, #0x801c                    /* MSGQ_RECV */
+    movk x0, #0xc600, lsl #16
+    mov  x1, x27
+    mov  x2, x5
+    mov  x3, #240
+    hvc  #0
+    cbz  x0, rmgot
+    subs x12, x12, #1
+    b.ne rmrecv
+    movn x0, #0
+    str  x0, [x9, #0xa8]
+    b    rmret
+rmgot:
+    str  x0, [x9, #0xa8]
+    adr  x5, rmbuf
+    ldr  w0, [x5, #8]                   /* the reply's error code */
+    str  x0, [x9, #0xb0]
+    ldr  w0, [x5, #12]                  /* the VM id it returned */
+    str  x0, [x9, #0xb8]
+rmret:
+    mov  x30, x19
+    ret
+
+/* w0 = 1 if the string at x3 equals the one at x6 (both end at a zero byte). */
+streq:
+    mov  x7, x3
+    mov  x8, x6
+1:  ldrb w0, [x7], #1
+    ldrb w2, [x8], #1
+    cmp  w0, w2
+    b.ne 2f
+    cbnz w0, 1b
+    mov  w0, #1
+    ret
+2:  mov  w0, #0
+    ret
+
+s_compatible: .asciz "compatible"
+s_reg:        .asciz "reg"
+s_msgq:       .asciz "qcom,gunyah-message-queue"
 
     .org 0x800
 vectors:

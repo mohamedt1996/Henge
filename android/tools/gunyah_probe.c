@@ -49,9 +49,10 @@
                      to the VM is still the host's to read (Henge's devices read and write the Mac's memory).
                      Read in a child process, so a refusal is a signal to the child; it may also reset the tablet.
      --rm-rpc        add an rm-rpc message-queue channel to the resource manager to the VM's tree, as Qualcomm's
-                     own guests have. Phase 1 of asking the resource manager, from inside the guest, to share the
-                     VM's memory back to the host: this only tests whether the firmware lets an unauthenticated
-                     VM have the channel at all (the VM still starts).
+                     own guests have.
+     --rm-call       --rm-rpc, and the guest then parses its tree for the channel and asks the resource manager
+                     its own VM id (VM_GET_VMID). Proves the guest can drive the resource manager, which the
+                     memory-share request needs. The report shows the channel's capabilities and the reply.
      --tree-only F   no VM: the tree this run would give, written to F
      --kmsg FILE     the kernel's messages from now on copied to FILE, each forced to storage as it comes:
                      what the kernel said last before a reset
@@ -161,7 +162,7 @@ static int npieces;
 enum { RAM_SHM, RAM_RESMEM, RAM_PRIVATE, RAM_PLAIN };
 static int ram_how = RAM_SHM;
 static uint64_t size_max_mb;
-static int shm_alloc, ram_rw, rm_rpc;
+static int shm_alloc, ram_rw, rm_rpc, rm_call;
 
 /* ---- crumbs: a line forced to storage before each step ---- */
 static const char *crumb_path;
@@ -538,6 +539,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--shm-alloc")) shm_alloc = 1;
         else if (!strcmp(a, "--peek")) peek = 1;
         else if (!strcmp(a, "--rm-rpc")) rm_rpc = 1;
+        else if (!strcmp(a, "--rm-call")) rm_rpc = rm_call = 1;
         else if (!strcmp(a, "--bells")) bells = 1;
         else if (!v) { fprintf(stderr, "gunyah-probe: %s needs a value\n", a); return 2; }
         else if (!strcmp(a, "--mem")) mem_mb = strtoull(v, NULL, 10), i++;
@@ -626,7 +628,8 @@ int main(int argc, char **argv) {
     uint8_t *image = mmap(NULL, L->image_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
     if (image == MAP_FAILED) { step("map the image", -1); goto fail; }
     memcpy(image, probe_guest, sizeof probe_guest);
-    uint64_t params[6] = {L->report, touch && touch_size ? touch_pa : 0, touch ? touch_size : 0, (uint64_t)ncpus, poke, table};
+    uint64_t params[7] = {L->report, touch && touch_size ? touch_pa : 0, touch ? touch_size : 0, (uint64_t)ncpus, poke, table,
+                          rm_call ? L->image_pa + L->dtb_off : 0};
     memcpy(image + PROBE_GUEST_PARAMS, params, sizeof params);
 
     struct rlimit nolimit = {RLIM_INFINITY, RLIM_INFINITY};
@@ -759,6 +762,16 @@ int main(int argc, char **argv) {
     if (mmu16k) printf("16 KB pages, tried     %s\n", !table ? "not tried: no room for the table in this layout"
                        : HAVE(16) && rep[16] == 0x16c ? "they WORK: the MMU on, memory read through them"
                        : HAVE(16) ? "the MMU came on, and memory read back wrong" : "the guest did not come back from turning the MMU on");
+    if (rm_call) {
+        if (!HAVE(17)) printf("resource mgr channel   not found in the tree the resource manager gave the guest\n");
+        else {
+            printf("resource mgr channel   found: send cap %#llx, receive cap %#llx\n", (unsigned long long)rep[18], (unsigned long long)rep[19]);
+            printf("  MSGQ_SEND            %s\n", HAVE(20) && rep[20] == 0 ? "ok" : "failed");
+            if (!(HAVE(21) && rep[21] == 0)) printf("  reply                none: the resource manager did not answer\n");
+            else printf("  reply                error %#llx, VM id %llu%s\n", (unsigned long long)rep[22], (unsigned long long)rep[23],
+                        rep[22] == 0 ? " (the guest can drive the resource manager)" : "");
+        }
+    }
     if (touch && touch_size) {
         if (HAVE(10)) printf("pages written          %llu of %llu\n", (unsigned long long)rep[10], (unsigned long long)pages);
         if (HAVE(11)) printf("pages read back wrong  %llu\n", (unsigned long long)rep[11]);
@@ -772,6 +785,9 @@ int main(int argc, char **argv) {
     else if (touch && touch_size && (!HAVE(10) || rep[10] != pages)) why = "not every page was written";
     else if (touch && touch_size && (!HAVE(11) || rep[11] != 0)) why = "pages read back wrong";
     else if (mmu16k && table && !(HAVE(16) && rep[16] == 0x16c)) why = "16 KB pages did not work";
+    else if (rm_call && !HAVE(17)) why = "the guest did not find the resource-manager channel in its tree";
+    else if (rm_call && !(HAVE(21) && rep[21] == 0)) why = "the resource manager did not answer the guest";
+    else if (rm_call && rep[22] != 0) why = "the resource manager refused the guest's request";
     else if (poke && !poked) why = "a store at a device's address did not come out of the guest";
     else if (ncpus > 1 && (!HAVE(13) || rep[13] != (uint64_t)(ncpus - 1))) {
         snprintf(whybuf, sizeof whybuf, "%llu of %d other CPUs came up", HAVE(13) ? (unsigned long long)rep[13] : 0ull, ncpus - 1);
