@@ -98,7 +98,12 @@ CPU, start, run a tiny program, then more memory, every page written, more CPUs,
 the Mac's memory layout. Each request is forced to storage before it is made, so after a reset Henge says
 which step, and which request in it, the tablet did not survive (also `gunyah-test.txt` beside
 `device-check.txt`). The device check itself no longer makes a VM. The engine's log likewise ends in
-`gunyah: next: ...`, forced to storage, before each of its own requests. Untested on the tablet.
+`gunyah: next: ...`, forced to storage, before each of its own requests.
+
+On the tablet (2026-11-11, 0.3.30; Android 17, kernel 6.1.138-android14-11): steps 1-5 pass (open, create,
+2 MB, device tree, vCPU) and step 6, `GH_VM_START` of the 2 MB VM, is refused with EINVAL, with no reset.
+0.3.31 adds the kernel's messages during a failed step to the report. The same check: no udmabuf
+(`# CONFIG_UDMABUF is not set`, no module), so no zero-copy without a kernel module built for it.
 
 For a Gunyah reset, the kernel's last messages are needed. `/sys/fs/pstore` was empty on the test
 tablet, so record them live before starting the Mac, as root:

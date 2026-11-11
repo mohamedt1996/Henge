@@ -105,13 +105,21 @@ final class GunyahTest {
                     o.getFD().sync();
                 } catch (Exception ignored) { }
                 p.edit().putInt("began", k).commit(); // commit: on storage before the step
-                DeviceCheck.sh(true, "sync");
+                // A mark in the kernel's log: what the kernel says after it is this step's.
+                String mark = "henge-gunyah-step-" + (k + 1) + "-" + System.currentTimeMillis();
+                DeviceCheck.sh(true, "echo " + mark + " > /dev/kmsg; sync");
                 int seconds = Integer.parseInt(STEPS[k][2]);
                 String out = DeviceCheck.sh(true, probe.getPath() + " " + STEPS[k][1] + " --seconds " + seconds + " --crumb "
                         + crumb.getPath() + " 2>&1; true", seconds + 30);
                 boolean pass = out.contains("RESULT: PASS");
                 said = "Step " + (k + 1) + " of " + STEPS.length + " (" + STEPS[k][0] + "): "
                         + (pass ? "passed" : out.isEmpty() ? "no answer in " + (seconds + 30) + " s" : "FAILED") + "\n" + indent(out);
+                if (!pass) {
+                    // Why the kernel or Gunyah's resource manager refused: the kernel's lines since the mark.
+                    String kernel = DeviceCheck.sh(true, "dmesg | sed -n '/" + mark + "/,$p' | grep -v " + mark + " | tail -n 60; true");
+                    said += kernel.trim().isEmpty() ? "  The kernel said nothing during it (or dmesg is not readable).\n"
+                            : "  The kernel during it:\n" + indent(kernel);
+                }
                 SharedPreferences.Editor e = p.edit().putInt("began", -1);
                 if (pass) e.putInt("next", k + 1).putInt("reset", -1);
                 e.putString("report", p.getString("report", "") + said + "\n").commit();
