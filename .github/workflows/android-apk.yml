@@ -23,9 +23,18 @@ jobs:
 
       - name: Toolchain
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q gcc-aarch64-linux-gnu g++-aarch64-linux-gnu clang cmake pkg-config bison flex \
-            qemu-user spirv-tools libvulkan-dev mesa-vulkan-drivers
+          # The runner's own mirror (azure.archive.ubuntu.com) has days it does not resolve: Ubuntu's archive first,
+          # short timeouts, and a few tries.
+          printf 'http://archive.ubuntu.com/ubuntu/\tpriority:1\nhttp://azure.archive.ubuntu.com/ubuntu/\tpriority:2\n' \
+            | sudo tee /etc/apt/apt-mirrors.txt
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "20";\nAcquire::https::Timeout "20";\n' \
+            | sudo tee /etc/apt/apt.conf.d/99henge
+          for try in 1 2 3; do
+            sudo apt-get update -q && sudo apt-get install -y -q gcc-aarch64-linux-gnu g++-aarch64-linux-gnu clang cmake \
+              pkg-config bison flex qemu-user spirv-tools libvulkan-dev mesa-vulkan-drivers && break
+            [ $try = 3 ] && exit 1
+            sleep 20
+          done
           pip install --user meson ninja mako pyyaml packaging
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
