@@ -131,10 +131,15 @@ static void *worker(void *opaque) {
         b->inflight++;
         pthread_mutex_unlock(&b->mu);
 
-        uint64_t t0 = stats ? now_us() : 0;
+        uint64_t t0 = now_us();
         if (handle(b, &r->e, &r->written) != 0) r->written = 0;
+        uint64_t t1 = now_us();
+        __atomic_fetch_add(&b->busy_us, t1 - t0, __ATOMIC_RELAXED);
+        if (type == T_FLUSH) {
+            __atomic_fetch_add(&b->flushes, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&b->flush_us, t1 - t0, __ATOMIC_RELAXED);
+        }
         if (stats) {
-            uint64_t t1 = now_us();
             busy += t1 - t0, reqs++, bytes += r->written > 1 ? r->written : readable(&r->e);
             if (type == T_FLUSH) flushes++, flush_us += t1 - t0;
             if (t1 - t_last > every) {

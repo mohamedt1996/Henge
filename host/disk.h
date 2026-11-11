@@ -10,6 +10,8 @@ typedef struct HvDisk {
     uint64_t offset;
     uint64_t size;   /* bytes visible to the guest */
     int readonly;
+    int dirty;       /* written since the last flush that reached the file (atomic) */
+    uint64_t flushes_spared; /* flushes with nothing written since the one before: answered at once */
 } HvDisk;
 
 int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly);

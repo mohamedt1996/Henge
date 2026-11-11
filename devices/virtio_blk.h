@@ -31,6 +31,7 @@ typedef struct HvVirtioBlk {
     HvVirtio vio;
     HvDisk *disk;
     uint64_t requests, errors;
+    uint64_t flushes, flush_us, busy_us; /* workers (atomic): flushes, the time in them, the time in all requests */
     HvVblkReq *ring;
     uint32_t submitted;  /* CPU thread: requests handed to the worker */
     uint32_t completed;  /* workers: requests done (in any order) */

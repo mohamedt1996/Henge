@@ -239,6 +239,7 @@ static void *install_heartbeat(void *arg) {
     (void)arg;
     uint64_t last[HV_MAX_CPUS] = {0}, last_pc[HV_MAX_CPUS] = {0};
     uint64_t last_disk = 0, last_gpu = 0, last_wait = 0;
+    uint64_t last_busy = 0, last_fl = 0, last_flus = 0, last_spared = 0, last_tr = 0, last_full = 0, last_drop = 0;
     int still = 0, reported = 0;
     for (int t = 30; install_done == -2; t += 30) {
         sleep(30);
@@ -276,6 +277,27 @@ static void *install_heartbeat(void *arg) {
         }
         if (disk != last_disk || cmds != last_gpu) moved = 1;
         last_disk = disk, last_gpu = cmds;
+        {
+            /* The disk's time and the JIT's upkeep, of this 30 s: requests' time in the workers, syncs of flash
+               (and those spared, nothing having been written), blocks translated, and translations thrown away
+               (all of them: "full"). */
+            uint64_t busy = 0, fl = 0, flus = 0, spared = 0;
+            HvVirtioBlk *bl[2] = {b->root_blk, b->aux_blk};
+            for (int i = 0; i < 2; i++) {
+                if (!bl[i]) continue;
+                busy += __atomic_load_n(&bl[i]->busy_us, __ATOMIC_RELAXED), fl += __atomic_load_n(&bl[i]->flushes, __ATOMIC_RELAXED);
+                flus += __atomic_load_n(&bl[i]->flush_us, __ATOMIC_RELAXED);
+                spared += __atomic_load_n(&bl[i]->disk->flushes_spared, __ATOMIC_RELAXED);
+            }
+            HvMachine *m = hv_vm_machine();
+            fprintf(stderr, " | disk time %.1f s, %llu flushes (%.1f s, %llu spared) | jit +%llu blocks, %llu drops (%llu full), %.0f MB",
+                    (busy - last_busy) / 1e6, (unsigned long long)(fl - last_fl), (flus - last_flus) / 1e6,
+                    (unsigned long long)(spared - last_spared), (unsigned long long)(m->stats.translations - last_tr),
+                    (unsigned long long)(m->stats.block_flushes - last_drop), (unsigned long long)(m->stats.flush_full - last_full),
+                    (double)m->jit.used * 4 / (1 << 20));
+            last_busy = busy, last_fl = fl, last_flus = flus, last_spared = spared;
+            last_tr = m->stats.translations, last_full = m->stats.flush_full, last_drop = m->stats.block_flushes;
+        }
         host_state(stderr);
         if (u) fprintf(stderr, " | usb: %s, kernel driver %s (status %#x)", u->rom_on ? "iBoot has it" : "iBoot let go",
                        u->pci_on ? "on" : "not started", u->vio.status);

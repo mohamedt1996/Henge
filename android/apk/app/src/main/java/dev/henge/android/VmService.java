@@ -308,6 +308,7 @@ public class VmService extends Service {
             process = pb.start();
             if (sound) new Thread(() -> playSound(log), "sound").start();
             if (!install) new Thread(() -> favourEngine(pidFile, log), "favour").start();
+            if (!install) fullSpeed(log, "on".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("fullspeed", "off")));
             code = process.waitFor();
         } catch (Exception e) {
             appendLog(log, "henge app: could not start the engine: " + e);
@@ -321,6 +322,7 @@ public class VmService extends Service {
                         java.nio.file.StandardCopyOption.REPLACE_EXISTING); } catch (Exception ignored) { }
             }
         }
+        if (!install) fullSpeed(log, false);
         if (reims && GpuView.loaded) GpuView.nativeReimsStop();
         active.delete();
         if (!install) appendLog(log, "henge app: the engine exited (" + code + ")");
@@ -420,6 +422,40 @@ public class VmService extends Service {
         } catch (Exception e) {
             appendLog(log, "henge app: could not put the engine among Android's foreground work: " + e);
         }
+    }
+
+    /**
+     * Settings > Full speed (root): every CPU's frequency governor set to `performance` while the Mac runs, so
+     * the cores the JIT runs on stay at their highest frequency instead of climbing to it after each pause.
+     * The governors as they were are kept in the preferences and put back when the Mac stops; a stop that
+     * never got here (the app killed) is put right at the next start, on or off.
+     */
+    private void fullSpeed(File log, boolean on) {
+        android.content.SharedPreferences p = getSharedPreferences("henge", MODE_PRIVATE);
+        String saved = p.getString("governors", "");
+        if (!saved.isEmpty()) {
+            StringBuilder sh = new StringBuilder();
+            for (String s : saved.split(" ")) {
+                String[] kv = s.split("=");
+                if (kv.length == 2 && kv[0].matches("policy[0-9]+") && kv[1].matches("[a-z_]+"))
+                    sh.append("echo ").append(kv[1]).append(" > /sys/devices/system/cpu/cpufreq/").append(kv[0]).append("/scaling_governor; ");
+            }
+            DeviceCheck.sh(true, sh + "true");
+            p.edit().remove("governors").commit();
+            appendLog(log, "henge app: full speed off: the CPU governors are as they were (" + saved + ")");
+        }
+        if (!on) return;
+        String was = DeviceCheck.sh(true, "for p in /sys/devices/system/cpu/cpufreq/policy*; do "
+                + "grep -qw performance $p/scaling_available_governors || continue; "
+                + "echo -n \"${p##*/}=$(cat $p/scaling_governor) \"; done; true").trim();
+        if (was.isEmpty()) {
+            appendLog(log, "henge app: full speed: no root, or this kernel has no `performance` governor");
+            return;
+        }
+        p.edit().putString("governors", was).commit();
+        DeviceCheck.sh(true, "for p in /sys/devices/system/cpu/cpufreq/policy*; do echo performance > $p/scaling_governor; done; true");
+        appendLog(log, "henge app: full speed: CPU governors set to performance (were " + was + "); now "
+                + DeviceCheck.sh(true, "cat /sys/devices/system/cpu/cpufreq/policy*/scaling_governor | tr '\\n' ' '; true").trim());
     }
 
     private static int le32(byte[] b, int at) {

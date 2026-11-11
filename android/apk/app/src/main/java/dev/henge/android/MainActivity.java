@@ -599,6 +599,13 @@ public class MainActivity extends Activity {
         c.addView(choiceRow("Sound", new String[]{"On", "Off"}, "off".equals(prefs.getString("sound", "on")) ? 1 : 0,
                 i -> { prefs.edit().putString("sound", i == 0 ? "on" : "off").apply(); render(true); }));
         c.addView(hairline());
+        c.addView(choiceRow("Full speed", new String[]{"Off", "On"}, "on".equals(prefs.getString("fullspeed", "off")) ? 1 : 0,
+                i -> { prefs.edit().putString("fullspeed", i == 1 ? "on" : "off").apply(); render(true); }));
+        TextView fnote = text("Needs root. Keeps every CPU core at its highest frequency while the Mac runs: fewer slowdowns, "
+                + "more heat and battery use; the tablet may throttle sooner when hot. Put back when the Mac stops.", 13, DIM, false);
+        fnote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(fnote);
+        c.addView(hairline());
         c.addView(choiceRow("CPU engine", ENGINE_LABELS, java.util.Arrays.asList(ENGINE_MODES).indexOf(engineMode()),
                 i -> { prefs.edit().putString("engine", ENGINE_MODES[i]).apply(); render(true); }));
         TextView enote = text(ENGINE_NOTES[Math.max(0, java.util.Arrays.asList(ENGINE_MODES).indexOf(engineMode()))], 13, DIM, false);
