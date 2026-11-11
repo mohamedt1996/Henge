@@ -92,6 +92,14 @@ The app's log is the evidence: Settings saves it to `Download/Henge/`. The lines
   in each 30 s.
 - `metal2vulkan: copied host buffers: ...` and `host mappings: ...`: the cost of the copies.
 
+**Test Gunyah** (under *This tablet*, 0.3.30) tries Gunyah from the smallest request up, one step a tap
+(`GunyahTest.java`, `android/tools/gunyah_probe.c`): open the device, create a VM, memory, device tree, a
+CPU, start, run a tiny program, then more memory, every page written, more CPUs, the Mac's doorbells and
+the Mac's memory layout. Each request is forced to storage before it is made, so after a reset Henge says
+which step, and which request in it, the tablet did not survive (also `gunyah-test.txt` beside
+`device-check.txt`). The device check itself no longer makes a VM. The engine's log likewise ends in
+`gunyah: next: ...`, forced to storage, before each of its own requests. Untested on the tablet.
+
 For a Gunyah reset, the kernel's last messages are needed. `/sys/fs/pstore` was empty on the test
 tablet, so record them live before starting the Mac, as root:
 

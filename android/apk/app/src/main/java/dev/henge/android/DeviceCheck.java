@@ -59,11 +59,11 @@ final class DeviceCheck {
         String lib = c.getApplicationInfo().nativeLibraryDir;
         line(b, "engine", new File(lib, "libhengevm.so").canExecute() ? "ok" : "missing");
         line(b, "air2spv", new File(lib, "libair2spv.so").canExecute() ? "ok" : "missing");
-        // Whether the guest could run on Gunyah instead of the JIT: a tiny VM made through /dev/gunyah (root only).
-        File probe = new File(lib, "libghprobe.so");
-        if (root && new File("/dev/gunyah").exists() && probe.canExecute()) {
-            b.append("\nGunyah probe:\n").append(sh(true, probe.getPath() + " 2>&1")).append('\n');
-        }
+        // Gunyah itself is not tried here: making a VM can reset this tablet. "Test Gunyah" (GunyahTest) does,
+        // a step a tap.
+        line(b, "Gunyah", new File(lib, "libghprobe.so").canExecute() ? "tested a step at a time, under \"Test Gunyah\"" : "probe missing");
+        String gunyah = GunyahTest.report(c);
+        if (!gunyah.isEmpty()) b.append("\nGunyah test so far:\n").append(gunyah);
         String out = b.toString();
         File ext = c.getExternalFilesDir(null);
         if (ext != null) try (FileOutputStream o = new FileOutputStream(new File(ext, "device-check.txt"))) {
@@ -125,7 +125,9 @@ final class DeviceCheck {
     }
 
     /** A shell command's output (as root through su when asked), given up after ten seconds. */
-    static String sh(boolean su, String cmd) {
+    static String sh(boolean su, String cmd) { return sh(su, cmd, 10); }
+
+    static String sh(boolean su, String cmd, int seconds) {
         try {
             Process p = new ProcessBuilder(su ? new String[]{"su", "-c", cmd} : new String[]{"/system/bin/sh", "-c", cmd})
                     .redirectErrorStream(true).start();
@@ -137,7 +139,7 @@ final class DeviceCheck {
                 } catch (Exception ignored) { }
             });
             t.start();
-            if (!p.waitFor(10, TimeUnit.SECONDS)) { p.destroy(); return ""; }
+            if (!p.waitFor(seconds, TimeUnit.SECONDS)) { p.destroy(); return ""; }
             t.join(1000);
             return p.exitValue() == 0 ? out.toString() : "";
         } catch (Exception e) {

@@ -788,6 +788,57 @@ public class MainActivity extends Activity {
         note.setPadding(0, dp(10), 0, 0);
         c.addView(note);
         page.addView(c);
+        gunyah(page);
+    }
+
+    /** Gunyah, a step a tap (GunyahTest): each step adds one thing to the last, and a reset names its step. */
+    private void gunyah(LinearLayout page) {
+        if (!new java.io.File("/dev/gunyah").exists() && GunyahTest.report(this).isEmpty()) return;
+        GunyahTest.noteReset(this);
+        LinearLayout c = card(22);
+        c.addView(text("Test Gunyah", 16, TEXT, true));
+        c.addView(gap(6));
+        int next = GunyahTest.next(this), reset = GunyahTest.resetAt(this), n = GunyahTest.STEPS.length;
+        TextView about = text("Starting the Mac on Gunyah resets this tablet. This tries Gunyah from the smallest request up, one "
+                + "step a tap, and records each before it is made: after a reset, open Henge again and it says which step did it. "
+                + "A step can reset the tablet: close what you have not saved.", 13, DIM, false);
+        c.addView(about);
+        c.addView(gap(10));
+        String report = GunyahTest.report(this);
+        if (!report.isEmpty()) {
+            TextView t = text(report.trim(), 11, DIM, false, Typeface.MONOSPACE);
+            t.setTextIsSelectable(true);
+            c.addView(t);
+            c.addView(gap(10));
+            c.addView(link("Copy", v -> {
+                getSystemService(android.content.ClipboardManager.class)
+                        .setPrimaryClip(android.content.ClipData.newPlainText("Henge Gunyah test", GunyahTest.report(this)));
+                android.widget.Toast.makeText(this, "Copied", android.widget.Toast.LENGTH_SHORT).show();
+            }));
+            c.addView(gap(10));
+        }
+        if (next >= n) {
+            c.addView(text("Every step passed: Gunyah gives this tablet what the Mac's VM asks for.", 13, TEXT, false));
+        } else {
+            String label = GunyahTest.running ? "Running step " + (next + 1) + "…"
+                    : (reset == next ? "Run step " + (next + 1) + " again (it reset the tablet): " : "Run step " + (next + 1) + " of " + n + ": ")
+                    + GunyahTest.STEPS[next][0];
+            c.addView(secondary(label, ACCENT_LIGHT, v -> {
+                if (GunyahTest.running) return;
+                GunyahTest.running = true;
+                render(true);
+                new Thread(() -> {
+                    try { GunyahTest.runNext(getApplicationContext()); } finally { GunyahTest.running = false; }
+                    ui.post(() -> { if (!isFinishing()) render(true); });
+                }, "gunyah-test").start();
+            }));
+        }
+        if (!report.isEmpty() && !GunyahTest.running) {
+            c.addView(gap(10));
+            c.addView(link("Start over", v -> { GunyahTest.startOver(this); render(true); }));
+        }
+        page.addView(gap(14));
+        page.addView(c);
     }
 
     /** The check's result over the app, scrollable and selectable, with Copy. */

@@ -31,6 +31,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -392,6 +393,19 @@ void hv_gunyah_stop(void) {
     }
 }
 
+/* A line of the log forced to storage before a step: starting a VM has reset the Xiaomi Pad 7 with nothing
+   left to read, and the log's last line after a reset is then the step the tablet did not survive. */
+static void mark(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    fputs("gunyah: next: ", stderr);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+    fflush(stderr);
+    fsync(2);
+}
+
 static int fail(const char *what) {
     fprintf(stderr, "gunyah: %s failed: %s (errno %d)\n", what, strerror(errno), errno);
     return -1;
@@ -406,8 +420,10 @@ int hv_gunyah_run(void) {
     for (int i = 0; i < HV_MAX_CPUS; i++) vcpu_fd[i] = -1;
     for (int i = 0; i < NIRQ; i++) irq_fd[i] = -1;
 
+    mark("open /dev/gunyah");
     int dev = open("/dev/gunyah", O_RDWR | O_CLOEXEC);
     if (dev < 0) return fail("opening /dev/gunyah (it needs root)");
+    mark("create the VM");
     vm_fd = ioctl(dev, GH_CREATE_VM, 0);
     if (vm_fd < 0) return fail("creating the VM");
 
@@ -427,6 +443,7 @@ int hv_gunyah_run(void) {
     struct gh_userspace_memory_region r = {.label = label++, .flags = GH_MEM_R | GH_MEM_W | GH_MEM_X,
                                            .guest_phys_addr = BOOT_PA, .memory_size = BOOT_SIZE,
                                            .userspace_addr = (uintptr_t)boot};
+    mark("share the boot region");
     if (ioctl(vm_fd, GH_VM_SET_USER_MEM_REGION, &r) < 0) return fail("sharing the boot region");
     /* Gunyah pins every page and keeps one kcalloc'd array entry per 4 KB page (plus one parcel entry per run),
        so one 3 GB region needs a 6 MB+ physically contiguous kernel allocation and fails with ENOMEM. Large
@@ -450,6 +467,7 @@ int hv_gunyah_run(void) {
             r = (struct gh_userspace_memory_region){.label = label, .flags = GH_MEM_R | GH_MEM_W | GH_MEM_X,
                                                     .guest_phys_addr = ram->pa + done, .memory_size = n,
                                                     .userspace_addr = (uintptr_t)ram->host + done};
+            mark("share %llu MB of memory at %llx", (unsigned long long)(n >> 20), (unsigned long long)(ram->pa + done));
             if (ioctl(vm_fd, GH_VM_SET_USER_MEM_REGION, &r) == 0) {
                 label++, pieces++, done += n;
                 continue;
@@ -465,9 +483,11 @@ int hv_gunyah_run(void) {
                                 (unsigned long long)(chunk >> 20));
     }
     struct gh_vm_dtb_config dtb = {.guest_phys_addr = BOOT_PA + DTB_OFF, .size = (dtb_len + 0xfff) & ~0xfffull};
+    mark("set the VM device tree");
     if (ioctl(vm_fd, GH_VM_SET_DTB_CONFIG, &dtb) < 0) return fail("setting the VM device tree");
 
     int bells = 0;
+    mark("add the interrupt doorbells");
     for (int id = 0; id < NIRQ; id++) {
         if (!irq_wanted(id)) continue;
         int efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
@@ -488,6 +508,7 @@ int hv_gunyah_run(void) {
     for (int i = 0; i < nvcpu; i++) {
         uint32_t id = (uint32_t)i;
         struct gh_fn_desc fn = {.type = GH_FN_VCPU, .arg_size = sizeof id, .arg = (uintptr_t)&id};
+        mark("add vCPU %d", i);
         vcpu_fd[i] = ioctl(vm_fd, GH_VM_ADD_FUNCTION, &fn);
         if (vcpu_fd[i] < 0) {
             if (i == 0) return fail("adding the vCPU");
@@ -496,6 +517,7 @@ int hv_gunyah_run(void) {
             return -1;
         }
     }
+    mark("start the VM");
     if (ioctl(vm_fd, GH_VM_START, 0) < 0) return fail("starting the VM");
     long sz = ioctl(vcpu_fd[0], GH_VCPU_MMAP_SIZE, 0);
     if (sz < 0) sz = ioctl(dev, GH_VCPU_MMAP_SIZE, 0);
@@ -511,7 +533,7 @@ int hv_gunyah_run(void) {
     hv_gic_external = gic_external; /* from here Henge's devices ring doorbells instead of its own GIC */
     struct sigaction sa = {.sa_handler = on_sigusr}; /* no SA_RESTART: a stop breaks GH_VCPU_RUN */
     sigaction(SIGUSR1, &sa, NULL);
-    fprintf(stderr, "gunyah: VM started; the boot ROM runs on the CPU itself\n");
+    mark("run the vCPUs (the VM started; the boot ROM runs on the CPU itself)");
 
     pthread_t t;
     pthread_create(&t, NULL, device_thread, NULL);
