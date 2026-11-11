@@ -37,6 +37,12 @@
                        plain    said nowhere, as before 0.3.40
      --poke ADDR     last, the guest stores to ADDR (hex): whether a store where the Mac has a device (its PCI
                      windows are above 1 GB) comes out to Henge, or is an exception in the guest
+     --mmu16k        last, the guest turns its MMU on with 16 KB pages, as macOS has it, and reads memory
+                     through them: Gunyah's ID register says the CPU has none, and may only be saying so
+     --base ADDR     the base address (hex): where the first region is, and what the tree says of it
+     --gic ADDR      the interrupt controller's address (hex; the redistributors 64 KB after it)
+     --size-max MB   the tree's limit of the VM's own memory above the base address
+     --ram-at ADDR   the memory beyond the first region at ADDR (hex), not where the layout has it
      --tree-only F   no VM: the tree this run would give, written to F
      --kmsg FILE     the kernel's messages from now on copied to FILE, each forced to storage as it comes:
                      what the kernel said last before a reset
@@ -46,6 +52,11 @@
      --crumb FILE    before each step, a line appended to FILE and forced to storage (fsync): after a reset
                      the file's last line is the step the tablet did not survive
    The last line printed is `RESULT: PASS` or `RESULT: FAIL ...`.
+
+   What the Xiaomi Pad 7 answered to 0.3.40 (its resource manager is gunyah-6de79709c, and its messages are those
+   of Qualcomm's source of late 2023): the tree is taken; a first region that is shared is refused at the start
+   and one that is lent starts, at 0x80000000; base address 0 is refused; 64 MB more, lent, is refused whichever
+   way the tree names it. The guest's ID register shows no 16 KB pages.
 
    What the resource manager wants of the tree (Qualcomm's source, vm_config_parser.c and vm_creation.c; the
    tablet answered "memory invalid" to VM_INIT, which in the 2023 source is also what a tree it cannot accept
@@ -132,6 +143,7 @@ static Piece pieces[MAX_PIECES];
 static int npieces;
 enum { RAM_SHM, RAM_RESMEM, RAM_PRIVATE, RAM_PLAIN };
 static int ram_how = RAM_SHM;
+static uint64_t size_max_mb;
 
 /* ---- crumbs: a line forced to storage before each step ---- */
 static const char *crumb_path;
@@ -309,6 +321,9 @@ static size_t build_dtb(uint8_t *out, size_t cap, const Layout *L, int ncpus, in
     prop_u32(&f, "#size-cells", 2);
     uint32_t base[2] = {(uint32_t)(L->image_pa >> 32), (uint32_t)L->image_pa};
     prop_u32s(&f, "base-address", base, 2);
+    if (size_max_mb) { /* read with the cells of the node above, which says none: one cell */
+        prop_u32(&f, "size-max", (uint32_t)(size_max_mb << 20));
+    }
     end(&f);
     begin(&f, "interrupts");
     prop_u32(&f, "config", GIC);
@@ -369,7 +384,7 @@ static size_t build_dtb(uint8_t *out, size_t cap, const Layout *L, int ncpus, in
 }
 
 /* ---- running ---- */
-static uint64_t rep[16];
+static uint64_t rep[32];
 static unsigned seen;
 static uint64_t report_pa, poke_at;
 static int poked;
@@ -388,7 +403,7 @@ static int handle_exit(int cpu) {
     struct gh_vcpu_run *run = vrun[cpu];
     if (run->exit_reason == GH_VCPU_EXIT_MMIO) {
         uint64_t a = run->mmio.phys_addr, v = 0;
-        if (run->mmio.is_write && a >= report_pa && a < report_pa + 0x80) {
+        if (run->mmio.is_write && a >= report_pa && a < report_pa + 0x100) {
             memcpy(&v, run->mmio.data, run->mmio.len < 8 ? run->mmio.len : 8);
             unsigned i = (unsigned)((a - report_pa) / 8);
             rep[i] = v, seen |= 1u << i;
@@ -475,7 +490,8 @@ int main(int argc, char **argv) {
     static Layout layout;
     Layout *L = &layout;
     layout = SMALL;
-    uint64_t mem_mb = 2, image_mb = 0, dtb_room_kb = 0, poke = 0;
+    uint64_t mem_mb = 2, image_mb = 0, dtb_room_kb = 0, poke = 0, base = ~0ull, gic = 0, ram_at = ~0ull;
+    int mmu16k = 0;
     const char *kmsg_path = NULL, *tree_only = NULL;
     int touch = 0, ncpus = 1, bells = 0, seconds = 6;
     const char *until = "";
@@ -485,6 +501,7 @@ int main(int argc, char **argv) {
         if (!strcmp(a, "--touch")) touch = 1;
         else if (!strcmp(a, "--lend")) lend_image = lend_rest = 1;
         else if (!strcmp(a, "--lend-image")) lend_image = 1;
+        else if (!strcmp(a, "--mmu16k")) mmu16k = 1;
         else if (!strcmp(a, "--bells")) bells = 1;
         else if (!v) { fprintf(stderr, "gunyah-probe: %s needs a value\n", a); return 2; }
         else if (!strcmp(a, "--mem")) mem_mb = strtoull(v, NULL, 10), i++;
@@ -496,6 +513,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--image-mb")) image_mb = strtoull(v, NULL, 10), i++;
         else if (!strcmp(a, "--dtb-room")) dtb_room_kb = strtoull(v, NULL, 10), i++;
         else if (!strcmp(a, "--poke")) poke = strtoull(v, NULL, 16), i++;
+        else if (!strcmp(a, "--base")) base = strtoull(v, NULL, 16) & ~0x1fffffull, i++;
+        else if (!strcmp(a, "--gic")) gic = strtoull(v, NULL, 16), i++;
+        else if (!strcmp(a, "--ram-at")) ram_at = strtoull(v, NULL, 16) & ~0xfffull, i++;
+        else if (!strcmp(a, "--size-max")) size_max_mb = strtoull(v, NULL, 10), i++;
         else if (!strcmp(a, "--tree-only")) tree_only = v, i++;
         else if (!strcmp(a, "--ram")) {
             ram_how = !strcmp(v, "resmem") ? RAM_RESMEM : !strcmp(v, "private") ? RAM_PRIVATE : !strcmp(v, "plain") ? RAM_PLAIN : RAM_SHM;
@@ -509,6 +530,9 @@ int main(int argc, char **argv) {
     if (seconds < 1) seconds = 1;
     /* The probe layout's first 2 MB hold the image; the engine layout's memory is all apart from it. */
     int small = L->nodes == 0;
+    if (base != ~0ull) L->image_pa = base, L->ram_pa = small ? base + L->image_size : L->ram_pa;
+    if (gic) L->gic_dist = gic, L->gic_redist = gic + 0x10000, L->redist_each = 0x20000;
+    if (gic && L->report >= gic && L->report < gic + 0x10000 + 0x20000ull * MAX_CPUS) L->report = 0x20010000ull; /* not the GIC's own */
     if (small && image_mb >= 2 && image_mb <= 512) {
         L->image_size = image_mb << 20, L->ram_pa = L->image_pa + L->image_size;
         if (mem_mb < image_mb) mem_mb = image_mb;
@@ -519,6 +543,11 @@ int main(int argc, char **argv) {
     uint64_t ram_size = small ? (mem_mb > image_now ? (mem_mb - image_now) << 20 : 0) : mem_mb << 20;
     /* A piece the resource manager adds by itself lies right after the first region, whatever the layout. */
     if (ram_how == RAM_PRIVATE) L->ram_pa = L->image_pa + L->image_size;
+    else if (ram_at != ~0ull) L->ram_pa = ram_at;
+    /* --touch with a long first region and nothing after it: the first region past its first 2 MB. */
+    uint64_t touch_pa = ram_size ? L->ram_pa : L->image_pa + 0x200000, touch_size = ram_size ? ram_size : L->image_size - 0x200000;
+    /* The 16 KB page table: 16 KB of the first region nothing else has (the tree and its room lie elsewhere). */
+    uint64_t table = !mmu16k ? 0 : L->dtb_off >= 0x100000 ? L->image_pa + 0x8000 : L->image_size >= 0x200000 ? L->image_pa + 0x180000 : 0;
     static const char *const how_name[] = {"a shm device each", "a reserved-memory node each", "one private piece, lent", "said nowhere"};
     kmsg_start(kmsg_path);
     report_pa = L->report, poke_at = poke;
@@ -561,7 +590,7 @@ int main(int argc, char **argv) {
     uint8_t *image = mmap(NULL, L->image_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
     if (image == MAP_FAILED) { step("map the image", -1); goto fail; }
     memcpy(image, probe_guest, sizeof probe_guest);
-    uint64_t params[5] = {L->report, touch && ram_size ? L->ram_pa : 0, touch ? ram_size : 0, (uint64_t)ncpus, poke};
+    uint64_t params[6] = {L->report, touch && touch_size ? touch_pa : 0, touch ? touch_size : 0, (uint64_t)ncpus, poke, table};
     memcpy(image + PROBE_GUEST_PARAMS, params, sizeof params);
 
     struct rlimit nolimit = {RLIM_INFINITY, RLIM_INFINITY};
@@ -676,7 +705,7 @@ int main(int argc, char **argv) {
     if (HAVE(0)) printf("MIDR                   %#llx\n", (unsigned long long)rep[0]);
     if (HAVE(1)) {
         unsigned tg16 = (unsigned)(rep[1] >> 20) & 0xf;
-        printf("16K pages              %s (MMFR0 %#llx)\n", tg16 ? "yes" : "NO: macOS cannot run here", (unsigned long long)rep[1]);
+        printf("16K pages              %s (MMFR0 %#llx)\n", tg16 ? "yes" : "not in the ID register Gunyah shows the guest; --mmu16k tries them", (unsigned long long)rep[1]);
     }
     if (HAVE(2)) printf("pointer auth (ISAR1)   %#llx\n", (unsigned long long)rep[2]);
     if (HAVE(3)) printf("exception level        EL%u\n", (unsigned)(rep[3] >> 2) & 3);
@@ -690,8 +719,11 @@ int main(int argc, char **argv) {
                            : "did NOT come out: the guest took an exception there");
     const char *why = NULL;
     static char whybuf[160];
-    uint64_t pages = touch ? ram_size >> 12 : 0;
-    if (touch && ram_size) {
+    uint64_t pages = touch ? touch_size >> 12 : 0;
+    if (mmu16k) printf("16 KB pages, tried     %s\n", !table ? "not tried: no room for the table in this layout"
+                       : HAVE(16) && rep[16] == 0x16c ? "they WORK: the MMU on, memory read through them"
+                       : HAVE(16) ? "the MMU came on, and memory read back wrong" : "the guest did not come back from turning the MMU on");
+    if (touch && touch_size) {
         if (HAVE(10)) printf("pages written          %llu of %llu\n", (unsigned long long)rep[10], (unsigned long long)pages);
         if (HAVE(11)) printf("pages read back wrong  %llu\n", (unsigned long long)rep[11]);
     }
@@ -701,8 +733,9 @@ int main(int argc, char **argv) {
     }
     if (!HAVE(15)) why = timed_out ? "the guest did not finish in the time allowed" : "the guest did not finish";
     else if (rep[15] != 0xd0e) why = "the guest took an exception";
-    else if (touch && ram_size && (!HAVE(10) || rep[10] != pages)) why = "not every page was written";
-    else if (touch && ram_size && (!HAVE(11) || rep[11] != 0)) why = "pages read back wrong";
+    else if (touch && touch_size && (!HAVE(10) || rep[10] != pages)) why = "not every page was written";
+    else if (touch && touch_size && (!HAVE(11) || rep[11] != 0)) why = "pages read back wrong";
+    else if (mmu16k && table && !(HAVE(16) && rep[16] == 0x16c)) why = "16 KB pages did not work";
     else if (poke && !poked) why = "a store at a device's address did not come out of the guest";
     else if (ncpus > 1 && (!HAVE(13) || rep[13] != (uint64_t)(ncpus - 1))) {
         snprintf(whybuf, sizeof whybuf, "%llu of %d other CPUs came up", HAVE(13) ? (unsigned long long)rep[13] : 0ull, ncpus - 1);

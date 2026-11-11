@@ -29,7 +29,11 @@ final class GunyahTest {
      *
      * 0.3.35 to 0.3.39 were all refused at the same request (VM_INIT, "memory invalid"): the tree named its
      * memory node `memory@80000000`, and the resource manager fails a tree with any memory node not named
-     * exactly `memory`. The probe's tree is now as it reads it (gunyah_probe.c).
+     * exactly `memory`. With 0.3.40's tree the Pad 7 started a VM and ran the guest: the first region lent, 2 MB at
+     * 0x80000000. Shared, at base 0, or with 64 MB more (lent) it was refused at the start, and the guest's ID
+     * register showed no 16 KB pages. These steps ask what was left open: 16 KB pages tried, not read; how long
+     * the first region may be; more memory shared while the first region is lent, small first; where the base
+     * address and the interrupt controller may be.
      */
     static final String[][] STEPS = {
             {"Open /dev/gunyah", "--until open", "6", "pre"},
@@ -37,30 +41,37 @@ final class GunyahTest {
             {"Give it 2 MB of memory", "--until memory", "6", "pre"},
             {"Give it its device tree", "--until tree", "6", "pre"},
             {"Add a CPU", "--until vcpu", "6", "pre"},
-            {"Start: 2 MB at 0x80000000, the tree as the resource manager reads it", "", "6", "start"},
-            {"Start: the same, memory lent", "--lend", "6", "start"},
-            {"Start: base 0", "--layout zero --mem 0", "6", "start"},
-            {"Start: base 0, memory lent", "--layout zero --mem 0 --lend", "6", "start"},
-            {"Start: 16 MB at 0x80000000", "--image-mb 16", "6", "start"},
+            {"Start: 2 MB at 0x80000000, lent", "--lend", "6", "start"},
             {"Run a tiny program in it", "%L", "6", "use"},
-            {"64 MB more, each piece a shm device in the tree", "%L --mem 66 --touch --ram shm", "10", "ram"},
-            {"64 MB more, each piece a reserved-memory node", "%L --mem 66 --touch --ram resmem", "10", "ram"},
-            {"64 MB more, one private piece after the first region", "%L --mem 66 --touch --ram private", "10", "ram"},
-            {"64 MB more, said nowhere in the tree", "%L --mem 66 --touch --ram plain", "10", "ram"},
-            {"256 MB, every page written", "%L %R --mem 256 --touch", "20", "use"},
-            {"1 GB, every page written", "%L %R --mem 1024 --touch", "40", "use"},
-            {"3 GB, every page written", "%L %R --mem 3072 --touch", "90", "use"},
-            {"2 CPUs", "%L %R --mem 256 --cpus 2", "10", "use"},
-            {"4 CPUs", "%L %R --mem 256 --cpus 4", "10", "use"},
-            {"The Mac's interrupt doorbells", "%L %R --mem 256 --cpus 4 --bells", "10", "use"},
-            {"All of it: 3 GB, 4 CPUs, doorbells", "%L %R --mem 3072 --cpus 4 --bells --touch", "90", "use"},
-            {"The Mac's map: base 0, memory at 0x70000000, shared", "--layout zero %R --mem 256 --touch --cpus 4 --bells", "20", "info"},
-            {"The Mac's map, only the first region lent", "--layout zero --lend-image %R --mem 256 --touch --cpus 4 --bells", "20", "info"},
-            {"A store at 0x50000000 (the Mac's PCI devices) comes out to Henge", "--layout zero --mem 0 %S --poke 50000000", "6", "info"},
-            {"A store at 0x40000000 (the Mac's PCI configuration) comes out to Henge", "--layout zero --mem 0 %S --poke 40000000", "6", "info"},
-            {"A store at 0x20010000 (the Mac's serial port) comes out to Henge", "--layout zero --mem 0 %S --poke 20010000", "6", "info"},
+            {"16 KB pages (what macOS has), turned on in the guest", "%L --mmu16k", "6", "info"},
+            {"First region 4 MB, lent, every page written", "--lend --image-mb 4 --touch", "10", "info"},
+            {"First region 16 MB", "--lend --image-mb 16 --touch", "10", "info"},
+            {"First region 64 MB", "--lend --image-mb 64 --touch", "15", "info"},
+            {"First region 256 MB", "--lend --image-mb 256 --touch", "25", "info"},
+            {"First region 512 MB", "--lend --image-mb 512 --touch", "40", "info"},
+            {"2 MB more, shared, a shm device in the tree (first region lent)", "--lend-image --mem 4 --touch --ram shm", "10", "ram"},
+            {"2 MB more, shared, a reserved-memory node", "--lend-image --mem 4 --touch --ram resmem", "10", "ram"},
+            {"2 MB more, shared, said nowhere in the tree", "--lend-image --mem 4 --touch --ram plain", "10", "ram"},
+            {"2 MB more, lent, a shm device", "--lend --mem 4 --touch --ram shm", "10", "info"},
+            {"2 MB more, lent, one private piece after the first region", "--lend --mem 4 --touch --ram private", "10", "info"},
+            {"64 MB more, shared, the way that worked", "--lend-image %R --mem 66 --touch", "15", "info"},
+            {"256 MB more, shared, the way that worked", "--lend-image %R --mem 258 --touch", "25", "info"},
+            {"The interrupt controller at the Mac's address (0x10000000)", "--lend --gic 10000000", "6", "info"},
+            {"Base address 2 MB", "--lend --base 200000", "6", "info"},
+            {"Base address 0x40000000", "--lend --base 40000000", "6", "info"},
+            {"Base address 0x70000000 (the Mac's memory), interrupt controller at 0x10000000", "--lend --base 70000000 --gic 10000000", "6", "info"},
+            {"Base address 0, the VM's own memory limited to 256 MB", "--lend --layout zero --mem 0 --size-max 256", "6", "info"},
+            {"Base address 0, interrupt controller at 0x3fff0000", "--lend --layout zero --mem 0 --gic 3fff0000", "6", "info"},
+            {"2 MB below the base address (0x100000, the Mac's ROM), shared, a shm device", "--lend-image --mem 4 --touch --ram shm --ram-at 100000", "10", "info"},
+            {"2 MB below the base address, shared, a reserved-memory node", "--lend-image --mem 4 --touch --ram resmem --ram-at 100000", "10", "info"},
+            {"2 CPUs", "%L --cpus 2", "10", "info"},
+            {"4 CPUs", "%L --cpus 4", "10", "info"},
+            {"The Mac's interrupt doorbells", "%L --cpus 4 --bells", "10", "info"},
+            {"A store at 0x50000000 (the Mac's PCI devices) comes out to Henge", "%L --poke 50000000", "6", "info"},
+            {"A store at 0x40000000 (the Mac's PCI configuration) comes out to Henge", "%L --poke 40000000", "6", "info"},
+            {"A store at 0x20010000 (the Mac's serial port) comes out to Henge", "%L --poke 20010000", "6", "info"},
     };
-    private static final int VERSION = 5; // of STEPS: progress saved by another list starts over
+    private static final int VERSION = 6; // of STEPS: progress saved by another list starts over
 
     static volatile boolean running;
 
@@ -151,7 +162,10 @@ final class GunyahTest {
         if (pastStarts && layout == null) {
             return "None of the layouts started a VM: there is nothing to run the remaining steps with.";
         } else if (STEPS[k][1].contains("%R") && ram == null) {
-            said = "No way of giving the VM more memory worked: this step needs one. Skip it to go on.";
+            said = "Step " + (k + 1) + " of " + STEPS.length + " (" + STEPS[k][0] + "): not run. No way of giving the VM more memory worked.";
+            p.edit().putInt("next", k + 1).putString("report", p.getString("report", "") + said + "\n\n").commit();
+            save(c);
+            return said;
         } else if (!"0".equals(DeviceCheck.sh(true, "id -u").trim())) {
             said = "No root (su was denied): the test needs it.";
         } else if (!new File("/dev/gunyah").exists() && DeviceCheck.sh(true, "ls /dev/gunyah").trim().isEmpty()) {
@@ -188,7 +202,7 @@ final class GunyahTest {
                     String own = DeviceCheck.sh(true, "dmesg | sed -n '/" + mark + "/,$p' | grep -v " + mark
                             + " | grep -iE 'gunyah|gh_rsc|gh_vm|gh_rm|hypervisor' | tail -n 20; true");
                     if (!own.trim().isEmpty()) said += "  Gunyah in the kernel's log during it:\n" + indent(own);
-                    said += kernel.trim().isEmpty() ? "  The kernel said nothing during it (or dmesg is not readable).\n"
+                    else said += kernel.trim().isEmpty() ? "  The kernel said nothing during it (or dmesg is not readable).\n"
                             : "  The kernel during it:\n" + indent(kernel);
                 }
                 SharedPreferences.Editor e = p.edit().putInt("began", -1);

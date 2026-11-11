@@ -7,12 +7,15 @@
      +0x10  memory to touch, bytes
      +0x18  CPUs                        (more than 1: the others are started through PSCI)
      +0x20  an address to store to, last (0: none): whether a store there leaves the guest, as a device's would
+     +0x28  16 KB of zeroed memory for a page table (0: none): the MMU is turned on with 16 KB pages, as macOS
+            has it, whatever ID_AA64MMFR0 says of them
    and reads `flags` (image + 0x440): a byte a started CPU sets, by its number.
 
    Report slots (8 bytes each): 0x00 MIDR, 0x08 MMFR0, 0x10 ISAR1, 0x18 CurrentEL, 0x20 the PAC hypercall's
    answer, 0x28 SMCCC OEM UID, 0x30 PSCI version, 0x38 PFR0, 0x40 ESR and 0x48 ELR of an exception taken,
    0x50 pages written, 0x58 pages that read back wrong, 0x60 the PSCI CPU_ON answers or'ed together,
-   0x68 CPUs that came up, 0x70 the address stored to once that store has returned, 0x78 done (0xd0e) or failed (0xbad). */
+   0x68 CPUs that came up, 0x70 the address stored to once that store has returned, 0x80 what was read back
+   through 16 KB pages (0x16c), 0x78 done (0xd0e) or failed (0xbad). */
     .text
     .global _start
 _start:
@@ -105,7 +108,41 @@ done:
     cbz  x11, 10f
     str  x11, [x11]
     str  x11, [x9, #0x70]
-10: movz x1, #0xd0e
+10: ldr  x11, [x10, #0x28]              /* the page table: one level-2 table of 16 KB pages, 32 MB a block */
+    cbz  x11, 12f
+    adr  x12, _start
+    and  x12, x12, #0xfffffffffe000000  /* this program's 32 MB, mapped at its own address, normal memory */
+    lsr  x13, x12, #25
+    and  x13, x13, #0x7ff
+    movz x14, #0x701                    /* block, AF, inner shareable, read-write, attribute 0 */
+    orr  x14, x14, x12
+    str  x14, [x11, x13, lsl #3]
+    and  x12, x9, #0xfffffffffe000000   /* the report page's 32 MB: device memory, never executed */
+    lsr  x13, x12, #25
+    and  x13, x13, #0x7ff
+    movz x14, #0x405                    /* block, AF, attribute 1 */
+    movk x14, #0x0060, lsl #48          /* UXN, PXN */
+    orr  x14, x14, x12
+    str  x14, [x11, x13, lsl #3]
+    movz x1, #0x04ff                    /* attribute 0: normal, write-back; 1: device */
+    msr  mair_el1, x1
+    movz x1, #0xb51c                    /* 36-bit addresses (T0SZ 28), 16 KB pages (TG0 = 2), write-back walks */
+    movk x1, #0x0080, lsl #16           /* no walks of the upper half */
+    movk x1, #0x0001, lsl #32           /* 36-bit physical addresses */
+    msr  tcr_el1, x1
+    msr  ttbr0_el1, x11
+    isb
+    mrs  x1, sctlr_el1
+    bic  x1, x1, #0x80000               /* writable memory may be executed (WXN off): this program's is */
+    orr  x1, x1, #1                     /* the MMU on */
+    msr  sctlr_el1, x1
+    isb
+    movz x1, #0x16c
+    add  x2, x11, #0x3000               /* a word of the table's own memory, through the new mapping */
+    str  x1, [x2, #0xff8]
+    ldr  x3, [x2, #0xff8]
+    str  x3, [x9, #0x80]
+12: movz x1, #0xd0e
     str  x1, [x9, #0x78]
     movz x0, #0x8400, lsl #16
     movk x0, #0x0008                    /* PSCI SYSTEM_OFF */
@@ -126,7 +163,7 @@ secondary:
 
     .org 0x400
 params:
-    .quad 0x10000000, 0, 0, 1, 0
+    .quad 0x10000000, 0, 0, 1, 0, 0
     .org 0x440
 flags:
     .fill 64, 1, 0
