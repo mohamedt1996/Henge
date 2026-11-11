@@ -21,13 +21,19 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/share/boost
           df -h /
       - name: The commit's full name
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir find && cd find && git init -q
-          git fetch -q --filter=tree:0 https://android.googlesource.com/kernel/common '+refs/heads/android14-6.1*:refs/remotes/o/*'
-          full=$(git rev-parse --verify "$COMMIT^{commit}")
+          # GitHub's mirror resolves a short name; else every android14-6.1 branch's commits (no trees) are searched.
+          full=$(gh api "repos/aosp-mirror/kernel_common/commits/$COMMIT" -q .sha 2>/dev/null || true)
+          if ! echo "$full" | grep -Eq '^[0-9a-f]{40}$'; then
+            mkdir find && cd find && git init -q
+            git fetch -q --filter=tree:0 https://android.googlesource.com/kernel/common '+refs/heads/android14-6.1*:refs/remotes/o/android14-6.1*'
+            git branch -r | head -80
+            full=$(git rev-parse --verify "$COMMIT^{commit}")
+          fi
+          echo "$full"
           echo "FULL=$full" >> "$GITHUB_ENV"
-          git log -1 --format='%H %cd %s' "$full"
-          git branch -r --contains "$full" | head -20
       - name: Kernel source and Google's build tools
         run: |
           mkdir -p ~/bin && curl -sS https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo && chmod +x ~/bin/repo
