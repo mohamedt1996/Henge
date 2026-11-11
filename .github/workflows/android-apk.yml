@@ -23,11 +23,13 @@ jobs:
 
       - name: Toolchain
         run: |
-          # The runner's own mirror (azure.archive.ubuntu.com) has days it does not resolve: Ubuntu's archive first,
-          # short timeouts, and a few tries.
-          printf 'http://archive.ubuntu.com/ubuntu/\tpriority:1\nhttp://azure.archive.ubuntu.com/ubuntu/\tpriority:2\n' \
+          # The runner's own mirror (azure.archive.ubuntu.com) has days it does not resolve, and Ubuntu's own names
+          # with it: mirrors under other names first, short timeouts, a few tries.
+          getent hosts azure.archive.ubuntu.com archive.ubuntu.com mirrors.edge.kernel.org mirror.math.princeton.edu || true
+          printf '%s\tpriority:%s\n' https://mirrors.edge.kernel.org/ubuntu/ 1 http://mirror.math.princeton.edu/pub/ubuntu/ 2 \
+            http://ftp.halifax.rwth-aachen.de/ubuntu/ 3 http://archive.ubuntu.com/ubuntu/ 4 http://azure.archive.ubuntu.com/ubuntu/ 5 \
             | sudo tee /etc/apt/apt-mirrors.txt
-          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "20";\nAcquire::https::Timeout "20";\n' \
+          printf 'Acquire::Retries "1";\nAcquire::http::Timeout "10";\nAcquire::https::Timeout "10";\n' \
             | sudo tee /etc/apt/apt.conf.d/99henge
           for try in 1 2 3; do
             sudo apt-get update -q && sudo apt-get install -y -q gcc-aarch64-linux-gnu g++-aarch64-linux-gnu clang cmake \
