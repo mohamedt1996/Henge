@@ -294,11 +294,17 @@ int hv_pvg_applegfx_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_t i
     ctx.disp = disp;
     free(err);
 
-    /* Probe-only escape hatch: prove the library loads/initialises on the tablet, then fall back to pvg_lite
-       without claiming the MMIO windows (the old, safe behaviour). */
-    if (getenv("HV_GPU_APPLEGFX_PROBE_ONLY")) {
-        fprintf(stderr, "hengevm: applegfx: PROBE_ONLY set — device and display created, not bridging the MMIO "
-                        "windows. Falling back to the built-in GPU.\n");
+    /* The MMIO<->PCI bridge is opt-in while the IOSFC (IOSurface host device) window is unimplemented: without
+       it the guest has no surface backing, so engaging the bridge by default would black the screen. By default
+       applegfx proves the library loads/initialises on the tablet and then hands the screen to pvg_lite (a
+       picture). Set HV_GPU_APPLEGFX_BRIDGE=1 to engage the experimental bridge and test it (see
+       android/applegfx/BRIDGE.md). */
+    if (!getenv("HV_GPU_APPLEGFX_BRIDGE")) {
+        fprintf(stderr, "hengevm: applegfx: device and display created on this tablet (guest memory and interrupts "
+                        "wired). The MMIO<->PCI bridge is implemented but off by default (the IOSFC window is not "
+                        "done yet, so it would not render); set HV_GPU_APPLEGFX_BRIDGE=1 to try it. Using the "
+                        "built-in GPU for the screen.\n");
+        lagfx_display_free(disp), lagfx_device_free(dev);
         return 0;
     }
 
