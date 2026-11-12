@@ -38,13 +38,19 @@
  *   - The library's shell callbacks remain backed by the real engine: guest RAM (hv_ram_lookup) for
  *     read/write/map, and the library's own memfd+mmap task primitives.
  *
- * What is NOT resolved (the remaining blocker; see BRIDGE.md):
- *   - The IOSFC window (VMAPPLE_IOSFC / PGIOSurfaceHostDevice) has no counterpart in libapplegfx-vulkan. On
- *     Apple silicon macOS drives IOSurface sharing through THIS device (apple-gfx-mmio sets
- *     usingIOSurfaceMapper=true), not through the FIFO IOSurface opcodes (0x26-0x2a) the library implements for
- *     the PCI transport (usingIOSurfaceMapper=false). Its register protocol is not reverse-engineered in the
- *     library, so the window is answered by a logging stub: the bridge boots and the gfx command ring runs, but
- *     surfaces will not be backed and frames are unlikely until the IOSurface host device is implemented.
+ * IOSFC window (VMAPPLE_IOSFC / PGIOSurfaceHostDevice): on Apple silicon macOS drives IOSurface sharing through
+ *   THIS second MMIO device (apple-gfx-mmio sets usingIOSurfaceMapper=true), not through the FIFO IOSurface
+ *   opcodes (0x26-0x2a) the library implements for the PCI transport. libapplegfx-vulkan has no counterpart for
+ *   it. This file now models the device end to end — reverse-engineered from steelbrain/reims-vgpu's iosurface
+ *   module (the working ground truth) and QEMU's apple-gfx-mmio.m: the 64-bit register file, the command ring
+ *   and doorbell, map/unmap/test, the one- and two-level descriptor page-table walk, the guest "mapped" bit
+ *   write-back, and the per-command completion IRQ on the IOSFC GIC line. See the IOSFC block below and
+ *   android/applegfx/BRIDGE.md.
+ *
+ * What is STILL open (see BRIDGE.md "To close it"): the library exposes no entry point to accept a surface
+ *   mapped by a separate host device (no lagfx_iosfc_* API, no mapping-id -> surface registry). So mapped
+ *   surfaces are fully resolved and recorded in this device's own registry, but cannot yet be handed to the
+ *   renderer. BRIDGE.md specifies the minimal lagfx API addition that would close this.
  *
  * Because of that, the bridge is engaged but honest: it logs its experimental status and points at Graphics:
  * reims for the known-working GPU. Set HV_GPU_APPLEGFX_PROBE_ONLY=1 to keep the old behaviour (prove the library
@@ -65,6 +71,100 @@
 #include <time.h>
 
 #include "libapplegfx-vulkan.h"
+
+/* ======================================================================================= *
+ * IOSFC window: a host model of Apple's PGIOSurfaceHostDevice (vmapple's second MMIO device).
+ *
+ * This is reverse-engineered from steelbrain/reims-vgpu's `iosurface` module, which implements
+ * the SAME vmapple apple-gfx-MMIO IOSurface device and works, cross-checked against QEMU's
+ * hw/display/apple-gfx-mmio.m. See android/applegfx/BRIDGE.md for the full write-up and the
+ * per-register / per-command citations (reims crates/reims-vgpu-core/src/iosurface/{regs,ring,
+ * table,walk,descriptor,device}.rs).
+ *
+ * The device is a small MMIO register file driving a guest command ring. The guest's IOSurface
+ * mapper writes a ring and a descriptor-table base, then rings a doorbell; the host drains the
+ * ring, and each `map` command reads one guest IOSurface descriptor, walks its page table to the
+ * guest pages that back the surface, and makes those pages a host-visible surface keyed by a
+ * "mapping id". On Apple silicon the PVG kext sets usingIOSurfaceMapper=true and shares every
+ * WindowServer IOSurface this way, so this device — not the GFX FIFO opcodes — is how surfaces
+ * reach the renderer.
+ *
+ * What is implemented here: the whole MMIO/ring/descriptor protocol end to end — registers, the
+ * doorbell, map/unmap/test, the one- and two-level page-table walk, the guest "mapped" bit
+ * write-back, and the per-command completion IRQ on the IOSFC GIC line. mapMemory is the trivial
+ * guest-physical -> host alias into the engine's single contiguous RAM mapping (ctx.ram->host).
+ *
+ * The one piece that cannot be finished here: handing the resulting surface to libapplegfx-vulkan.
+ * The library implements IOSurface only over its PCI-transport FIFO opcodes (0x26-0x2a, keyed by
+ * (surface_id, task_id) in its resource registry) and exposes NO entry point for a mapping-id ->
+ * surface handoff from a separate host device (no lagfx_iosfc_* API, no "latest IOSurface device"
+ * registry, no retain_surface_with_mapping_id equivalent). So mapped surfaces are fully resolved
+ * and recorded in this device's registry, but the renderer has no public hook to look them up.
+ * BRIDGE.md proposes the minimal lagfx API addition. */
+
+#define IOSFC_PAGE_SIZE    0x4000ull  /* Apple-silicon guest: 16 KiB pages */
+#define IOSFC_PAGE_SHIFT   14u
+#define IOSFC_RING_CMD_SZ  16ull      /* one ring command, reims ring.rs RING_COMMAND_SIZE */
+#define IOSFC_TABLE_ENTRY  4ull       /* one descriptor-table entry, reims table.rs TABLE_ENTRY_SIZE */
+#define IOSFC_MAPPING_IDS  8192u      /* reims table.rs MAPPING_ID_COUNT; ids are 1..8192 */
+#define IOSFC_TABLE_LEN    (IOSFC_PAGE_SIZE / IOSFC_TABLE_ENTRY) /* entries in one table page */
+#define IOSFC_DESC_FIRST   0x200ull   /* first-form descriptor size */
+#define IOSFC_DESC_SECOND  0x400ull   /* second-form descriptor size */
+
+/* The MMIO register offsets (64-bit registers), reims iosurface/regs.rs. */
+#define IOSFC_REG_RING_BASE        0x1000ull /* ring guest-physical base (a write unmaps the ring) */
+#define IOSFC_REG_RING_SIZE        0x1008ull /* ring length in commands (needs a base; maps the ring) */
+#define IOSFC_REG_DESCRIPTOR_BASE  0x1010ull /* descriptor-table guest-physical base (maps one page) */
+#define IOSFC_REG_RING_WR_COUNTER  0x1018ull /* write counter: a write is the doorbell */
+#define IOSFC_REG_RING_RD_COUNTER  0x1020ull /* read counter (writable only while no ring is mapped) */
+#define IOSFC_REG_FEATURES         0x1028ull /* read-only: bit 0 = the second descriptor form is offered */
+#define IOSFC_REG_DESC_ENABLE      0x1030ull /* descriptor form: bit 0 = second form */
+
+/* Ring command words: command 1 map, 2 unmap, 3 test; anything else is unsupported. */
+#define IOSFC_CMD_MAP    1u
+#define IOSFC_CMD_UNMAP  2u
+#define IOSFC_CMD_TEST   3u
+
+/* IOReturn codes written back into each command's status word, reims ring.rs IoReturn::code. */
+#define IOSFC_IO_SUCCESS       0
+#define IOSFC_IO_NO_MEMORY     ((int32_t)0xe00002bd)
+#define IOSFC_IO_BAD_ARGUMENT  ((int32_t)0xe00002c2)
+#define IOSFC_IO_UNSUPPORTED   ((int32_t)0xe00002c7)
+#define IOSFC_IO_BUSY          ((int32_t)0xe00002d5)
+
+/* A descriptor's first word / a page-table entry: valid:1, (isTable|mapped):1, pageNumber:30
+   (reims descriptor.rs IoSurfaceDescriptorPageTableEntry). */
+#define IOSFC_PTE_VALID   1u
+#define IOSFC_PTE_TABLE   2u   /* a page-table entry names a lower table */
+#define IOSFC_PTE_MAPPED  2u   /* a descriptor's "mapped" bit (same bit, descriptor context) */
+
+/* One mapped surface, keyed by its mapping id. For a guest-backed surface `pages` holds the host
+   address of each of its `page_count` guest pages; a host-only surface lists none. The geometry is
+   kept so a future renderer hook can build a texture over these pages. */
+struct iosfc_surface {
+    int present;
+    int read_only;
+    int host_only;
+    uint64_t page_count;
+    uint64_t *pages;              /* host addresses of each guest page, or NULL (host-only) */
+    uint32_t pixel_format;
+    uint64_t width, height, bytes_per_row, alloc_size, base_offset;
+};
+
+/* The IOSFC device state (modelling reims HostDeviceCore + Registers for the Henge engine). The
+   guest RAM is one contiguous host mapping, so the ring, the descriptor table, the descriptor
+   pages and the surface pages are aliased straight out of ctx.ram->host; there is no per-mapping
+   machinery to maintain. */
+struct applegfx_iosfc {
+    pthread_mutex_t lock;
+    /* The six writable registers (features is computed). */
+    uint64_t ring_base, ring_size, descriptor_base, ring_wr, ring_rd, desc_enable;
+    uint8_t *ring_host;          /* host pointer to the mapped ring, or NULL */
+    uint8_t *table_host;         /* host pointer to the one mapped descriptor-table page, or NULL */
+    uint64_t descriptors_per_page; /* PAGE / form-size, set by the enable register */
+    struct iosfc_surface *slots; /* IOSFC_MAPPING_IDS entries, index 0 unused */
+    int ready;                   /* slots allocated and lock initialised */
+};
 
 /* The engine state the library's callbacks reach back into. */
 struct applegfx_ctx {
@@ -88,6 +188,9 @@ struct applegfx_ctx {
 
     pthread_t pump;
     int pump_running;
+
+    /* The IOSFC window: a host model of PGIOSurfaceHostDevice (see the big comment above). */
+    struct applegfx_iosfc iosfc;
 };
 
 /* The task-memory callbacks wrap the library's own memfd+mmap primitives. */
@@ -129,7 +232,8 @@ static bool applegfx_write_memory(void *o, uint64_t gpa, uint64_t len, const voi
 
 /* The library (the PGDevice) raises MSI vector 0 for stamp/display completions; on the MMIO transport that is
    the single GFX GIC line (apple-gfx-mmio.m: desc.raiseInterrupt -> qemu_irq_pulse(irq_gfx)). hv_gicv3_pend is an
-   edge, matching qemu_irq_pulse. The IOSFC line belongs to the (unimplemented) IOSurface host device. */
+   edge, matching qemu_irq_pulse. The IOSFC line belongs to the IOSurface host device below, which raises it
+   itself (iosfc_raise_interrupt). */
 static void applegfx_raise_interrupt(void *o, uint32_t vector) {
     struct applegfx_ctx *C = o;
     (void)vector; /* every lagfx-raised interrupt is a PGDevice interrupt -> the GFX line */
@@ -160,31 +264,389 @@ static void applegfx_gfx_write(void *o, uint64_t off, uint64_t val, unsigned siz
         lagfx_mmio_write(C->dev, off + done, (uint32_t)(val >> (done * 8)));
 }
 
-/* ---- IOSFC window: PGIOSurfaceHostDevice — not implemented by the library (see header/BRIDGE.md) -------- *
- * TODO(applegfx-iosfc): implement the PGIOSurfaceHostDevice MMIO protocol. macOS on Apple silicon maps guest
- * IOSurface memory through this window (iosfc mapMemory(phys,len,ro,&va)); without it the renderer has no
- * surface backing. The register layout is not reverse-engineered in libapplegfx-vulkan, so for now we answer
- * reads with 0 and swallow writes, logging the first accesses so a capture can begin the RE. */
+/* ---- IOSFC window: a host model of PGIOSurfaceHostDevice (see the big comment above / BRIDGE.md) -------- *
+ *
+ * The protocol, reconstructed from reims-vgpu's iosurface module (the ground truth) and QEMU's
+ * apple-gfx-mmio.m: a 64-bit register file (0x1000..0x1030) driving a guest command ring; each ring
+ * command maps/unmaps/tests one IOSurface named by a 1..8192 "mapping id"; a map reads the guest's
+ * descriptor for that id, walks its page table to the guest pages that back the surface, aliases
+ * them host-side and records the surface; each completed command raises the IOSFC IRQ. */
+
+/* Little-endian guest word accessors (the guest and the host are both arm64 LE; assembled by byte
+   so the code is endian-correct regardless). */
+static uint32_t iosfc_ld32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static uint64_t iosfc_ld64(const uint8_t *p) {
+    return (uint64_t)iosfc_ld32(p) | ((uint64_t)iosfc_ld32(p + 4) << 32);
+}
+static void iosfc_st32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+static void iosfc_st64(uint8_t *p, uint64_t v) { iosfc_st32(p, (uint32_t)v); iosfc_st32(p + 4, (uint32_t)(v >> 32)); }
+
+/* Host pointer for `len` guest bytes at guest-physical `gpa`, or NULL if the range leaves RAM.
+   This is the whole of "mapMemory" for this device: the engine's RAM is one contiguous host
+   mapping, so a guest-physical address is ram->host + (gpa - ram->pa). */
+static uint8_t *iosfc_gpa_to_host(struct applegfx_ctx *C, uint64_t gpa, uint64_t len) {
+    if (len == 0 || gpa < C->ram->pa) return NULL;
+    uint64_t off = gpa - C->ram->pa;
+    if (off + len < off || off + len > C->ram->size) return NULL; /* overflow / out of range */
+    return C->ram->host + off;
+}
+
+/* A page-table entry's target guest-physical address: pageNumber (bits 2..31) << page shift. */
+static uint64_t iosfc_pte_address(uint32_t entry) {
+    return (uint64_t)(entry >> 2) << IOSFC_PAGE_SHIFT;
+}
+
+/* A decoded surface descriptor, both forms upgraded to the fields this device needs
+   (reims descriptor.rs: the second form, and upgrade_descriptor for the first). */
+struct iosfc_desc {
+    uint32_t word0;         /* first word: a page-table entry rooting the surface's page table */
+    uint32_t pixel_format;
+    uint64_t offset;
+    uint64_t alloc_size;
+    uint64_t width, height, bytes_per_row;
+    uint8_t  plane_count;
+    int read_only;
+    int host_only;
+};
+
+/* Decode the descriptor at `d` in the current form. */
+static void iosfc_decode_descriptor(const uint8_t *d, int second_form, struct iosfc_desc *out) {
+    memset(out, 0, sizeof *out);
+    out->word0 = iosfc_ld32(d + 0);
+    out->pixel_format = iosfc_ld32(d + 4);
+    if (second_form) {
+        out->offset = iosfc_ld64(d + 0x08);
+        out->alloc_size = iosfc_ld64(d + 0x18);
+        out->width = iosfc_ld64(d + 0x20);
+        out->height = iosfc_ld64(d + 0x28);
+        out->bytes_per_row = iosfc_ld64(d + 0x30);
+        out->plane_count = d[0x3e];
+        out->read_only = (d[0x41] & 1u) != 0;  /* bits41: readOnly:1, hostOnly:1 */
+        out->host_only = (d[0x41] & 2u) != 0;
+    } else {
+        /* First form (0x200): narrower fields, widened as reims upgrade_descriptor does. width and
+           height live in the high 24 bits of word14/word18 (the low byte is the element size). */
+        out->offset = iosfc_ld32(d + 0x08);
+        out->alloc_size = iosfc_ld32(d + 0x10);
+        out->width = iosfc_ld32(d + 0x14) >> 8;
+        out->height = iosfc_ld32(d + 0x18) >> 8;
+        out->bytes_per_row = iosfc_ld32(d + 0x1c);
+        out->plane_count = d[0x24];
+        out->read_only = (d[0x27] & 1u) != 0;  /* bits27: readOnly:1 */
+        out->host_only = 0;                     /* an upgraded first-form descriptor is never host-only */
+    }
+}
+
+/* Fill `s->pages` with the host address of each of `page_count` guest pages of the surface
+   `desc` roots, through its one- or two-level page table (reims walk.rs). Returns an IOReturn. */
+static int iosfc_walk(struct applegfx_ctx *C, uint32_t mapping_id, const struct iosfc_desc *desc,
+                      uint64_t page_count, struct iosfc_surface *s) {
+    uint64_t root_gpa = iosfc_pte_address(desc->word0);
+    uint8_t *root = iosfc_gpa_to_host(C, root_gpa, IOSFC_PAGE_SIZE);
+    if (!root) {
+        fprintf(stderr, "hengevm: applegfx: iosfc map: surface %u page-table root at 0x%llx not in guest RAM\n",
+                mapping_id, (unsigned long long)root_gpa);
+        return IOSFC_IO_NO_MEMORY;
+    }
+    uint64_t entries_per_page = IOSFC_PAGE_SIZE / IOSFC_TABLE_ENTRY;
+    if (page_count > entries_per_page * entries_per_page)
+        return IOSFC_IO_NO_MEMORY; /* more than two levels of page table hold */
+
+    s->pages = page_count ? calloc(page_count, sizeof(uint64_t)) : NULL;
+    if (page_count && !s->pages) return IOSFC_IO_NO_MEMORY;
+    s->page_count = page_count;
+
+    uint64_t table_count = (page_count + entries_per_page - 1) / entries_per_page;
+    if (table_count <= 1) {
+        /* One level: each root entry names a page. */
+        for (uint64_t i = 0; i < page_count; i++) {
+            uint32_t e = iosfc_ld32(root + i * IOSFC_TABLE_ENTRY);
+            if (!(e & IOSFC_PTE_VALID) || (e & IOSFC_PTE_TABLE)) return IOSFC_IO_BAD_ARGUMENT;
+            uint8_t *hp = iosfc_gpa_to_host(C, iosfc_pte_address(e), IOSFC_PAGE_SIZE);
+            if (!hp) return IOSFC_IO_NO_MEMORY;
+            s->pages[i] = (uint64_t)(uintptr_t)hp;
+        }
+        return IOSFC_IO_SUCCESS;
+    }
+    /* Two levels: each root entry names a table of up to one page of page entries. */
+    uint64_t mapped = 0, remaining = page_count;
+    for (uint64_t t = 0; t < table_count; t++) {
+        uint32_t te = iosfc_ld32(root + t * IOSFC_TABLE_ENTRY);
+        if (!(te & IOSFC_PTE_VALID) || !(te & IOSFC_PTE_TABLE)) return IOSFC_IO_BAD_ARGUMENT;
+        uint8_t *tbl = iosfc_gpa_to_host(C, iosfc_pte_address(te), IOSFC_PAGE_SIZE);
+        if (!tbl) return IOSFC_IO_NO_MEMORY;
+        uint64_t count = remaining < entries_per_page ? remaining : entries_per_page;
+        for (uint64_t j = 0; j < count; j++) {
+            uint32_t e = iosfc_ld32(tbl + j * IOSFC_TABLE_ENTRY);
+            if (!(e & IOSFC_PTE_VALID) || (e & IOSFC_PTE_TABLE)) return IOSFC_IO_NO_MEMORY;
+            uint8_t *hp = iosfc_gpa_to_host(C, iosfc_pte_address(e), IOSFC_PAGE_SIZE);
+            if (!hp) return IOSFC_IO_NO_MEMORY;
+            s->pages[mapped++] = (uint64_t)(uintptr_t)hp;
+        }
+        remaining -= count;
+    }
+    return IOSFC_IO_SUCCESS;
+}
+
+/* Release one surface slot. */
+static void iosfc_free_slot(struct iosfc_surface *s) {
+    free(s->pages);
+    memset(s, 0, sizeof *s);
+}
+
+/* The host pointer of `mapping_id`'s descriptor, within the mapped descriptor table/page; writes
+   *form_second. NULL (with an IOReturn in *status) when the table entry or page is unreachable. */
+static uint8_t *iosfc_descriptor_ptr(struct applegfx_ctx *C, uint32_t mapping_id, int *second_form,
+                                     int *status) {
+    struct applegfx_iosfc *D = &C->iosfc;
+    *second_form = (D->desc_enable & 1u) != 0;
+    uint64_t form_size = *second_form ? IOSFC_DESC_SECOND : IOSFC_DESC_FIRST;
+    uint64_t id = mapping_id;
+    uint64_t page_index = id / D->descriptors_per_page;
+    uint64_t within = id % D->descriptors_per_page;
+    if (page_index >= IOSFC_TABLE_LEN) { *status = IOSFC_IO_BAD_ARGUMENT; return NULL; }
+    uint32_t te = iosfc_ld32(D->table_host + page_index * IOSFC_TABLE_ENTRY);
+    if (!(te & IOSFC_PTE_VALID)) { *status = IOSFC_IO_NO_MEMORY; return NULL; }
+    uint8_t *page = iosfc_gpa_to_host(C, iosfc_pte_address(te), IOSFC_PAGE_SIZE);
+    if (!page) { *status = IOSFC_IO_NO_MEMORY; return NULL; }
+    return page + within * form_size;
+}
+
+/* `map` command: resolve the surface named by `mapping_id`, make its pages host-visible and record
+   it; set the guest descriptor's "mapped" bit on success (reims table.rs map + walk). */
+static int iosfc_map(struct applegfx_ctx *C, uint32_t mapping_id) {
+    struct applegfx_iosfc *D = &C->iosfc;
+    if (mapping_id == 0 || mapping_id >= IOSFC_MAPPING_IDS) return IOSFC_IO_BAD_ARGUMENT;
+    struct iosfc_surface *slot = &D->slots[mapping_id];
+    if (slot->present) return IOSFC_IO_SUCCESS; /* already mapped */
+
+    int second_form = 0, status = IOSFC_IO_SUCCESS;
+    uint8_t *dptr = iosfc_descriptor_ptr(C, mapping_id, &second_form, &status);
+    if (!dptr) return status;
+
+    struct iosfc_desc desc;
+    iosfc_decode_descriptor(dptr, second_form, &desc);
+    if (!(desc.word0 & IOSFC_PTE_VALID)) return IOSFC_IO_BAD_ARGUMENT;
+
+    struct iosfc_surface made;
+    memset(&made, 0, sizeof made);
+    made.read_only = desc.read_only;
+    made.host_only = desc.host_only;
+    made.pixel_format = desc.pixel_format;
+    made.width = desc.width;
+    made.height = desc.height;
+    made.bytes_per_row = desc.bytes_per_row;
+    made.alloc_size = desc.alloc_size;
+    made.base_offset = desc.offset;
+    /* Whole pages spanning the allocation. */
+    uint64_t page_count = (desc.alloc_size + IOSFC_PAGE_SIZE - 1) >> IOSFC_PAGE_SHIFT;
+
+    if (desc.host_only) {
+        made.page_count = page_count;      /* no guest pages; a real host would allocate backing here */
+    } else {
+        status = iosfc_walk(C, mapping_id, &desc, page_count, &made);
+        if (status != IOSFC_IO_SUCCESS) { iosfc_free_slot(&made); return status; }
+    }
+    made.present = 1;
+    *slot = made;
+
+    /* Set the guest descriptor's mapped bit so the guest's mapper sees the surface as live. */
+    uint32_t w = iosfc_ld32(dptr);
+    iosfc_st32(dptr, w | IOSFC_PTE_MAPPED);
+
+    fprintf(stderr, "hengevm: applegfx: iosfc map id=%u %llux%llu fmt=0x%x pages=%llu%s (recorded; "
+            "renderer handoff pending a lagfx hook, see BRIDGE.md)\n", mapping_id,
+            (unsigned long long)made.width, (unsigned long long)made.height, made.pixel_format,
+            (unsigned long long)made.page_count, made.host_only ? " host-only" : "");
+    return IOSFC_IO_SUCCESS;
+}
+
+/* `unmap` command: release the surface and clear the guest descriptor's mapped bit
+   (reims table.rs unmap). This model tracks no external holders, so a mapped surface is never
+   Busy. */
+static int iosfc_unmap(struct applegfx_ctx *C, uint32_t mapping_id) {
+    struct applegfx_iosfc *D = &C->iosfc;
+    if (mapping_id == 0 || mapping_id >= IOSFC_MAPPING_IDS) return IOSFC_IO_BAD_ARGUMENT;
+    struct iosfc_surface *slot = &D->slots[mapping_id];
+    if (!slot->present) return IOSFC_IO_SUCCESS;
+
+    int second_form = 0, status = IOSFC_IO_SUCCESS;
+    uint8_t *dptr = iosfc_descriptor_ptr(C, mapping_id, &second_form, &status);
+    if (dptr) {
+        uint32_t w = iosfc_ld32(dptr);
+        iosfc_st32(dptr, w & ~IOSFC_PTE_MAPPED);
+    }
+    iosfc_free_slot(slot);
+    return IOSFC_IO_SUCCESS;
+}
+
+/* `test` command: write each 8-byte word of the surface's allocation with its own byte offset, as
+   a device self-test the guest reads back (reims table.rs test_pattern). Guest-backed surfaces are
+   written page by page (a 16 KiB page is a multiple of 8, so no word straddles a page); host-only
+   surfaces have no backing in this model and are a no-op success. */
+static int iosfc_test(struct applegfx_ctx *C, uint32_t mapping_id) {
+    struct applegfx_iosfc *D = &C->iosfc;
+    if (mapping_id == 0 || mapping_id >= IOSFC_MAPPING_IDS) return IOSFC_IO_BAD_ARGUMENT;
+    struct iosfc_surface *s = &D->slots[mapping_id];
+    if (!s->present) return IOSFC_IO_BAD_ARGUMENT;
+    if (s->host_only || !s->pages) return IOSFC_IO_SUCCESS;
+
+    uint64_t total = s->page_count << IOSFC_PAGE_SHIFT;
+    for (uint64_t off = 0; off + 8 <= total && off < s->alloc_size + 8; off += 8) {
+        uint64_t pg = off >> IOSFC_PAGE_SHIFT, within = off & (IOSFC_PAGE_SIZE - 1);
+        if (pg >= s->page_count) break;
+        iosfc_st64((uint8_t *)(uintptr_t)s->pages[pg] + within, off);
+    }
+    return IOSFC_IO_SUCCESS;
+}
+
+/* Raise the IOSFC completion interrupt on its own GIC line (apple-gfx-mmio.m routes the
+   PGIOSurfaceHostDevice's raiseInterrupt to irq_iosfc, distinct from the GFX device's irq_gfx). */
+static void iosfc_raise_interrupt(struct applegfx_ctx *C) {
+    hv_gicv3_pend(C->gic, C->iosfc_irq);
+    if (C->ncpus == 1) hv_machine_wake(C->m);
+}
+
+/* Drain the ring from the read counter to the write counter: run each command, write its status
+   back into the ring slot, bump the read counter and raise the IRQ (reims ring.rs run_ring). */
+static void iosfc_run_ring(struct applegfx_ctx *C) {
+    struct applegfx_iosfc *D = &C->iosfc;
+    if (D->ring_base == 0 || D->ring_size == 0 || !D->ring_host || !D->table_host) return;
+    while (D->ring_rd < D->ring_wr) {
+        uint64_t slot_index = D->ring_rd % D->ring_size;
+        uint8_t *cmd = D->ring_host + slot_index * IOSFC_RING_CMD_SZ;
+        uint32_t command = iosfc_ld32(cmd + 0);
+        uint32_t mapping_id = iosfc_ld32(cmd + 4);
+        int status;
+        switch (command) {
+            case IOSFC_CMD_MAP:   status = iosfc_map(C, mapping_id);   break;
+            case IOSFC_CMD_UNMAP: status = iosfc_unmap(C, mapping_id); break;
+            case IOSFC_CMD_TEST:  status = iosfc_test(C, mapping_id);  break;
+            default:
+                fprintf(stderr, "hengevm: applegfx: iosfc unsupported command %u for surface %u\n",
+                        command, mapping_id);
+                status = IOSFC_IO_UNSUPPORTED;
+                break;
+        }
+        iosfc_st32(cmd + 8, (uint32_t)status); /* status word at command + 8 */
+        D->ring_rd++;
+        iosfc_raise_interrupt(C);
+    }
+}
+
+/* Whether the second descriptor form is offered: on 16 KiB pages a one-page table reaches every
+   mapping id, so the form is offered (reims regs.rs second_form_holds_every_id). */
+static uint64_t iosfc_features_offered(void) {
+    uint64_t entries = IOSFC_PAGE_SIZE / IOSFC_TABLE_ENTRY;
+    uint64_t per_page = IOSFC_PAGE_SIZE / IOSFC_DESC_SECOND;
+    return (entries * per_page >= IOSFC_MAPPING_IDS) ? 1 : 0;
+}
+
+/* Tear every surface down (a descriptor-base or enable write does this; reims teardown_surfaces). */
+static void iosfc_teardown_surfaces(struct applegfx_iosfc *D) {
+    for (uint32_t i = 1; i < IOSFC_MAPPING_IDS; i++)
+        if (D->slots[i].present) iosfc_free_slot(&D->slots[i]);
+}
+
+/* Read a 64-bit register (features is computed; an unknown offset is all ones). */
+static uint64_t iosfc_reg_get(struct applegfx_ctx *C, uint64_t rbase) {
+    struct applegfx_iosfc *D = &C->iosfc;
+    switch (rbase) {
+        case IOSFC_REG_RING_BASE:       return D->ring_base;
+        case IOSFC_REG_RING_SIZE:       return D->ring_size;
+        case IOSFC_REG_DESCRIPTOR_BASE: return D->descriptor_base;
+        case IOSFC_REG_RING_WR_COUNTER: return D->ring_wr;
+        case IOSFC_REG_RING_RD_COUNTER: return D->ring_rd;
+        case IOSFC_REG_FEATURES:        return iosfc_features_offered();
+        case IOSFC_REG_DESC_ENABLE:     return D->desc_enable;
+        default:                        return (uint64_t)-1;
+    }
+}
+
+/* Apply a full 64-bit register write with its side effects (reims regs.rs mmio_write + setters). */
+static void iosfc_reg_put(struct applegfx_ctx *C, uint64_t rbase, uint64_t value) {
+    struct applegfx_iosfc *D = &C->iosfc;
+    switch (rbase) {
+        case IOSFC_REG_RING_BASE:
+            /* A new base unmaps the ring and keeps the size: the ring stays unmapped until the
+               size is written again. */
+            D->ring_host = NULL;
+            D->ring_base = value;
+            break;
+        case IOSFC_REG_RING_SIZE: {
+            /* A size needs a base and is stored before the ring is mapped; a refused mapping leaves
+               the register at the new size and the ring as it was. */
+            if (value == 0 || D->ring_base == 0) return;
+            D->ring_size = value;
+            uint64_t length = value * IOSFC_RING_CMD_SZ;
+            if (length / IOSFC_RING_CMD_SZ != value) return; /* overflow: register set, ring unchanged */
+            uint8_t *mapped = iosfc_gpa_to_host(C, D->ring_base, length);
+            if (mapped) D->ring_host = mapped; /* else keep the old ring */
+            break;
+        }
+        case IOSFC_REG_DESCRIPTOR_BASE:
+            /* A new base tears every surface down, drops the table and maps one page of table. */
+            iosfc_teardown_surfaces(D);
+            D->table_host = NULL;
+            D->descriptor_base = value;
+            if (value != 0) D->table_host = iosfc_gpa_to_host(C, value, IOSFC_PAGE_SIZE);
+            break;
+        case IOSFC_REG_RING_WR_COUNTER:
+            D->ring_wr = value;
+            iosfc_run_ring(C); /* the doorbell */
+            break;
+        case IOSFC_REG_RING_RD_COUNTER:
+            if (!D->ring_host) D->ring_rd = value; /* writable only while no ring is mapped */
+            break;
+        case IOSFC_REG_FEATURES:
+            break; /* read-only */
+        case IOSFC_REG_DESC_ENABLE:
+            /* Keep bit 0, set the form's descriptors-per-page and drop the table (teardown). */
+            D->desc_enable = value & 1u;
+            D->descriptors_per_page = IOSFC_PAGE_SIZE / (D->desc_enable ? IOSFC_DESC_SECOND : IOSFC_DESC_FIRST);
+            iosfc_teardown_surfaces(D);
+            D->table_host = NULL;
+            D->descriptor_base = 0;
+            break;
+        default:
+            break;
+    }
+}
+
+/* The IOSFC registers are 64-bit. The guest's mapper drives them with 64-bit accesses; a narrower
+   access is served against the containing 8-byte register (reims regs.rs notes QEMU's 32-bit shell
+   truncates reads / zero-extends writes). */
 static uint64_t applegfx_iosfc_read(void *o, uint64_t off, unsigned size) {
     struct applegfx_ctx *C = o;
-    (void)C; (void)size;
-    static unsigned seen;
-    if (seen < 16) {
-        fprintf(stderr, "hengevm: applegfx: IOSFC read off=0x%llx (unimplemented PGIOSurfaceHostDevice; returning 0)\n",
-                (unsigned long long)off);
-        seen++;
-    }
-    return 0;
+    struct applegfx_iosfc *D = &C->iosfc;
+    if (!D->ready) return (uint64_t)-1;
+    uint64_t rbase = off & ~7ull, sub = off & 7ull;
+    pthread_mutex_lock(&D->lock);
+    uint64_t v = iosfc_reg_get(C, rbase);
+    pthread_mutex_unlock(&D->lock);
+    if (size == 0 || size >= 8) return v;
+    uint64_t mask = (size >= 8) ? ~0ull : ((1ull << (size * 8)) - 1);
+    return (v >> (sub * 8)) & mask;
 }
 static void applegfx_iosfc_write(void *o, uint64_t off, uint64_t val, unsigned size) {
     struct applegfx_ctx *C = o;
-    (void)C; (void)size;
-    static unsigned seen;
-    if (seen < 16) {
-        fprintf(stderr, "hengevm: applegfx: IOSFC write off=0x%llx val=0x%llx (unimplemented PGIOSurfaceHostDevice)\n",
-                (unsigned long long)off, (unsigned long long)val);
-        seen++;
+    struct applegfx_iosfc *D = &C->iosfc;
+    if (!D->ready) return;
+    uint64_t rbase = off & ~7ull, sub = off & 7ull;
+    pthread_mutex_lock(&D->lock);
+    uint64_t full = val;
+    if (size && size < 8) {
+        /* Splice the narrow write into the current register value, then apply the whole word. */
+        uint64_t cur = (rbase == IOSFC_REG_FEATURES) ? 0 : iosfc_reg_get(C, rbase);
+        uint64_t mask = ((1ull << (size * 8)) - 1) << (sub * 8);
+        full = (cur & ~mask) | ((val << (sub * 8)) & mask);
     }
+    iosfc_reg_put(C, rbase, full);
+    pthread_mutex_unlock(&D->lock);
 }
 
 /* ---- ~60 Hz pump: vblank/online IRQ + frame read-out -------------------------------------------------- */
@@ -326,9 +788,22 @@ int hv_pvg_applegfx_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_t i
     memset(ctx.back, 0, ctx.bufsize);
     pthread_mutex_init(&ctx.flock, NULL);
 
-    /* Claim both MMIO windows. The GFX window forwards to the library; the IOSFC window is the stubbed
-       PGIOSurfaceHostDevice. Self-locked like reims: each access may block in the library, which must not stall
-       the engine's device lock for the other vCPU. */
+    /* Bring up the IOSFC device model (PGIOSurfaceHostDevice). Its slots are keyed by mapping id;
+       index 0 is unused (ids are 1..8192). First form until the enable register selects the second. */
+    ctx.iosfc.slots = calloc(IOSFC_MAPPING_IDS, sizeof(struct iosfc_surface));
+    if (!ctx.iosfc.slots) {
+        fprintf(stderr, "hengevm: applegfx: out of memory for the IOSFC surface table; using the built-in GPU instead\n");
+        free(ctx.front), free(ctx.back);
+        lagfx_display_free(disp), lagfx_device_free(dev);
+        return 0;
+    }
+    pthread_mutex_init(&ctx.iosfc.lock, NULL);
+    ctx.iosfc.descriptors_per_page = IOSFC_PAGE_SIZE / IOSFC_DESC_FIRST;
+    ctx.iosfc.ready = 1;
+
+    /* Claim both MMIO windows. The GFX window forwards to the library; the IOSFC window drives the
+       PGIOSurfaceHostDevice model above. Self-locked like reims: each access may block in the library
+       or the ring drain, which must not stall the engine's device lock for the other vCPU. */
     hv_machine_add_mmio(m, gfx_pa, 0x10000, &ctx, applegfx_gfx_read, applegfx_gfx_write, "gfx-applegfx");
     m->mmio[m->nmmio - 1].self_locked = 1;
     hv_machine_add_mmio(m, iosfc_pa, 0x10000, &ctx, applegfx_iosfc_read, applegfx_iosfc_write, "iosurface-applegfx");
@@ -343,9 +818,11 @@ int hv_pvg_applegfx_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_t i
     }
 
     fprintf(stderr, "hengevm: applegfx: EXPERIMENTAL MMIO<->PCI bridge engaged on this tablet. The GFX window and "
-                    "interrupts are wired to libapplegfx-vulkan; the IOSFC (IOSurface host device) window is a stub, "
-                    "so frames are unlikely until it is implemented (see android/applegfx/BRIDGE.md). Pick Graphics: "
-                    "reims for the known-working GPU, or set HV_GPU_APPLEGFX_PROBE_ONLY=1 for the safe fallback.\n");
+                    "interrupts are wired to libapplegfx-vulkan, and the IOSFC (PGIOSurfaceHostDevice) window now "
+                    "models the surface-mapping protocol (registers, ring, map/unmap/test, page walk, IRQ); mapped "
+                    "surfaces are recorded but not yet handed to the renderer, which needs a new lagfx hook (see "
+                    "android/applegfx/BRIDGE.md). Pick Graphics: reims for the known-working GPU, or set "
+                    "HV_GPU_APPLEGFX_PROBE_ONLY=1 for the safe fallback.\n");
     return 1; /* the bridge owns the GPU windows now */
 #else
     (void)m, (void)gic, (void)gfx_pa, (void)iosfc_pa, (void)gfx_irq, (void)iosfc_irq;
