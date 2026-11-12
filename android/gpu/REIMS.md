@@ -297,6 +297,21 @@ its top frequency.
 
 Version 0.3.28.
 
+Upstream pins reviewed (2026-11-12), to clear `memory.map.mapping_length_unaligned` by a bump:
+reims-vgpu and metal2vulkan are already pinned at each repo's current `master` HEAD (reims-vgpu
+`1fe0acb6`, metal2vulkan `219f0136`, the rev reims-vgpu's own `Cargo.toml` names), both dated
+2026-10-29, so there is nothing newer on the default branch to bump to. Each repo's recent work
+(2026-11-11) lives on a `development` branch that splits `reims-vgpu-core` into `reims-vgpu-graphics`
+and `reims-vgpu-vulkan/src/core/`; every `android_port.py` anchor and `build.sh`'s metal2vulkan
+crate-path patch name the old `reims-vgpu-core/src/iosurface/*` layout, so adopting it is a port
+rewrite, not a pin bump, and is left for a later, build-tested change. That branch still ends the
+process on an unaligned mapping length (`fatal_unless!(total_length % PAGE_SIZE == 0,
+DeathKind::MappingLengthUnaligned)` in `core/memory/map.rs`), so it does not handle the ring's
+unaligned length: the ring's whole-page rounding in `android_port.py` is kept. (It does move the
+map granule to a compile-time `PAGE_SIZE` — 16 KiB on arm64, 4 KiB on x86-64 — which matches what
+the device/descriptor page-size edits already force.) No pin moved; the crash is not cleared by any
+available bump and the on-device test still stands.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
