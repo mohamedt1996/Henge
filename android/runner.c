@@ -51,17 +51,22 @@ static void host_state(FILE *out) {
     FILE *f = fopen("/proc/meminfo", "r");
     if (f) {
         char line[160];
-        long long total = -1, avail = -1, swap_total = -1, swap_free = -1, huge = -1, v;
+        long long total = -1, avail = -1, swap_total = -1, swap_free = -1, huge = -1, whole = -1, v;
         while (fgets(line, sizeof line, f)) {
             if (sscanf(line, "MemTotal: %lld kB", &v) == 1) total = v;
             else if (sscanf(line, "MemAvailable: %lld kB", &v) == 1) avail = v;
             else if (sscanf(line, "SwapTotal: %lld kB", &v) == 1) swap_total = v;
             else if (sscanf(line, "SwapFree: %lld kB", &v) == 1) swap_free = v;
             else if (sscanf(line, "ShmemHugePages: %lld kB", &v) == 1) huge = v;
+            else if (sscanf(line, "ShmemPmdMapped: %lld kB", &v) == 1) whole = v;
         }
         fclose(f);
         if (total > 0 && avail >= 0) fprintf(out, " | tablet: %lld of %lld MB of memory available", avail >> 10, total >> 10);
-        if (huge > 0) fprintf(out, ", %lld MB in huge pages", huge >> 10);
+        /* Settings > Huge pages: how much shared memory (the Mac's RAM is nearly all of it) lies in 2 MB pages,
+           and how much of that a process maps as such, which is what spares the TLB. Shown while asked for,
+           0 included: "0 MB" is the answer where the kernel gave none (the tablet, build 57, On: no figure). */
+        if (huge > 0 || (huge == 0 && getenv("HV_RAM_THP")))
+            fprintf(out, ", %lld MB in huge pages (%lld MB mapped whole)", huge >> 10, whole > 0 ? whole >> 10 : 0);
         if (swap_total > 0 && swap_free >= 0) fprintf(out, ", %lld of %lld MB of swap used", (swap_total - swap_free) >> 10, swap_total >> 10);
     }
     f = fopen("/proc/pressure/memory", "r");

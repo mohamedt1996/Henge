@@ -216,6 +216,9 @@ def main() -> None:
     # makes) are told by the kernel's name for them, and an answer that still fails is a copy of the
     # pages, said in the log, not the app's death (m2v_dma_buf_checks.py).
     subprocess.run([sys.executable, '-I', str(HERE / 'm2v_dma_buf_checks.py'), str(m2v)], check=True)
+    # An experiment the app asks for (Settings > Framebuffer in place): the textures the GPU writes over the
+    # Mac's pages in place too, not shadows copied in and back at every frame (m2v_render_in_place.py).
+    subprocess.run([sys.executable, '-I', str(HERE / 'm2v_render_in_place.py'), str(m2v)], check=True)
     # Framebuffer fetch on a device with neither ordered form (Qualcomm): input attachments without the
     # order flags, best effort (m2v_unordered_fetch.py), instead of refusing WindowServer's pipelines.
     subprocess.run([sys.executable, '-I', str(HERE / 'm2v_unordered_fetch.py'), str(m2v)], check=True)

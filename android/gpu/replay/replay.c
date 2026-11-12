@@ -31,7 +31,9 @@ struct Replay {
     int dirty;
     uint8_t *frame;
     uint32_t fw, fh;
-    int external; /* Graphics: reims: frames come whole through replay_show_frame */
+    int external; /* Graphics: reims: frames come whole through replay_show_frame or replay_frame_begin */
+    int in_screen; /* external: the frame's pixels lie in the screen's own memory (screen_frame), not in `frame` */
+    uint64_t put_n, put_ns; /* external: presents and their time since replay_present_stats last asked */
     /* the pointer */
     uint8_t *cursor;
     uint32_t cw, ch, cstride;
@@ -316,7 +318,7 @@ void replay_command(Replay *r, uint32_t ch, const uint32_t *cmd, uint32_t len) {
 /* ---------------------------------------------------------------- presenting -- */
 /* Copies the surface on screen into the frame, with the pointer over it. Lock held. */
 static int compose(Replay *r) {
-    if (r->external) return r->frame ? 0 : -1;
+    if (r->external) return r->frame || r->in_screen ? 0 : -1;
     Surface *s = r->mapping ? surface_get(&r->os, r->mapping) : NULL;
     if (!s || !s->w || !s->h || s->w > 8192 || s->h > 8192) return -1;
     if (r->fw != s->w || r->fh != s->h) {
@@ -357,12 +359,40 @@ static uint32_t cursor_where(Replay *r) {
     return page ? __atomic_load_n((const uint32_t *)(page + 0xe00), __ATOMIC_ACQUIRE) : 0;
 }
 
+/* external: the frame out of a screen that is going away, into memory of the replay's own, so that the next
+   screen has it to show before the Mac draws again (a still desktop draws nothing for minutes). Lock held. */
+static void keep_frame(Replay *r) {
+    if (!r->external || !r->in_screen) return;
+    r->in_screen = 0;
+    uint32_t w = 0, h = 0;
+    const uint8_t *px = r->screen ? screen_frame_now(r->screen, &w, &h) : NULL;
+    free(r->frame);
+    r->frame = px && w == r->fw && h == r->fh ? malloc((size_t)w * h * 4) : NULL;
+    if (r->frame) memcpy(r->frame, px, (size_t)w * h * 4);
+    else r->fw = r->fh = 0;
+}
+
+/* external: the frame into the screen's memory, where it is not there yet. Lock held. Returns 0 where the
+   screen's memory holds it. */
+static int hand_frame(Replay *r) {
+    if (r->in_screen) return 0;
+    if (!r->screen || !r->frame) return -1;
+    uint8_t *to = screen_frame(r->screen, r->fw, r->fh, NULL);
+    if (!to) return -1;
+    memcpy(to, r->frame, (size_t)r->fw * r->fh * 4);
+    free(r->frame), r->frame = NULL;
+    r->in_screen = 1;
+    return 0;
+}
+
 void replay_present_now(Replay *r) {
     pthread_mutex_lock(&r->lock);
     int ok = compose(r) == 0;
     r->dirty = 0;
-    if (r->external) { /* replay_show_frame may replace the frame: show it under the lock */
-        if (ok && r->screen && screen_show(r->screen, r->frame, r->fw, r->fh) == 0) r->frames++;
+    if (r->external) { /* the frame's pixels may be written again: show them under the lock */
+        uint64_t t0 = now_ns();
+        if (ok && r->screen && hand_frame(r) == 0 && screen_present(r->screen, r->fw, r->fh) == 0)
+            r->frames++, r->put_n++, r->put_ns += now_ns() - t0;
         pthread_mutex_unlock(&r->lock);
         return;
     }
@@ -370,11 +400,13 @@ void replay_present_now(Replay *r) {
     if (ok && r->screen && screen_show(r->screen, r->frame, r->fw, r->fh) == 0) r->frames++;
 }
 
+/* Under the lock from end to end: an external frame's pixels lie in the screen's memory, which whoever draws
+   the frame writes between replay_frame_begin and replay_frame_end. */
 static void set_screen_window(Replay *r) {
     pthread_mutex_lock(&r->lock);
     void *w = r->new_window;
     r->window_changed = 0;
-    pthread_mutex_unlock(&r->lock);
+    keep_frame(r);
     if (r->screen) screen_destroy(r->screen), r->screen = NULL;
 #ifdef __ANDROID__
     if (r->window) ANativeWindow_release(r->window);
@@ -382,7 +414,6 @@ static void set_screen_window(Replay *r) {
     r->window = w;
     if (w) r->screen = screen_create(w);
     r->dirty = 1;
-    pthread_mutex_lock(&r->lock);
     pthread_cond_broadcast(&r->applied);
     pthread_mutex_unlock(&r->lock);
 }
@@ -417,7 +448,10 @@ static void *present_loop(void *arg) {
             last_report = now_ns();
         }
     }
+    pthread_mutex_lock(&r->lock);
+    keep_frame(r);
     if (r->screen) screen_destroy(r->screen), r->screen = NULL;
+    pthread_mutex_unlock(&r->lock);
     return NULL;
 }
 
@@ -549,17 +583,66 @@ void replay_stop(Replay *r) {
     free(r);
 }
 
-void replay_show_frame(Replay *r, const uint8_t *rgba, uint32_t w, uint32_t h) {
+uint8_t *replay_frame_begin(Replay *r, uint32_t w, uint32_t h, int *kept) {
+    if (!w || !h) return NULL;
     pthread_mutex_lock(&r->lock);
     r->external = 1;
-    if (r->fw != w || r->fh != h || !r->frame) {
-        free(r->frame);
-        r->frame = malloc((size_t)w * h * 4);
-        r->fw = r->frame ? w : 0, r->fh = r->frame ? h : 0;
+    int same = r->fw == w && r->fh == h && (r->in_screen || r->frame);
+    uint8_t *px = NULL;
+    if (r->screen) {
+        /* The screen's memory: what the replay kept (from a screen that went away) moves there first. */
+        if (same && !r->in_screen && hand_frame(r) != 0) same = 0;
+        int fresh = 1;
+        px = screen_frame(r->screen, w, h, &fresh);
+        if (px) {
+            if (fresh) same = 0;
+            free(r->frame), r->frame = NULL;
+            r->in_screen = 1;
+        }
     }
-    if (r->frame) memcpy(r->frame, rgba, (size_t)w * h * 4), r->dirty = 1;
+    if (!px) { /* no screen (or none with memory): the replay's own, shown by the next screen */
+        if (r->in_screen) keep_frame(r), same = same && r->frame;
+        if (!same || !r->frame) {
+            free(r->frame);
+            r->frame = malloc((size_t)w * h * 4);
+            same = 0;
+        }
+        px = r->frame;
+    }
+    if (!px) {
+        r->fw = r->fh = 0, r->in_screen = 0;
+        pthread_mutex_unlock(&r->lock);
+        return NULL;
+    }
+    r->fw = w, r->fh = h;
+    if (kept) *kept = same;
+    return px;
+}
+
+void replay_present_stats(Replay *r, uint64_t *presents, uint64_t *ns) {
+    pthread_mutex_lock(&r->lock);
+    *presents = r->put_n, *ns = r->put_ns;
+    r->put_n = r->put_ns = 0;
     pthread_mutex_unlock(&r->lock);
-    pthread_cond_signal(&r->wake);
+}
+
+void replay_screen_words(Replay *r, char *out, size_t n) {
+    pthread_mutex_lock(&r->lock);
+    screen_words(r->screen, out, n);
+    pthread_mutex_unlock(&r->lock);
+}
+
+void replay_frame_end(Replay *r, int changed) {
+    if (changed) r->dirty = 1;
+    pthread_mutex_unlock(&r->lock);
+    if (changed) pthread_cond_signal(&r->wake);
+}
+
+void replay_show_frame(Replay *r, const uint8_t *rgba, uint32_t w, uint32_t h) {
+    uint8_t *px = replay_frame_begin(r, w, h, NULL);
+    if (!px) return;
+    memcpy(px, rgba, (size_t)w * h * 4);
+    replay_frame_end(r, 1);
 }
 
 void replay_enable_draws(Replay *r, const char *tool, const char *cache) {

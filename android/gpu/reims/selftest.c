@@ -26,10 +26,27 @@ static volatile int frames;
 static volatile uint32_t frame_w, frame_h;
 static volatile uint32_t frame_px;
 
-/* The replay's presenter, as host.c hands it frames. */
-void replay_show_frame(Replay *r, const uint8_t *rgba, uint32_t w, uint32_t h) {
+/* The replay's presenter, as host.c hands it frames: the frame's pixels are the presenter's own, which host.c
+   reads the frame target back into between begin and end. */
+static uint8_t *shown_px;
+static uint32_t shown_w, shown_h;
+uint8_t *replay_frame_begin(Replay *r, uint32_t w, uint32_t h, int *kept) {
     (void)r;
-    frame_w = w, frame_h = h, frame_px = rgba ? *(const uint32_t *)rgba : 0;
+    int same = shown_px && shown_w == w && shown_h == h;
+    if (!same) {
+        free(shown_px);
+        shown_px = calloc((size_t)w * h, 4);
+        shown_w = w, shown_h = h;
+    }
+    if (kept) *kept = same;
+    return shown_px;
+}
+void replay_present_stats(Replay *r, uint64_t *presents, uint64_t *ns) { (void)r, *presents = 0, *ns = 0; }
+void replay_screen_words(Replay *r, char *out, size_t n) { (void)r; snprintf(out, n, "the test's"); }
+void replay_frame_end(Replay *r, int changed) {
+    (void)r;
+    if (!changed) return;
+    frame_w = shown_w, frame_h = shown_h, frame_px = *(const uint32_t *)shown_px;
     __atomic_add_fetch(&frames, 1, __ATOMIC_RELEASE);
 }
 

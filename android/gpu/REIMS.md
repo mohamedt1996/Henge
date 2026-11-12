@@ -18,8 +18,9 @@ engine (hengevm, --gpu reims)                     app (libhengegpu.so)
   (each vCPU its own slot, futex-woken)              over the RAM file (MAP_SHARED, as reims wants on Linux)
   irq thread ◀── irq_bits ─────────────────          raise_interrupt: the gfx and IOSurface lines, pulsed
                                                    frames: rvg_display_encode_frame into an RGBA8 frame
-  guest RAM: disk.img.ram (HV_RAM_KEEP) ◀─ mmap ─    target, read back, pointer drawn over, shown by the
-                                                   replay's presenter on the screen's Vulkan surface
+  guest RAM: disk.img.ram (HV_RAM_KEEP) ◀─ mmap ─    target, read back into the screen's own memory, the
+                                                   pointer drawn over it there, shown by the replay's
+                                                   presenter on the screen's Vulkan surface
 ```
 
 - `reims_link.h`: the shared file's layout.
@@ -424,6 +425,82 @@ comparison's own speed. The other half of a copy's upkeep, the merge back of the
 completion, had no line at all: `m2v_copy_in_used.py` now prints one every 10 s (`N completions compared X
 MiB and wrote Y MiB of the GPU's changes back to the Mac's pages, in Z ms`), so the next log on copies says
 whether it is worth working on (its changed blocks are merged eight bytes at a time).
+
+0.3.52 on the tablet (2026-11-12, build 57; three runs, Henge's Turnip, Zero-copy on). It held: `turnip:
+dma-buf imports: KGSL keeps them I/O-coherent ... (flags 0x8c140080)`, no `copied host buffers` lines, a
+frame drawn in 3 to 6 ms (10 to 13 before), up to 55 frames a second, the JIT cache's memory given back at
+each flush. The first run on the new driver had three waits of two seconds and more for pipelines and one
+dropped draw; the third, with the driver's pipeline cache filled (5973 files, 70 MB), had none, and held 42
+to 48 frames a second for a minute with Safari, Terminal, Finder and Activity Monitor open, then 24 to 35.
+The second was ended by Android for memory right after boot, which the app took for what it was. What did
+not move: the fastest core held to 1.7 of 2.8 GHz at 70 to 96 C in every run (heat, not something the app
+sets); the JIT cache at 384 MB dropped one to three times every 30 s, re-translating 1.4 to 4.3 million
+blocks each 30 s; huge pages 14 to 18 MB of 4096 on Eager and none shown on On; the framebuffer still a
+shadowed texture, its pass split in two; 1.1 to 2.5 ms to read a frame back and 1.2 to 2.3 ms to show it.
+The CPUs' "waited 7.2 s on the GPU" in 30 s is all four CPUs' time summed: about 6 % of it.
+
+0.3.53, from those logs.
+
+- **A frame was copied four times on the CPU after the GPU drew it**: read back into a buffer of the host's,
+  copied into a second with the pointer over it, copied into the replay's, copied into the screen's staging
+  buffer; a pointer move alone was three of the four. 4 MB each at 1280x800. Now the frame target is read
+  back straight into the screen's own memory (`screen_frame`, `replay_frame_begin`), the pointer is drawn
+  over it there with the few pixels it covers kept aside and put back before it is drawn again
+  (`pointer_drop`, `pointer_lift`), and the presenter shows that memory. One copy, the read-back itself. A
+  screen that goes away (the app in the background) has its frame kept by the replay and handed to the next
+  one, so a still desktop is shown again without the Mac drawing. 12 MB less held by the app.
+- **The screen's swapchain was the window's size** (the Mi Pad 7's panel is 3200x2136): at every frame the system's
+  driver cleared all of it and filled it with a scaling blit of the 1280x800 frame, some 50 MB written on
+  the GPU for a 4 MB picture, into three or four window-sized buffers (27 MB each). Now, where the window is
+  at least the frame's size, the swapchain is made at the frame's own scale and the window's shape (1280x854
+  there: the frame's pixels one to one, 27 rows of black above and below) and Android's compositor scales it
+  to the window, which the display's own scaler does where the hardware takes the layer. A present is a
+  clear of the small image and one copy of the frame. The letterbox is where it was to a pixel, so touches
+  land as before. A window smaller than the frame, a rotated surface or a swapchain that is not RGBA8 keeps
+  the blit; Settings > Screen scaling: Blit (`HENGE_SCREEN_DIRECT=0`) forces it; and a surface that calls three such swapchains in a row
+  suboptimal or out of date without a clean present between gets the window-sized one from then on (Android's
+  loader is believed to report suboptimal for a changed rotation only; its source was not re-read for this,
+  and the guard is for a loader that does otherwise). The `reims:` line every 10 s now ends with which form
+  the screen took, with the window's size, and its own time per present, none of which the app's log had.
+- **Huge pages** (Settings; root). Asking was not enough: the kernel gives a 2 MB page only where 2 MB lie
+  free in one piece at the first touch. While the Mac runs, each put back after: free memory is compacted once
+  before the engine starts (`/proc/sys/vm/compact_memory`; the log has the free memory in pieces of 2 MB and
+  more before and after, from `/proc/buddyinfo`); `defrag` never -> madvise or defer -> defer+madvise, so a
+  first touch of memory that asked makes room; `enabled` never -> madvise, which is what Linux 6.1 starts
+  khugepaged by (as its `hugepage_flags_enabled` reads; not checked on the tablet's kernel), and khugepaged at
+  16384 pages every 2 s, gathering a 2 MB range only where at most 64 of
+  its 512 pages are untouched (so it adds at most an eighth to what the Mac uses). The engine maps the RAM
+  on a 2 MB boundary itself. Eager's walk stops when the tablet has under 768 MB available: the walk of
+  build 57 took all 4096 MB in 2.7 s with about 1 GB available, which most likely pushed pages straight
+  out to swap, and what comes back from swap comes back small. The heartbeat shows the figure while huge
+  pages are asked for, 0 included, and how much of it is mapped whole (`ShmemPmdMapped`), which is the part
+  that spares the TLB. How much a tablet this full can keep huge is not known: the next log says.
+- **The framebuffer as a shadowed texture** is metal2vulkan's rule, not a failure: a texture over host pages
+  is taken in place only where its usage reads it; one the GPU renders into is an image of the runtime's
+  own, the pages' texels copied in before a use, kept aside before a write and merged back after
+  (`in_place.rs`, `shadow_merge.rs`). All on the GPU: a few copies of 8 MB a frame, none of it the CPUs'.
+  The reason is Vulkan's letter (an image over imported memory starts UNDEFINED, and its transitions and a
+  pass's load and store may touch any byte bound to it), not a driver seen doing so. Settings > Framebuffer
+  in place (off; an experiment; `M2V_RENDER_IN_PLACE=1`, `m2v_render_in_place.py`) asks for such a texture
+  in place too where it is over dma-bufs, its rows hold texels alone (10240 = 1280 x 8) and the device's own
+  check of the first move passed; every refusal falls back to the shadow with its notice. It could not be
+  run before it shipped (no `/dev/udmabuf` off the tablet): a crash with it on turns it off again and leaves
+  the driver where it was, and `metal2vulkan: (Henge)` lines say what each written texture's usage was and
+  what was asked. Whether it is faster is open: the fetch on Turnip reads the attachment as an input, which
+  an image made for the texture's declared usage may lack, and the runtime then renders through a stand-in.
+- **The pass split in two** ("its draws keep different attachments out of their subpass", and one for a tile
+  dispatch) was read and left: it is decided deep in the runtime's render-pass shapes, costs GPU time alone,
+  and the GPU is not what holds the Mac back here (the CPUs wait on it 6 % of the time).
+- The JIT cache's note in Settings said to try 384 MB when memory is short; the log says 384 re-translates
+  far more. It says 512 first now.
+
+Tested off the tablet: the replay's self-test on lavapipe has the frame's-scale swapchain (1280x800 in
+3200x2136 -> 1280x854, pixels one to one, bars black; 1920x1080 next -> 1920x1282), the blit for a window
+smaller than the frame, and reims frames written in place (new, kept, new again at another size; kept by
+the replay with no screen), clean under the address sanitizer; `reims/selftest.c` against a host build of
+the patched library draws a frame into the presenter's memory; the pointer's lift and drop match 0.3.52's
+compose at twelve positions, clipped ones and one off the screen included. Not tested: anything on Adreno,
+Android's compositor scaling the swapchain, the kernel's huge-page settings, the experiment.
 
 What to expect next, in order:
 

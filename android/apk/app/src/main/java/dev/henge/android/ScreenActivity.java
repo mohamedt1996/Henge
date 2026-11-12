@@ -41,6 +41,12 @@ public class ScreenActivity extends Activity {
         root.setBackgroundColor(Color.BLACK);
         String gpuMode = getSharedPreferences("henge", MODE_PRIVATE).getString("gpu", "on");
         boolean vulkan = ("vulkan".equals(gpuMode) || "reims".equals(gpuMode)) && GpuView.loaded;
+        // Settings > Screen scaling: the native screen reads this each time it makes a swapchain's screen
+        // (android/gpu/replay/screen_vk.c): "0" keeps the window-sized swapchain and the GPU's scaling blit.
+        try {
+            android.system.Os.setenv("HENGE_SCREEN_DIRECT",
+                    "blit".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("screenScale", "compositor")) ? "0" : "1", true);
+        } catch (Exception ignored) { }
         if (vulkan) {
             gpu = new GpuView(this);
             root.addView(gpu);
