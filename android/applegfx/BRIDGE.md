@@ -219,6 +219,10 @@ typedef struct {
 
 LAGFX_EXPORT lagfx_status_t lagfx_iosurface_register(
     lagfx_device_t *device, const lagfx_iosurface_mapping_t *mapping);
+/* Re-upload current guest-page contents into the existing VkImage (no recreate),
+   for a surface the guest keeps redrawing. Falls back to register if unseen. */
+LAGFX_EXPORT lagfx_status_t lagfx_iosurface_refresh(
+    lagfx_device_t *device, const lagfx_iosurface_mapping_t *mapping);
 LAGFX_EXPORT lagfx_status_t lagfx_iosurface_unregister(
     lagfx_device_t *device, uint32_t mapping_id);
 ```
@@ -237,16 +241,45 @@ symmetric. Both functions compile with and without Vulkan.
 registered. A register failure is non-fatal — the IOSFC `map` still reports success to the guest; only the
 on-screen content is missing, and that is logged.
 
-### Still open beyond the hook
+**Freshness.** `register` snapshots the guest pages once. A surface the guest keeps redrawing (the compositor /
+wallpaper framebuffer) is kept current by `iosfc_refresh_surfaces()` in the ~60 Hz pump thread: each vblank it
+walks the live guest-backed slots under the IOSFC lock and calls `lagfx_iosurface_refresh(mapping_id)`, which
+re-uploads the current page contents into the *existing* `VkImage` (a staging-buffer copy, no recreate). The
+guest-RAM mapping is fixed, so the page host pointers captured at map time stay valid — only their contents
+change. Set `HV_GPU_APPLEGFX_NO_REFRESH=1` to disable (debug / measure cost). Refresh is held under the IOSFC
+device lock so a concurrent `unmap` cannot free a surface's pages mid-upload.
 
-- **Staging-copy freshness.** `register` snapshots the guest pages into the `VkImage` once, at `map` time. A
-  surface the guest keeps redrawing (the wallpaper/compositor framebuffer) needs the copy refreshed — either a
-  periodic re-upload from the still-mapped pages, or external-memory import so the `VkImage` aliases the guest
-  pages directly on the tablet's Turnip instead of copying. The present code does the one-shot copy; wiring a
-  per-frame (or dirty-driven) re-register is the next step.
-- **Vulkan on-device.** The host CI build has no Vulkan, so the shipped arm64 static lib currently takes the
-  `LAGFX_HAVE_VULKAN`-off path: `register` records the mapping but builds no image. Real display needs the lib
-  cross-built against the tablet's Vulkan headers/loader (Turnip) with `LAGFX_HAVE_VULKAN` on.
+### Building Vulkan-on
+
+The default `android/applegfx/build.sh` builds the lib **Vulkan-off**, because the default engine is a fully
+static binary (`STATIC = -static` in `android/Makefile`) and a static binary can't dynamically load the tablet's
+Vulkan driver. In that configuration `register`/`refresh` record the mapping but build no image.
+
+To build the real rendering path, set `APPLEGFX_VULKAN=1` when invoking `build.sh`:
+
+- A static archive doesn't link a loader, so the cross build needs only the Vulkan **headers** to compile the
+  `LAGFX_HAVE_VULKAN` code. `build.sh` fetches pinned `KhronosGroup/Vulkan-Headers`, points
+  `APPLEGFX_VULKAN_INCLUDE` at them, and configures with `-Dforce_vulkan=true` (added by
+  `patches/0002-forcible-vulkan-build.patch`: a meson option that forces the gate on from those headers without
+  relying on meson's loader auto-detection, which can't see a cross loader). It then writes a `VULKAN_ON` marker
+  into the output dir.
+- The engine resolves the archive's Vulkan symbols against the tablet's loader: when the `VULKAN_ON` marker is
+  present, `android/Makefile` adds `-lvulkan` to the engine link and drops `-static` (a Vulkan engine is
+  necessarily dynamic). The driver on the Xiaomi Pad 7 is Turnip (`libvulkan_freedreno.so`), already bundled in
+  the APK for `Graphics: reims`.
+
+So the remaining work to light up pixels is an integration/packaging choice — ship the engine built with
+`APPLEGFX_VULKAN=1` (hence dynamic) alongside the bundled loader — not a missing capability. On-device
+confirmation (that Turnip resolves and the compositor surface renders) is the test that still needs the tablet.
+
+### Still open beyond that
+
+- **External-memory import.** `refresh` keeps the surface current with a per-vblank staging copy. A zero-copy
+  path — importing the guest pages as `VkDeviceMemory` so the `VkImage` aliases them directly on Turnip — would
+  drop the per-frame copy, at the cost of Android/Turnip external-memory plumbing. The staging copy is correct
+  and simple; import is an optimization.
+- **Dirty-driven refresh.** The pump re-uploads every live guest-backed surface each vblank. A dirty signal
+  (an MMIO "backing written" hint, like the PCI transport's `0x3b`) would let it skip unchanged surfaces.
 - **Mode changes.** The frame buffers are sized to the single advertised mode (1920×1080). Honour `mode_changed`
   with a realloc under `flock` once a second mode is offered.
 - **Busy semantics.** reims returns `Busy` on `unmap` while another reference holds the IOSurface; once surfaces

@@ -1,8 +1,8 @@
 diff --git a/include/libapplegfx-vulkan.h b/include/libapplegfx-vulkan.h
-index cc8fb28..2a34e56 100644
+index cc8fb28..f73d6ad 100644
 --- a/include/libapplegfx-vulkan.h
 +++ b/include/libapplegfx-vulkan.h
-@@ -380,6 +380,53 @@ typedef enum {
+@@ -380,6 +380,68 @@ typedef enum {
   * lifecycle. */
  LAGFX_EXPORT lagfx_status_t lagfx_device_register_shader_catalog(lagfx_device_t *device);
  
@@ -47,6 +47,21 @@ index cc8fb28..2a34e56 100644
 +LAGFX_EXPORT lagfx_status_t lagfx_iosurface_register(
 +    lagfx_device_t *device, const lagfx_iosurface_mapping_t *mapping);
 +
++/* Re-upload the current guest-page contents of an already-registered mapping
++ * into its existing VkImage backing, without recreating it. For a surface the
++ * guest keeps redrawing (the compositor / wallpaper framebuffer), an embedder
++ * calls this per vblank (or on a dirty signal) so the displayed image tracks
++ * the guest's writes; register alone only snapshots the pages once. This is a
++ * staging-buffer upload, not an allocation.
++ *
++ * If mapping_id was never registered, or has no backing yet (vk came up after
++ * the first register), refresh performs a full register instead, so the first
++ * refresh still binds the surface. Returns LAGFX_OK on success (including the
++ * no-Vulkan build, where it is a no-op); LAGFX_ERR_INVALID_ARG on a bad
++ * device/mapping. */
++LAGFX_EXPORT lagfx_status_t lagfx_iosurface_refresh(
++    lagfx_device_t *device, const lagfx_iosurface_mapping_t *mapping);
++
 +/* Release the backing registered for mapping_id and drop its registry
 + * entry. Safe to call for an unknown id (returns LAGFX_ERR_NOT_FOUND).
 + * Safe on a NULL/!valid device (returns LAGFX_ERR_INVALID_ARG). */
@@ -70,29 +85,35 @@ index 675b60a..c1d0d89 100644
    # Legacy handlers moved to src/handlers/display/display.c for vchan opcodes (0x01-0x07)
 diff --git a/src/protocol/iosurface_api.c b/src/protocol/iosurface_api.c
 new file mode 100644
-index 0000000..cd9a643
+index 0000000..3c1f5fd
 --- /dev/null
 +++ b/src/protocol/iosurface_api.c
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,231 @@
 +/* src/protocol/iosurface_api.c — public host-mapped IOSurface registration
 + *
 + * Copyright © 2026 Matthew Jackson
 + * SPDX-License-Identifier: MIT
 + *
-+ * Implements lagfx_iosurface_register / lagfx_iosurface_unregister
-+ * (declared in include/libapplegfx-vulkan.h).
++ * Implements lagfx_iosurface_register / lagfx_iosurface_refresh /
++ * lagfx_iosurface_unregister (declared in include/libapplegfx-vulkan.h).
 + *
 + * Motivation: the in-band IOSFC command ring (handlers/iosurface/) learns
 + * about IOSurfaces from guest CmdCreateIOSurfaceBacking2 traffic over the
 + * apple-gfx PCI transport. An embedder driving the MMIO transport variant
 + * (Henge's android/applegfx bridge) resolves a surface's backing pages
 + * out-of-band and needs a direct, transport-agnostic way to hand those
-+ * host-mapped pages to the renderer. These two functions are that path.
++ * host-mapped pages to the renderer. These functions are that path.
 + *
 + * The implementation deliberately reuses the exact machinery the in-band
 + * handler uses (lagfx_vk_iosurface_create + _upload_pixels + the resource
 + * registry keyed by surface id as TEXTURE), so a surface registered here is
-+ * indistinguishable, downstream, from one created by the guest ring. */
++ * indistinguishable, downstream, from one created by the guest ring.
++ *
++ * register vs. refresh: register (re)creates the VkImage backing; refresh
++ * re-uploads current guest-page contents into the *existing* backing without
++ * recreating it, for a surface the guest keeps redrawing (the compositor /
++ * wallpaper framebuffer). An embedder calls refresh per vblank (or on a
++ * dirty signal); it is a cheap upload, not an allocation. */
 +
 +#include "libapplegfx-vulkan.h"
 +#include "state.h"
@@ -113,11 +134,42 @@ index 0000000..cd9a643
 +    if (!lagfx_device_is_valid(device)) return NULL;
 +    lagfx_protocol_t *p = (lagfx_protocol_t *)device->protocol_state;
 +    if (!p) {
-+        LAGFX_WARN("iosurface_register: device has no protocol state");
++        LAGFX_WARN("iosurface_api: device has no protocol state");
 +        return NULL;
 +    }
 +    return &p->resources;
 +}
++
++#ifdef LAGFX_HAVE_VULKAN
++/* Gather the mapping's host-mapped pages into one contiguous malloc'd buffer,
++ * in guest-physical order (the surface's linear pixel storage). *out_len gets
++ * the gathered length. Returns NULL (and *out_len 0) when there is nothing to
++ * gather or on OOM; the caller treats a NULL/empty gather as "no pixels".
++ * We copy at most alloc_size bytes (or page_count*page_size, whichever is
++ * smaller); upload_pixels then zero-pads short / truncates long against the
++ * image's own width*height*bpp. */
++static uint8_t *gather_pages(const lagfx_iosurface_mapping_t *m, size_t *out_len) {
++    *out_len = 0u;
++    if (!m->page_host_addrs || !m->page_count || !m->page_size) return NULL;
++    size_t span = (size_t)m->page_count * (size_t)m->page_size;
++    size_t want = (m->alloc_size && (size_t)m->alloc_size < span)
++                      ? (size_t)m->alloc_size : span;
++    if (!want) return NULL;
++    uint8_t *buf = (uint8_t *)malloc(want);
++    if (!buf) return NULL;
++    size_t got = 0u;
++    for (uint32_t i = 0; i < m->page_count && got < want; i++) {
++        const void *src = m->page_host_addrs[i];
++        size_t chunk = m->page_size;
++        if (got + chunk > want) chunk = want - got;
++        if (src) memcpy(buf + got, src, chunk);
++        else     memset(buf + got, 0, chunk); /* unmapped hole */
++        got += chunk;
++    }
++    *out_len = got;
++    return buf;
++}
++#endif /* LAGFX_HAVE_VULKAN */
 +
 +lagfx_status_t lagfx_iosurface_register(lagfx_device_t *device,
 +                                        const lagfx_iosurface_mapping_t *m) {
@@ -155,33 +207,8 @@ index 0000000..cd9a643
 +        return LAGFX_OK;
 +    }
 +
-+    /* Gather the mapped pages into one contiguous linear buffer. The pages
-+     * are the surface's pixel storage in guest-physical order, so a simple
-+     * in-order concat reconstructs the linear framebuffer the uploader
-+     * expects. We copy at most alloc_size bytes (or page_count*page_size,
-+     * whichever is smaller) — upload_pixels zero-pads a short buffer and
-+     * truncates a long one against the image's own width*height*bpp. */
-+    uint8_t *gather = NULL;
 +    size_t gathered = 0u;
-+    if (m->page_host_addrs && m->page_count && m->page_size) {
-+        size_t span = (size_t)m->page_count * (size_t)m->page_size;
-+        size_t want = m->alloc_size && m->alloc_size < span
-+                          ? (size_t)m->alloc_size : span;
-+        gather = (uint8_t *)malloc(want ? want : 1u);
-+        if (!gather) {
-+            LAGFX_ERR("iosurface_register: id=0x%x OOM gathering %zu bytes",
-+                      m->mapping_id, want);
-+            return LAGFX_ERR_OUT_OF_MEMORY;
-+        }
-+        for (uint32_t i = 0; i < m->page_count && gathered < want; i++) {
-+            const void *src = m->page_host_addrs[i];
-+            size_t chunk = m->page_size;
-+            if (gathered + chunk > want) chunk = want - gathered;
-+            if (src) memcpy(gather + gathered, src, chunk);
-+            else     memset(gather + gathered, 0, chunk); /* unmapped hole */
-+            gathered += chunk;
-+        }
-+    }
++    uint8_t *gather = gather_pages(m, &gathered);
 +
 +    lagfx_vk_iosurface_t *ios = NULL;
 +    lagfx_status_t st = lagfx_vk_iosurface_create(device->vk, m->width,
@@ -222,6 +249,52 @@ index 0000000..cd9a643
 +
 +    LAGFX_LOG("iosurface_register: id=0x%x %ux%u fmt=0x%x bound (%zu bytes)",
 +              m->mapping_id, m->width, m->height, m->pixel_format, gathered);
++    return LAGFX_OK;
++#endif /* LAGFX_HAVE_VULKAN */
++}
++
++lagfx_status_t lagfx_iosurface_refresh(lagfx_device_t *device,
++                                       const lagfx_iosurface_mapping_t *m) {
++    if (!lagfx_device_is_valid(device) || !m) return LAGFX_ERR_INVALID_ARG;
++    lagfx_resource_registry_t *reg = registry_of(device);
++    if (!reg) return LAGFX_ERR_INVALID_ARG;
++
++    const uint32_t task_id = 0u;
++    lagfx_resource_entry_t *e = lagfx_resource_lookup(reg, m->mapping_id,
++                                                      task_id);
++    /* Never registered, or lost its backing (e.g. vk came up after the first
++     * register): fall through to a full register so the first refresh still
++     * binds something. */
++    if (!e
++#ifdef LAGFX_HAVE_VULKAN
++        || !e->host_handle
++#endif
++       )
++        return lagfx_iosurface_register(device, m);
++
++#ifndef LAGFX_HAVE_VULKAN
++    (void)e;
++    return LAGFX_OK; /* nothing to re-upload without a renderer */
++#else
++    if (!device->vk) return LAGFX_OK;
++
++    size_t gathered = 0u;
++    uint8_t *gather = gather_pages(m, &gathered);
++    if (!gather || !gathered) { free(gather); return LAGFX_OK; }
++
++    /* Re-upload current guest-page contents into the EXISTING VkImage — no
++     * recreate. NB: upload_pixels transitions the image and copies via a
++     * staging buffer; if a frame is concurrently sampling this surface the
++     * embedder is responsible for ordering refresh against submission (the
++     * bridge does it from its vblank pump, between presents). */
++    lagfx_status_t st = lagfx_vk_iosurface_upload_pixels(
++        device->vk, (lagfx_vk_iosurface_t *)e->host_handle, gather, gathered);
++    free(gather);
++    if (st != LAGFX_OK) {
++        LAGFX_WARN("iosurface_refresh: id=0x%x re-upload failed (%d)",
++                   m->mapping_id, (int)st);
++        return st;
++    }
 +    return LAGFX_OK;
 +#endif /* LAGFX_HAVE_VULKAN */
 +}

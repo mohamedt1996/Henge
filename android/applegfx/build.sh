@@ -53,10 +53,33 @@ cpu_family = 'aarch64'
 cpu = 'aarch64'
 endian = 'little'
 CROSSEOF
+# Vulkan: off by default (the default engine is a fully static binary that can't dynamically load a Vulkan
+# driver). Set APPLEGFX_VULKAN=1 to build the real rendering path: a static archive doesn't link a loader, so
+# the cross build needs only the Vulkan HEADERS to compile the LAGFX_HAVE_VULKAN code; the engine links the
+# tablet's loader (-lvulkan) at its own link step. Enabling it also makes the engine a dynamic binary — see the
+# VULKAN_ON marker handling in android/Makefile. The real display driver on the Xiaomi Pad 7 is Turnip
+# (libvulkan_freedreno.so), already bundled in the APK for Graphics: reims.
+VK_ARGS=()
+rm -f "$OUT/VULKAN_ON"
+if [ "${APPLEGFX_VULKAN:-0}" = "1" ]; then
+  VKH=${APPLEGFX_VULKAN_HEADERS:-$DEPS/Vulkan-Headers}
+  VKH_REV=${APPLEGFX_VULKAN_HEADERS_REV:-v1.3.290}   # pin; bump deliberately
+  if [ ! -d "$VKH/.git" ]; then
+    git init -q "$VKH"
+    git -C "$VKH" remote add origin https://github.com/KhronosGroup/Vulkan-Headers 2>/dev/null || true
+  fi
+  git -C "$VKH" fetch -q --depth 1 origin "$VKH_REV"
+  git -C "$VKH" checkout -q FETCH_HEAD
+  test -f "$VKH/include/vulkan/vulkan.h" || { echo "applegfx: Vulkan-Headers missing vulkan/vulkan.h at $VKH" >&2; exit 1; }
+  export APPLEGFX_VULKAN_INCLUDE="$VKH/include"
+  VK_ARGS=(-Dforce_vulkan=true)
+  echo "applegfx: building Vulkan-ON (headers $VKH_REV; engine must link a Vulkan loader)"
+fi
 rm -rf "$SRC/bd-arm64"
-meson setup "$SRC/bd-arm64" "$SRC" --cross-file "$CROSS" -Dbuildtype=release -Ddefault_library=static
+meson setup "$SRC/bd-arm64" "$SRC" --cross-file "$CROSS" -Dbuildtype=release -Ddefault_library=static -Dtests=false "${VK_ARGS[@]}"
 meson compile -C "$SRC/bd-arm64"
 cp "$SRC/bd-arm64"/libapplegfx-vulkan.a "$OUT/" 2>/dev/null || cp "$SRC/bd-arm64"/*applegfx*vulkan*.a "$OUT/libapplegfx-vulkan.a"
 mkdir -p "$OUT/include"
 cp -r "$SRC/include/." "$OUT/include/"
-echo "applegfx: built $(du -h "$OUT/libapplegfx-vulkan.a" | cut -f1) static lib for arm64"
+[ "${APPLEGFX_VULKAN:-0}" = "1" ] && : > "$OUT/VULKAN_ON"
+echo "applegfx: built $(du -h "$OUT/libapplegfx-vulkan.a" | cut -f1) static lib for arm64${APPLEGFX_VULKAN:+ (Vulkan on)}"

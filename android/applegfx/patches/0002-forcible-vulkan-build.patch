@@ -1,0 +1,35 @@
+diff --git a/meson.build b/meson.build
+index be11cdf..23e7d71 100644
+--- a/meson.build
++++ b/meson.build
+@@ -76,6 +76,22 @@ if vulkan_dep.found()
+   # fallback that still satisfies the lifecycle contract.
+   add_project_arguments('-DLAGFX_HAVE_VULKAN=1', language : 'c')
+   message('Vulkan found — building real Vulkan init path (Phase 1.B).')
++elif get_option('force_vulkan')
++  # Cross-build case (Henge android/applegfx/build.sh): dependency(vulkan)
++  # can't auto-detect a loader for the target, but a STATIC archive doesn't
++  # link one — it only needs the Vulkan headers to compile the real path,
++  # and the consumer (the engine) links the target's loader. Take the header
++  # dir from APPLEGFX_VULKAN_INCLUDE and force the gate on.
++  vk_inc = run_command('sh', '-c', 'printf %s "${APPLEGFX_VULKAN_INCLUDE:-}"',
++                       check : false).stdout().strip()
++  if vk_inc == ''
++    error('force_vulkan=true but APPLEGFX_VULKAN_INCLUDE is unset; point it at a dir containing vulkan/vulkan.h')
++  endif
++  # -I via project args: include_directories() rejects an absolute external path.
++  lagfx_deps = []
++  add_project_arguments('-I' + vk_inc, language : 'c')
++  add_project_arguments('-DLAGFX_HAVE_VULKAN=1', language : 'c')
++  message('Vulkan forced on (headers from APPLEGFX_VULKAN_INCLUDE) — loader linked by consumer.')
+ else
+   # Early Phase 1 can build without vulkan (stubbed rendering).
+   warning('Vulkan not found — building with no-op Vulkan init stubs.')
+diff --git a/meson_options.txt b/meson_options.txt
+index 5aba6c1..7ba42a3 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -1,2 +1,3 @@
+ option('tests', type: 'boolean', value: true, description: 'Build tests')
++option('force_vulkan', type: 'boolean', value: false, description: 'Force LAGFX_HAVE_VULKAN on using headers from the APPLEGFX_VULKAN_INCLUDE env dir, even when dependency(vulkan) is not auto-detected. For a static-lib build the loader is not needed at archive time — the consumer links it. Used by Henge android/applegfx/build.sh.')
+ option('fuzz', type: 'feature', value: 'disabled', description: 'Enable fuzzing')

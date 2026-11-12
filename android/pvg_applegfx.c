@@ -51,10 +51,12 @@
  *   on `unmap` via lagfx_iosurface_unregister) — the entry point stock libapplegfx-vulkan lacked, added here as
  *   a Henge-local patch (android/applegfx/patches/, applied by build.sh). It binds the surface as a TEXTURE
  *   keyed on mapping_id so the library's existing CmdLookupIOSurface path resolves it. See BRIDGE.md.
- * What is STILL open (see BRIDGE.md): the register path snapshots the guest pages once (staging copy), so a
- *   continuously-redrawn surface needs a per-frame re-register or external-memory import; and the shipped CI lib
- *   is built with Vulkan off, so register records the mapping without building an image until the lib is
- *   cross-built against the tablet's Turnip with LAGFX_HAVE_VULKAN on.
+ * Freshness: a surface the guest keeps redrawing is re-uploaded from its still-mapped pages every vblank by
+ *   iosfc_refresh_surfaces() -> lagfx_iosurface_refresh() (re-upload into the existing VkImage, no recreate), so
+ *   the compositor framebuffer tracks the guest's drawing rather than freezing at the map-time snapshot.
+ * What is STILL open (see BRIDGE.md): Vulkan is enabled only when the library is built with it (build.sh
+ *   APPLEGFX_VULKAN=1, which also makes the engine link dynamically against the tablet's Vulkan driver). The
+ *   default static CI build is Vulkan-off, where register/refresh record the mapping without building an image.
  *
  * Because of that, the bridge is engaged but honest: it logs its experimental status and points at Graphics:
  * reims for the known-working GPU. Set HV_GPU_APPLEGFX_PROBE_ONLY=1 to keep the old behaviour (prove the library
@@ -690,6 +692,43 @@ static void applegfx_iosfc_write(void *o, uint64_t off, uint64_t val, unsigned s
     pthread_mutex_unlock(&D->lock);
 }
 
+/* Re-upload each live guest-backed IOSurface from its still-mapped pages so a surface the guest keeps
+   redrawing (the compositor / wallpaper framebuffer) tracks those writes on screen. lagfx_iosurface_register
+   snapshots the pages once at map time; this is the per-vblank refresh. The guest-RAM mapping is fixed, so the
+   page host pointers captured at map time stay valid — only their contents change — and refresh re-uploads into
+   the existing VkImage (no recreate). Held under D->lock so a concurrent unmap can't free s->pages mid-upload.
+   Set HV_GPU_APPLEGFX_NO_REFRESH=1 to disable (debug / measure). */
+static void iosfc_refresh_surfaces(struct applegfx_ctx *C) {
+    static int disabled = -1;
+    if (disabled < 0) disabled = getenv("HV_GPU_APPLEGFX_NO_REFRESH") ? 1 : 0;
+    if (disabled || !C->dev) return;
+    struct applegfx_iosfc *D = &C->iosfc;
+    if (!D->ready) return;
+    pthread_mutex_lock(&D->lock);
+    for (uint32_t id = 1; id < IOSFC_MAPPING_IDS; id++) {
+        struct iosfc_surface *s = &D->slots[id];
+        if (!s->present || s->host_only || !s->pages || !s->page_count) continue;
+        const void **pv = calloc((size_t)s->page_count, sizeof(*pv));
+        if (!pv) continue;
+        for (uint64_t i = 0; i < s->page_count; i++)
+            pv[i] = (const void *)(uintptr_t)s->pages[i];
+        lagfx_iosurface_mapping_t lm = {
+            .mapping_id    = id,
+            .pixel_format  = s->pixel_format,
+            .width         = (uint32_t)s->width,
+            .height        = (uint32_t)s->height,
+            .bytes_per_row = (uint32_t)s->bytes_per_row,
+            .alloc_size    = s->alloc_size,
+            .page_host_addrs = pv,
+            .page_count    = (uint32_t)s->page_count,
+            .page_size     = (uint32_t)IOSFC_PAGE_SIZE,
+        };
+        lagfx_iosurface_refresh(C->dev, &lm);
+        free(pv);
+    }
+    pthread_mutex_unlock(&D->lock);
+}
+
 /* ---- ~60 Hz pump: vblank/online IRQ + frame read-out -------------------------------------------------- */
 static void *applegfx_pump(void *arg) {
     struct applegfx_ctx *C = arg;
@@ -698,6 +737,10 @@ static void *applegfx_pump(void *arg) {
         /* Display online / vblank: fires the online IRQ (vector 0 -> GFX line) the moment the guest enables a
            display, which the deadlock fix in the library depends on. */
         lagfx_timer_tick_vblank(C->dev, C, applegfx_write_memory, applegfx_read_memory);
+
+        /* Refresh live IOSurfaces from guest memory before reading the frame, so the compositor's latest
+           drawing is in the sampled backing. */
+        iosfc_refresh_surfaces(C);
 
         /* Pull the latest rendered frame, if any, into the back buffer and publish it. */
         size_t stride = 0;

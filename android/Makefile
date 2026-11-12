@@ -54,6 +54,14 @@ $(B)/pvg_android.o: android/pvg_android.c | $(B)
 ifdef APPLEGFX
 APPLEGFX_CFLAGS = -DHAVE_APPLEGFX -I$(APPLEGFX)/include
 APPLEGFX_LIB = $(APPLEGFX)/libapplegfx-vulkan.a
+# When build.sh built the lib Vulkan-on (APPLEGFX_VULKAN=1), it leaves a VULKAN_ON marker. The archive then has
+# undefined Vulkan symbols the engine must resolve against the tablet's loader (-lvulkan), which also means the
+# engine can no longer be fully static — drop -static for this configuration. The default (no marker) is
+# unchanged: Vulkan-off archive, static engine.
+ifneq ($(wildcard $(APPLEGFX)/VULKAN_ON),)
+APPLEGFX_VK_LIBS = -lvulkan
+STATIC =
+endif
 endif
 $(B)/pvg_applegfx.o: android/pvg_applegfx.c | $(B)
 	$(CC) $(CFLAGS) $(APPLEGFX_CFLAGS) -c $< -o $@
@@ -91,7 +99,7 @@ $(B)/libhengerestore.a: android/build_restore.sh host/install.c host/libusb_shim
 	DEPS=$(DEPS) android/build_restore.sh
 RESTORE_LIBS = $(B)/libhengerestore.a $(DEPS)/libzip/lib/libzip.a -L$(DEPS)/lib -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz
 $(B)/hengevm-android: $(B)/seccomp_compat.o $(B)/runner.o $(B)/gunyah.o $(B)/pvg_reims.o $(B)/pvg_applegfx.o $(APPLEGFX_LIB) $(B)/curl_android.o $(B)/fetch.o $(LZFSE_OBJ) $(B)/vm.o $(B)/usb_host.o $(B)/net_slirp.o $(B)/vnc.o $(B)/audio_android.o $(B)/host_stubs.o $(B)/libhengevm.a $(B)/libhengerestore.a
-	$(CC) $(CFLAGS) $(filter-out $(B)/libhengerestore.a,$^) $(RESTORE_LIBS) $(SLIRP_LIBS) $(LIBS) -Wl,--wrap=curl_easy_init -o $@
+	$(CC) $(CFLAGS) $(filter-out $(B)/libhengerestore.a,$^) $(RESTORE_LIBS) $(SLIRP_LIBS) $(LIBS) $(APPLEGFX_VK_LIBS) -Wl,--wrap=curl_easy_init -o $@
 	python3 android/nosyscall.py $@
 
 $(B)/libhengevm.a: $(ENGINE) $(DEV)
