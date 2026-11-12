@@ -368,3 +368,16 @@ carry over is what they learned about macOS's GPU clients, and the Turnip route:
   path and the unordered raster order groups stay. Bundling an Android Turnip (the emulator
   community's prebuilts, loaded directly as the ICD) is the next structural step once the stock driver
   has shown what else it refuses.
+
+## GPU backends (not one basket)
+
+`--gpu` chooses the paravirtual-GPU host, so the GPU is not bet on a single implementation:
+
+| Mode | Host | State |
+| --- | --- | --- |
+| `on` | `pvg_lite` (built in) | minimal device; macOS's driver runs, no Android renderer |
+| `vulkan` | the home-grown replay (`pvg_android.c`, air2spv) | experimental; guesses some pipelines |
+| `reims` | reims-vgpu in the app, on metal2vulkan | experimental; the furthest-along path |
+| `applegfx` | libapplegfx-vulkan (`pvg_applegfx.c`) | a second, independent PVG host; **not built into the engine yet** — selecting it logs that and falls back to `pvg_lite` |
+
+`vmapple.c` tries the external hosts in order (`hv_pvg_applegfx_create`, then reims's `hv_pvg_external_create`), each gated by its own `HV_GPU_*` variable, then `pvg_lite`. Adding a backend is: a `pvg_*.c` that defines its `hv_pvg_*_create` (0 when not chosen or not built), a `--gpu` name in `runner.c`, the object on the engine link in `android/Makefile`, and a `GPU_MODES` entry in the app. To finish `applegfx`, build libapplegfx-vulkan (MIT) for `aarch64-linux-android` as a CI step like `reims/build.sh` and compile `pvg_applegfx.c` with `-DHAVE_APPLEGFX`.
