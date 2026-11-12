@@ -192,51 +192,61 @@ keyed by `(surface_id, task_id)` in `src/protocol/resource_registry.c`. There is
 - no process-global "latest IOSurface device" registry;
 - no `retain_surface_with_mapping_id` / mapping-id → surface entry point the renderer could call.
 
-So this bridge can — and now does — resolve every `map` to a concrete host surface (host page pointers +
-geometry) and record it, but it **cannot hand that surface to the renderer**: the library offers no public hook
-to inject a host-mapped surface and have `CmdLookupIOSurface` find it. This is the remaining blocker, and it is a
-**library gap, not an RE gap**.
+So this bridge resolves every `map` to a concrete host surface (host page pointers + geometry) and records it.
+Handing that surface to the renderer used to be the blocker — the stock library offered no public hook to inject
+a host-mapped surface and have the renderer find it. **That hook now exists**, added as a Henge-local patch on
+the pinned upstream rev.
 
-### Proposed minimal lagfx API addition
+### The lagfx API addition (implemented)
 
-The smallest additions that would let the renderer consume these surfaces (keyed by mapping id, matching
-Apple/reims):
+`android/applegfx/patches/0001-iosurface-register-api.patch` adds two exported functions and one struct to
+`include/libapplegfx-vulkan.h`, implemented in `src/protocol/iosurface_api.c`. `android/applegfx/build.sh`
+applies the patch after checking out `APPLEGFX_REV`, before the cross build, so the shipped static lib and its
+installed headers carry the API. The real shape (as merged):
 
 ```c
-/* One mapped IOSurface the host device resolved: the host pointers to its guest pages, in order,
-   plus the geometry needed to build a VkImage. */
 typedef struct {
-    uint32_t mapping_id;
-    uint32_t pixel_format;    /* IOSurface/Metal pixel format (fourcc-ish, as Apple sends) */
-    uint64_t width, height;
-    uint64_t bytes_per_row;
-    uint64_t alloc_size;
-    bool     read_only;
-    void   **page_host_addrs; /* page_count host pointers, one per guest page */
-    uint64_t page_count;
-    uint64_t page_size;       /* 0x4000 on Apple silicon */
+    uint32_t          mapping_id;      /* surface_id / registry key      */
+    uint32_t          pixel_format;    /* Metal MTLPixelFormat code      */
+    uint32_t          width;           /* pixels                         */
+    uint32_t          height;          /* pixels                         */
+    uint32_t          bytes_per_row;   /* guest stride (0 => width*4)    */
+    uint64_t          alloc_size;      /* total backing bytes            */
+    const void *const *page_host_addrs;/* host VAs, page_count entries   */
+    uint32_t          page_count;      /* number of mapped pages         */
+    uint32_t          page_size;       /* bytes per page (e.g. 16384)    */
 } lagfx_iosurface_mapping_t;
 
-/* Register / unregister a host-mapped IOSurface so the renderer's CmdLookupIOSurface(mapping_id)
-   can find it. The library builds a VkImage over the page list (lavapipe/Turnip external-memory or
-   a staging copy). Returns LAGFX_OK or an error. */
-LAGFX_EXPORT lagfx_status_t lagfx_iosurface_register(lagfx_device_t *device,
-                                                     const lagfx_iosurface_mapping_t *mapping);
-LAGFX_EXPORT lagfx_status_t lagfx_iosurface_unregister(lagfx_device_t *device, uint32_t mapping_id);
+LAGFX_EXPORT lagfx_status_t lagfx_iosurface_register(
+    lagfx_device_t *device, const lagfx_iosurface_mapping_t *mapping);
+LAGFX_EXPORT lagfx_status_t lagfx_iosurface_unregister(
+    lagfx_device_t *device, uint32_t mapping_id);
 ```
 
-`applegfx_iosfc_*` already has every field above at the point of a successful `map`/`unmap`; wiring these two
-calls in is a few lines. Internally the library would route `CmdLookupIOSurface` (and the SetFragmentTextures
-auto-create path) to this registry when it is non-empty, in place of / in addition to the FIFO
-`resource_registry`. Alternatively a callback form (`desc.shell.lookup_iosurface(opaque, mapping_id) ->
-surface`) mirrors reims' pull model, but the register/unregister pair is the smaller change against the current
-header.
+Internally `register` reuses the library's own IOSurface machinery: it gathers the mapped pages into one
+contiguous upload, builds a sampleable `VkImage` via `lagfx_vk_iosurface_create` + `lagfx_vk_iosurface_upload_pixels`
+(a staging copy — no external-memory import needed), and binds it in the resource registry as a `TEXTURE` keyed
+on `mapping_id`, so the existing `lagfx_resource_lookup_texture(mapping_id)` path — the one `CmdLookupIOSurface`
+and the SetFragmentTextures auto-create walk already use — resolves it with no further change. With
+`LAGFX_HAVE_VULKAN` off the registry entry is still recorded (no image), keeping `register`/`unregister`
+symmetric. Both functions compile with and without Vulkan.
+
+`iosfc_map`/`iosfc_unmap` in `android/pvg_applegfx.c` call these at the point of a successful `map`/`unmap`:
+`map` builds the `const void *` page array from `made.pages` and calls `lagfx_iosurface_register`; `unmap` calls
+`lagfx_iosurface_unregister(mapping_id)` before freeing the slot. Host-only surfaces (no guest backing) are not
+registered. A register failure is non-fatal — the IOSFC `map` still reports success to the guest; only the
+on-screen content is missing, and that is logged.
 
 ### Still open beyond the hook
 
-- **Renderer backing of host-mapped surfaces.** Even with the hook, the library's `LAGFX_HAVE_VULKAN` IOSurface
-  path (`src/vulkan/iosurface.c`) builds a `VkImage`; feeding it externally-owned guest pages (vs. a staging
-  copy) needs external-memory import on the tablet's Turnip, or an explicit upload each frame.
+- **Staging-copy freshness.** `register` snapshots the guest pages into the `VkImage` once, at `map` time. A
+  surface the guest keeps redrawing (the wallpaper/compositor framebuffer) needs the copy refreshed — either a
+  periodic re-upload from the still-mapped pages, or external-memory import so the `VkImage` aliases the guest
+  pages directly on the tablet's Turnip instead of copying. The present code does the one-shot copy; wiring a
+  per-frame (or dirty-driven) re-register is the next step.
+- **Vulkan on-device.** The host CI build has no Vulkan, so the shipped arm64 static lib currently takes the
+  `LAGFX_HAVE_VULKAN`-off path: `register` records the mapping but builds no image. Real display needs the lib
+  cross-built against the tablet's Vulkan headers/loader (Turnip) with `LAGFX_HAVE_VULKAN` on.
 - **Mode changes.** The frame buffers are sized to the single advertised mode (1920×1080). Honour `mode_changed`
   with a realloc under `flock` once a second mode is offered.
 - **Busy semantics.** reims returns `Busy` on `unmap` while another reference holds the IOSurface; once surfaces

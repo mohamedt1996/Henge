@@ -22,6 +22,24 @@ if [ ! -d "$SRC/.git" ]; then
 fi
 git -C "$SRC" fetch -q --depth 1 origin "$REV"
 git -C "$SRC" checkout -q FETCH_HEAD
+# Henge-local patches on top of the pinned upstream rev. These add the
+# lagfx_iosurface_register/unregister entry points the MMIO-transport bridge
+# needs (upstream only accepts IOSurfaces over the in-band PCI command ring).
+# Idempotent: skip a patch that is already applied (re-run / warm $DEPS cache).
+PATCHDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/patches"
+if [ -d "$PATCHDIR" ]; then
+  for p in "$PATCHDIR"/*.patch; do
+    [ -e "$p" ] || continue
+    if git -C "$SRC" apply --check -p1 "$p" 2>/dev/null; then
+      git -C "$SRC" apply -p1 "$p"
+      echo "applegfx: applied patch $(basename "$p")"
+    elif git -C "$SRC" apply --reverse --check -p1 "$p" 2>/dev/null; then
+      echo "applegfx: patch $(basename "$p") already applied, skipping"
+    else
+      echo "applegfx: WARNING patch $(basename "$p") does not apply to $REV — skipping" >&2
+    fi
+  done
+fi
 # A Meson cross file for the engine's toolchain. Vulkan is left off (dependency('vulkan', required:false)).
 CROSS=$DEPS/aarch64.cross
 cat > "$CROSS" <<CROSSEOF

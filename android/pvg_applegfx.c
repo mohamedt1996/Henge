@@ -47,10 +47,14 @@
  *   write-back, and the per-command completion IRQ on the IOSFC GIC line. See the IOSFC block below and
  *   android/applegfx/BRIDGE.md.
  *
- * What is STILL open (see BRIDGE.md "To close it"): the library exposes no entry point to accept a surface
- *   mapped by a separate host device (no lagfx_iosfc_* API, no mapping-id -> surface registry). So mapped
- *   surfaces are fully resolved and recorded in this device's own registry, but cannot yet be handed to the
- *   renderer. BRIDGE.md specifies the minimal lagfx API addition that would close this.
+ * Renderer handoff: each successful `map` is handed to the library via lagfx_iosurface_register (and released
+ *   on `unmap` via lagfx_iosurface_unregister) — the entry point stock libapplegfx-vulkan lacked, added here as
+ *   a Henge-local patch (android/applegfx/patches/, applied by build.sh). It binds the surface as a TEXTURE
+ *   keyed on mapping_id so the library's existing CmdLookupIOSurface path resolves it. See BRIDGE.md.
+ * What is STILL open (see BRIDGE.md): the register path snapshots the guest pages once (staging copy), so a
+ *   continuously-redrawn surface needs a per-frame re-register or external-memory import; and the shipped CI lib
+ *   is built with Vulkan off, so register records the mapping without building an image until the lib is
+ *   cross-built against the tablet's Turnip with LAGFX_HAVE_VULKAN on.
  *
  * Because of that, the bridge is engaged but honest: it logs its experimental status and points at Graphics:
  * reims for the known-working GPU. Set HV_GPU_APPLEGFX_PROBE_ONLY=1 to keep the old behaviour (prove the library
@@ -94,13 +98,12 @@
  * write-back, and the per-command completion IRQ on the IOSFC GIC line. mapMemory is the trivial
  * guest-physical -> host alias into the engine's single contiguous RAM mapping (ctx.ram->host).
  *
- * The one piece that cannot be finished here: handing the resulting surface to libapplegfx-vulkan.
- * The library implements IOSurface only over its PCI-transport FIFO opcodes (0x26-0x2a, keyed by
- * (surface_id, task_id) in its resource registry) and exposes NO entry point for a mapping-id ->
- * surface handoff from a separate host device (no lagfx_iosfc_* API, no "latest IOSurface device"
- * registry, no retain_surface_with_mapping_id equivalent). So mapped surfaces are fully resolved
- * and recorded in this device's registry, but the renderer has no public hook to look them up.
- * BRIDGE.md proposes the minimal lagfx API addition. */
+ * Handing the resulting surface to libapplegfx-vulkan: stock upstream implements IOSurface only over its
+ * PCI-transport FIFO opcodes (0x26-0x2a, keyed by (surface_id, task_id) in its resource registry) and shipped
+ * NO entry point for a mapping-id -> surface handoff from a separate host device. Henge adds that entry point
+ * (lagfx_iosurface_register/unregister) as a local patch to the pinned rev; iosfc_map/iosfc_unmap below call it,
+ * and it binds each surface as a TEXTURE keyed on mapping_id so the library's own CmdLookupIOSurface path finds
+ * it. See BRIDGE.md and android/applegfx/patches/. */
 
 #define IOSFC_PAGE_SIZE    0x4000ull  /* Apple-silicon guest: 16 KiB pages */
 #define IOSFC_PAGE_SHIFT   14u
@@ -458,10 +461,42 @@ static int iosfc_map(struct applegfx_ctx *C, uint32_t mapping_id) {
     uint32_t w = iosfc_ld32(dptr);
     iosfc_st32(dptr, w | IOSFC_PTE_MAPPED);
 
-    fprintf(stderr, "hengevm: applegfx: iosfc map id=%u %llux%llu fmt=0x%x pages=%llu%s (recorded; "
-            "renderer handoff pending a lagfx hook, see BRIDGE.md)\n", mapping_id,
+    /* Hand the mapped surface to the renderer. lagfx_iosurface_register gathers the guest pages
+       into a sampleable VkImage keyed on mapping_id (the entry point this bridge added upstream;
+       see BRIDGE.md and the android/applegfx patch). Host-only surfaces have no guest backing to
+       upload, so they are left for the library's own allocation path and not registered here. A
+       register failure is non-fatal: the IOSFC map still succeeds (the guest's mapper is satisfied
+       by the mapped bit); only the on-screen content is missing, which we log. */
+    int registered = 0;
+    if (!made.host_only && made.pages && made.page_count && C->dev) {
+        const void **pv = calloc((size_t)made.page_count, sizeof(*pv));
+        if (pv) {
+            for (uint64_t i = 0; i < made.page_count; i++)
+                pv[i] = (const void *)(uintptr_t)made.pages[i];
+            lagfx_iosurface_mapping_t lm = {
+                .mapping_id    = mapping_id,
+                .pixel_format  = made.pixel_format,
+                .width         = (uint32_t)made.width,
+                .height        = (uint32_t)made.height,
+                .bytes_per_row = (uint32_t)made.bytes_per_row,
+                .alloc_size    = made.alloc_size,
+                .page_host_addrs = pv,
+                .page_count    = (uint32_t)made.page_count,
+                .page_size     = (uint32_t)IOSFC_PAGE_SIZE,
+            };
+            lagfx_status_t rst = lagfx_iosurface_register(C->dev, &lm);
+            registered = (rst == LAGFX_OK);
+            if (!registered)
+                fprintf(stderr, "hengevm: applegfx: iosfc id=%u register failed (%d); surface mapped "
+                        "but not displayable\n", mapping_id, (int)rst);
+            free(pv);
+        }
+    }
+
+    fprintf(stderr, "hengevm: applegfx: iosfc map id=%u %llux%llu fmt=0x%x pages=%llu%s%s\n", mapping_id,
             (unsigned long long)made.width, (unsigned long long)made.height, made.pixel_format,
-            (unsigned long long)made.page_count, made.host_only ? " host-only" : "");
+            (unsigned long long)made.page_count, made.host_only ? " host-only" : "",
+            registered ? " -> renderer" : (made.host_only ? "" : " (not registered)"));
     return IOSFC_IO_SUCCESS;
 }
 
@@ -473,6 +508,12 @@ static int iosfc_unmap(struct applegfx_ctx *C, uint32_t mapping_id) {
     if (mapping_id == 0 || mapping_id >= IOSFC_MAPPING_IDS) return IOSFC_IO_BAD_ARGUMENT;
     struct iosfc_surface *slot = &D->slots[mapping_id];
     if (!slot->present) return IOSFC_IO_SUCCESS;
+
+    /* Drop the renderer's backing for this id before clearing our slot. Mirrors the register in
+       iosfc_map; a no-op (NOT_FOUND) for surfaces that were never registered (host-only, or a
+       register that failed). */
+    if (!slot->host_only && C->dev)
+        lagfx_iosurface_unregister(C->dev, mapping_id);
 
     int second_form = 0, status = IOSFC_IO_SUCCESS;
     uint8_t *dptr = iosfc_descriptor_ptr(C, mapping_id, &second_form, &status);
