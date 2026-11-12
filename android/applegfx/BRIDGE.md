@@ -272,14 +272,27 @@ So the remaining work to light up pixels is an integration/packaging choice — 
 `APPLEGFX_VULKAN=1` (hence dynamic) alongside the bundled loader — not a missing capability. On-device
 confirmation (that Turnip resolves and the compositor surface renders) is the test that still needs the tablet.
 
-### Still open beyond that
+### Refresh optimizations (done)
 
-- **External-memory import.** `refresh` keeps the surface current with a per-vblank staging copy. A zero-copy
-  path — importing the guest pages as `VkDeviceMemory` so the `VkImage` aliases them directly on Turnip — would
-  drop the per-frame copy, at the cost of Android/Turnip external-memory plumbing. The staging copy is correct
-  and simple; import is an optimization.
-- **Dirty-driven refresh.** The pump re-uploads every live guest-backed surface each vblank. A dirty signal
-  (an MMIO "backing written" hint, like the PCI transport's `0x3b`) would let it skip unchanged surfaces.
+- **Dirty detection.** `lagfx_iosurface_refresh` hashes the current page contents (fast 64-bit FNV-1a) and
+  compares against the hash of the last upload, stored on the surface's resource-registry entry
+  (`refresh_hash`). When they match — the common case, a static wallpaper — it skips the whole GPU re-upload
+  (no staging buffer, no layout transition, no queue submit). The MMIO transport has no `0x3b` BackingUpdate
+  signal, so content hashing stands in for a guest dirty hint. Per vblank this costs one read of the surface
+  bytes to hash; the GPU work happens only on an actual change.
+- **Contiguous zero-gather.** When a surface's mapped pages are contiguous in host memory — the usual case,
+  since every guest page is an alias into the engine's single `mmap`'d RAM — refresh/register read them in
+  place and hand the base pointer straight to the uploader, with no intermediate gather copy. Scattered
+  surfaces still gather into one buffer. (Both behaviours unit-tested.)
+
+### Still open: true zero-copy GPU aliasing
+
+The staging upload still copies the pixels into a device-local `VkImage`. A fully zero-copy path would import
+the contiguous host range as `VkDeviceMemory` via `VK_EXT_external_memory_host` so the `VkImage` aliases the
+guest pages directly on Turnip — dropping even the staging copy. The contiguous fast path above already produces
+exactly the single host pointer that import needs, so the groundwork is in place; wiring it needs on-device
+confirmation that Turnip exposes `VK_EXT_external_memory_host` and honours the page alignment, which is tablet
+work. It is a further optimization on top of a correct, working path, not a prerequisite for pixels.
 - **Mode changes.** The frame buffers are sized to the single advertised mode (1920×1080). Honour `mode_changed`
   with a realloc under `flock` once a second mode is offered.
 - **Busy semantics.** reims returns `Busy` on `unmap` while another reference holds the IOSurface; once surfaces

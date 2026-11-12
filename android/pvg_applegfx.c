@@ -695,9 +695,10 @@ static void applegfx_iosfc_write(void *o, uint64_t off, uint64_t val, unsigned s
 /* Re-upload each live guest-backed IOSurface from its still-mapped pages so a surface the guest keeps
    redrawing (the compositor / wallpaper framebuffer) tracks those writes on screen. lagfx_iosurface_register
    snapshots the pages once at map time; this is the per-vblank refresh. The guest-RAM mapping is fixed, so the
-   page host pointers captured at map time stay valid — only their contents change — and refresh re-uploads into
-   the existing VkImage (no recreate). Held under D->lock so a concurrent unmap can't free s->pages mid-upload.
-   Set HV_GPU_APPLEGFX_NO_REFRESH=1 to disable (debug / measure). */
+   page host pointers captured at map time stay valid — only their contents change. lagfx_iosurface_refresh
+   content-hashes the pages and only re-uploads to the GPU when they actually changed (dirty detection), and
+   reads contiguous surfaces in place (no gather copy), so an unchanged frame costs just the hash read. Held
+   under D->lock so a concurrent unmap can't free s->pages mid-upload. HV_GPU_APPLEGFX_NO_REFRESH=1 disables. */
 static void iosfc_refresh_surfaces(struct applegfx_ctx *C) {
     static int disabled = -1;
     if (disabled < 0) disabled = getenv("HV_GPU_APPLEGFX_NO_REFRESH") ? 1 : 0;
