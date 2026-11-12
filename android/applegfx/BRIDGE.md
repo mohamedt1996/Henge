@@ -78,36 +78,169 @@ which routed `vector != 0` to `iosfc_irq`.)*
   publishes it through `hv_pvg_applegfx_frame()`, which `hv_vm_boot_display()` presents exactly like
   `hv_pvg_lite_frame()`.
 
-## What is NOT resolved — the IOSFC window (the real blocker)
+## The IOSFC window — `PGIOSurfaceHostDevice` (now modelled)
 
 The IOSFC window is a **second Apple device**, `PGIOSurfaceHostDevice`, that exists only in the MMIO/ARM
-transport. `libapplegfx-vulkan` does not implement it and exposes no entry point for it: there is no
-`lagfx_iosfc_mmio_read/write`, and its `mmioReadAtOffset`/`mmioWriteAtOffset` register layout is not
-reverse-engineered anywhere in the library.
+transport. `apple-gfx-mmio.m` sets `desc.usingIOSurfaceMapper = true`, which tells the guest/framework to route
+IOSurface sharing through this device — **not** through the FIFO `0x26`–`0x2a` opcodes the library implements for
+the PCI transport (where `usingIOSurfaceMapper` is false). On Apple silicon, WindowServer composites almost
+entirely out of IOSurfaces, so without this device the renderer has no surface backing even when the GFX command
+ring runs perfectly.
 
-Why this matters: `apple-gfx-mmio.m` sets `desc.usingIOSurfaceMapper = true`, which tells the guest/framework to
-route IOSurface sharing through this device's `mapMemory(phys, len, ro, &va)` callback — **not** through the FIFO
-`0x26`–`0x2a` opcodes the library implements for the PCI transport (where `usingIOSurfaceMapper` is false). On
-Apple silicon, WindowServer composites almost entirely out of IOSurfaces, so without a working IOSurface host
-device the renderer has no surface backing even when the GFX command ring runs perfectly.
+`libapplegfx-vulkan` does not implement it, and its MMIO register layout is not reverse-engineered anywhere in
+the library. It **is** implemented and documented, byte for byte, in
+[`steelbrain/reims-vgpu`](https://github.com/steelbrain/reims-vgpu) — the SAME vmapple apple-gfx-MMIO variant,
+including the IOSurface device, and it works. The protocol below is reconstructed from that module (the ground
+truth) and cross-checked against QEMU's `hw/display/apple-gfx-mmio.m`. `android/pvg_applegfx.c` now models the
+device end to end from this; what remains open is only the hand-off of a mapped surface to the renderer (below).
 
-The bridge therefore answers the IOSFC window with a logging stub (`applegfx_iosfc_read/write`: reads return 0,
-writes are swallowed, first 16 accesses logged). The gfx device will initialise and the ring will drain, but
-frames are unlikely until the IOSurface host device is built.
+Sources (reims commit pinned in `android/gpu/reims/build.sh`,
+`crates/reims-vgpu-core/src/iosurface/`): `regs.rs` (registers), `ring.rs` (command ring), `table.rs`
+(map/unmap/test), `walk.rs` (page-table walk), `descriptor.rs` (descriptor formats),
+`device.rs` (device lifecycle + the surface lookup), and the C host shell `crates/reims-vgpu-c/src/iosurface.rs`.
 
-### To close it (future work)
+### The register file (`regs.rs`)
 
-1. **RE the PGIOSurfaceHostDevice MMIO protocol.** Capture `offset`/`value` from the stub's logs during a macOS
-   boot, or disassemble the guest `AppleParavirtGPU` kext's IOSFC path. Map registers to: ring/doorbell geometry,
-   a `mapMemory(phys,len,ro)` request/response, and the completion IRQ on `irq_iosfc`.
-2. **Add a library API** (`lagfx_iosfc_mmio_read/write`, or a second `lagfx_iosurface_host_t`) that owns the
-   mapper, or implement the device entirely in this glue backed by the engine's RAM (`ctx.ram->host`) — the
-   mapping itself is trivial here (guest-physical → `ram->host + (gpa - ram->pa)`), mirroring
-   `apple_gfx_mmio_map_surface_memory` in QEMU. The hard part is the register/command protocol, not the mapping.
-3. **Route completions** to `iosfc_irq` (already threaded through `applegfx_raise_interrupt`'s sibling path /
-   `ctx.iosfc_irq`).
-4. **Mode changes**: the frame buffers are sized to the single advertised mode (1920×1080). Honour
-   `mode_changed` with a realloc under `flock` once a second mode is offered.
+Six writable 64-bit registers plus a read-only features register, at MMIO offsets `0x1000`+. (reims notes QEMU's
+shell declares them 32-bit, so a narrow access truncates on read / zero-extends on write; the guest's mapper uses
+64-bit accesses. The Henge model serves a narrow access against the containing 8-byte register.) An offset naming
+no register reads **all ones** and ignores writes.
+
+```
+0x1000 RING_BASE        ring guest-physical base; a write unmaps the ring and keeps the size
+0x1008 RING_SIZE        ring length in COMMANDS; needs a base; maps the ring (size * 16 bytes)
+0x1010 DESCRIPTOR_BASE  descriptor-table guest-physical base; a write tears down every surface,
+                        drops the table and maps one guest page of table there
+0x1018 RING_WR_COUNTER  the ring write counter; a write is the DOORBELL (drains the ring)
+0x1020 RING_RD_COUNTER  the ring read counter; writable only while no ring is mapped
+0x1028 FEATURES         read-only: bit 0 = the second descriptor form is offered
+0x1030 DESC_ENABLE      descriptor form select: bit 0 = second form (else first)
+```
+
+`FEATURES` bit 0 is offered when one page of descriptor table reaches every mapping id: on 16 KiB pages
+(Apple silicon) a table page holds 4096 entries × 16 second-form descriptors/page = 65536 ≥ 8192, so it is
+offered; on 4 KiB pages it is not (the guest then uses the first form). `DESC_ENABLE` also sets the
+descriptors-per-page (`PAGE / 0x200` first form, `PAGE / 0x400` second) and, like a `DESCRIPTOR_BASE` write,
+tears the surfaces down and drops the table.
+
+### The command ring (`ring.rs`)
+
+The ring is an array of 16-byte commands at `RING_BASE`, `RING_SIZE` of them. One command:
+
+```
++0x00 u32 command      1 = map, 2 = unmap, 3 = test; anything else = Unsupported
++0x04 u32 mapping_id   the surface id, 1..8192
++0x08 i32 status       the host writes the IOReturn back here
++0x0c u32 (unused)
+```
+
+The doorbell (a write to `RING_WR_COUNTER`) drains the ring: for each command from `RING_RD_COUNTER` up to
+`RING_WR_COUNTER`, read the slot at `RING_BASE + (rd % size) * 16`, run it, write the IOReturn into the slot's
+status word, bump `RING_RD_COUNTER`, and **raise the IOSFC interrupt** (one per command). A doorbell with no ring
+or no descriptor table mapped runs nothing. IOReturn codes written back:
+
+```
+Success 0   NoMemory 0xe00002bd   BadArgument 0xe00002c2   Unsupported 0xe00002c7   Busy 0xe00002d5
+```
+
+### `map` — descriptor read + page walk (`table.rs`, `descriptor.rs`, `walk.rs`)
+
+`map(id)` makes the IOSurface that mapping id's descriptor describes, keyed by id:
+
+1. **Find the descriptor.** The descriptor table is one page of 4-byte entries at `DESCRIPTOR_BASE`.
+   `page_index = id / descriptors_per_page` selects a table entry → a **descriptor page** (guest-physical);
+   `within = id % descriptors_per_page` selects the descriptor in it. The descriptor is `0x200` bytes (first
+   form) or `0x400` bytes (second form).
+2. **Decode it.** The descriptor's first word is a page-table entry `{ valid:1, (isTable|mapped):1,
+   pageNumber:30 }`; its `pageNumber << page_shift` roots the surface's own page table. The base descriptor also
+   carries `pixel_format`, `offset`, `alloc_size`, `width`/`height`, `bytes_per_row`, `plane_count`, and flag
+   bits `readOnly` and (second form) `hostOnly`. A first-form descriptor is widened to the second form's fields
+   (reims `upgrade_descriptor`); it is never host-only.
+3. **Walk the pages.** `page_count = ceil(alloc_size / PAGE)`. The root page table is one or two levels: with at
+   most one page of entries (`PAGE/4`), the root entries name the surface's pages directly; beyond that, each
+   root entry names a second-level table of up to one page of page entries. Each entry must be `valid` and, at
+   the leaf, not a table; its `pageNumber << page_shift` is the guest-physical page, aliased to a host pointer.
+   A bad root/leaf entry is BadArgument; an unreachable page is NoMemory. A `hostOnly` surface lists no guest
+   pages (a real host allocates its backing).
+4. **Record + mark mapped.** The resolved host page list and geometry are stored in the device's slot for `id`,
+   and the guest descriptor's `mapped` bit (bit 1 of the first word) is set so the guest's mapper sees it live.
+
+`unmap(id)` clears the descriptor's `mapped` bit and releases the slot (reims refuses it **Busy** while any
+other reference holds the IOSurface; this model tracks no external holders, so it always releases). `test(id)`
+writes each 8-byte word of the surface's allocation with its own byte offset — a self-test the guest reads back.
+
+### Interrupts
+
+`apple-gfx-mmio.m` gives the `PGIOSurfaceHostDevice` descriptor its **own** `raiseInterrupt` block, which pulses
+`irq_iosfc` — distinct from the GFX device's `irq_gfx`. reims raises interrupt 0 through that block once per ring
+command. The Henge model pulses `ctx.iosfc_irq` (via `hv_gicv3_pend`, edge, waking a 1-CPU guest) per command.
+
+### How a mapped surface reaches the renderer (`device.rs`) — and the library gap
+
+In reims the two devices are **not** wired by an explicit host call. The IOSurface host device registers itself
+process-globally as the "latest device"; the graphics device's mapper service then calls
+`retain_surface_with_mapping_id(id)` on it to resolve an IOSurface by mapping id (reims
+`IoSurfaceHostDevice::latest_core` + `HostDeviceCore::retain_surface_with_mapping_id`). `usingIOSurfaceMapper =
+true` is exactly what tells the graphics side to resolve IOSurfaces this way instead of over the FIFO.
+
+**`libapplegfx-vulkan` has no equivalent.** Its IOSurface support is entirely the PCI-transport FIFO opcodes
+`0x26`–`0x2a` (`src/handlers/iosurface/iosurface.c`: `CmdCreate/Delete/Lookup/Import/UnmapIOSurfaceBacking2`),
+keyed by `(surface_id, task_id)` in `src/protocol/resource_registry.c`. There is:
+
+- no `PGIOSurfaceHostDevice` and no second MMIO device;
+- no `lagfx_iosfc_mmio_read/write` or `lagfx_iosurface_host_t` in `include/libapplegfx-vulkan.h`;
+- no process-global "latest IOSurface device" registry;
+- no `retain_surface_with_mapping_id` / mapping-id → surface entry point the renderer could call.
+
+So this bridge can — and now does — resolve every `map` to a concrete host surface (host page pointers +
+geometry) and record it, but it **cannot hand that surface to the renderer**: the library offers no public hook
+to inject a host-mapped surface and have `CmdLookupIOSurface` find it. This is the remaining blocker, and it is a
+**library gap, not an RE gap**.
+
+### Proposed minimal lagfx API addition
+
+The smallest additions that would let the renderer consume these surfaces (keyed by mapping id, matching
+Apple/reims):
+
+```c
+/* One mapped IOSurface the host device resolved: the host pointers to its guest pages, in order,
+   plus the geometry needed to build a VkImage. */
+typedef struct {
+    uint32_t mapping_id;
+    uint32_t pixel_format;    /* IOSurface/Metal pixel format (fourcc-ish, as Apple sends) */
+    uint64_t width, height;
+    uint64_t bytes_per_row;
+    uint64_t alloc_size;
+    bool     read_only;
+    void   **page_host_addrs; /* page_count host pointers, one per guest page */
+    uint64_t page_count;
+    uint64_t page_size;       /* 0x4000 on Apple silicon */
+} lagfx_iosurface_mapping_t;
+
+/* Register / unregister a host-mapped IOSurface so the renderer's CmdLookupIOSurface(mapping_id)
+   can find it. The library builds a VkImage over the page list (lavapipe/Turnip external-memory or
+   a staging copy). Returns LAGFX_OK or an error. */
+LAGFX_EXPORT lagfx_status_t lagfx_iosurface_register(lagfx_device_t *device,
+                                                     const lagfx_iosurface_mapping_t *mapping);
+LAGFX_EXPORT lagfx_status_t lagfx_iosurface_unregister(lagfx_device_t *device, uint32_t mapping_id);
+```
+
+`applegfx_iosfc_*` already has every field above at the point of a successful `map`/`unmap`; wiring these two
+calls in is a few lines. Internally the library would route `CmdLookupIOSurface` (and the SetFragmentTextures
+auto-create path) to this registry when it is non-empty, in place of / in addition to the FIFO
+`resource_registry`. Alternatively a callback form (`desc.shell.lookup_iosurface(opaque, mapping_id) ->
+surface`) mirrors reims' pull model, but the register/unregister pair is the smaller change against the current
+header.
+
+### Still open beyond the hook
+
+- **Renderer backing of host-mapped surfaces.** Even with the hook, the library's `LAGFX_HAVE_VULKAN` IOSurface
+  path (`src/vulkan/iosurface.c`) builds a `VkImage`; feeding it externally-owned guest pages (vs. a staging
+  copy) needs external-memory import on the tablet's Turnip, or an explicit upload each frame.
+- **Mode changes.** The frame buffers are sized to the single advertised mode (1920×1080). Honour `mode_changed`
+  with a realloc under `flock` once a second mode is offered.
+- **Busy semantics.** reims returns `Busy` on `unmap` while another reference holds the IOSurface; once surfaces
+  are shared with the renderer, this model should track holders and do the same.
 
 ## Safety / how to drive it
 
