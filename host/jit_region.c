@@ -132,5 +132,23 @@ uint32_t *hv_jit_reserve(HvJitRegion *region, size_t words) {
 }
 
 void hv_jit_reset(HvJitRegion *region) {
+#ifdef __linux__
+    /* Android/Linux: give the code just dropped back to the kernel. The region is a memfd mapped twice
+       (open_split), so without this every page ever written stays resident for the rest of the run, the whole
+       cache after its first fill, though nothing can run it again: under memory pressure Android compresses that
+       dead code into swap, and the next fill has to bring each page back just to overwrite it. Every other CPU
+       is parked at the dispatcher when this runs (stop_the_world), so nothing holds an address in it; the pages
+       come back as zeros, filled as blocks are written. HV_JIT_KEEP=1 keeps the pages, as before. */
+    static int keep = -1;
+    if (keep < 0) keep = getenv("HV_JIT_KEEP") != NULL;
+    if (!keep && region->owned && region->rw_diff && region->base) {
+        size_t used = region->used < region->capacity ? region->used : region->capacity; /* reserve counts past the end when full */
+        size_t pg = (size_t)sysconf(_SC_PAGESIZE), bytes = (used * sizeof(uint32_t) + pg - 1) & ~(pg - 1);
+        size_t whole = region->capacity * sizeof(uint32_t) & ~(pg - 1);
+        if (bytes > whole) bytes = whole;
+        /* Through the writable alias: MADV_REMOVE punches the file, which unmaps the pages from both. */
+        if (bytes && madvise((uint8_t *)region->base + region->rw_diff, bytes, MADV_REMOVE) == 0) region->released += bytes;
+    }
+#endif
     region->used = 0;
 }

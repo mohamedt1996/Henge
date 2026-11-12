@@ -282,6 +282,30 @@ static uint64_t tick(HvMachine *m, HvCpu *cpu) {
     return deadline;
 }
 
+#ifdef __linux__
+/* HV_RAM_THP=2: touch the guest's RAM in order, 32 MB at a call, so the kernel hands out its huge pages while
+   memory still has them (hv_vmapple_create). MADV_POPULATE_WRITE (Linux 5.14) takes the pages as a write
+   fault would and changes no byte; a kernel without it ends the walk at the first call. */
+static void *ram_populate(void *arg) {
+    struct { uint8_t *at; uint64_t size; } *all = arg;
+    const uint64_t step = 32ull << 20;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    uint64_t done = 0;
+    for (; done < all->size; done += step) {
+        uint64_t n = all->size - done < step ? all->size - done : step;
+        if (madvise(all->at + done, n, 23 /* MADV_POPULATE_WRITE */) != 0) {
+            fprintf(stderr, "hengevm: guest RAM touched ahead: stopped at %llu MB (%s)\n", (unsigned long long)(done >> 20), strerror(errno));
+            return NULL;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    fprintf(stderr, "hengevm: guest RAM touched ahead: %llu MB in %.1f s (the heartbeat's \"MB in huge pages\" says how much of it is huge)\n",
+            (unsigned long long)(done >> 20), (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
+    return NULL;
+}
+#endif
+
 int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size, HvDisk *root, HvDisk *aux,
                       const HvCfgParams *cfg, const uint8_t mac[6]) {
     memset(b, 0, sizeof *b);
@@ -332,9 +356,26 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
             /* HV_RAM_THP (Android, Settings > Huge pages; the app sets the kernel's shmem huge pages to
                `advise` with root): 2 MB pages for the Mac's RAM, so the JIT's loads and stores miss the host's
                TLB less. Not on Gunyah, which takes its own memory and resets the tablet on huge pages. */
-            if (getenv("HV_RAM_THP"))
+            if (getenv("HV_RAM_THP")) {
                 fprintf(stderr, "hengevm: guest RAM asked for in huge pages: %s\n",
                         madvise(b->ram, ram_size, MADV_HUGEPAGE) == 0 ? "the kernel took the request" : strerror(errno));
+                /* HV_RAM_THP=2 (Settings > Huge pages: Eager): the kernel gives a huge page only where 2 MB of
+                   memory lie free together when the page is first touched, and a tablet's memory is cut up
+                   more the longer the Mac runs (the tablet, 2026-11-12: 84 MB of 4096 in huge pages). So the
+                   RAM is touched now, in order, by a thread of its own while the Mac boots: the same memory
+                   the boot takes anyway, taken while whole 2 MB runs are still to be had. */
+                if (atoi(getenv("HV_RAM_THP")) >= 2) {
+                    static struct { uint8_t *at; uint64_t size; } all;
+                    all.at = b->ram, all.size = ram_size;
+                    pthread_t t;
+                    pthread_attr_t a;
+                    pthread_attr_init(&a);
+                    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+                    if (pthread_create(&t, &a, ram_populate, &all) != 0)
+                        fprintf(stderr, "hengevm: guest RAM is not touched ahead: no thread (%s)\n", strerror(errno));
+                    pthread_attr_destroy(&a);
+                }
+            }
         } else {
             fprintf(stderr, "hengevm: guest RAM in memory failed (%s); a file instead\n", strerror(errno));
             if (fd >= 0) close(fd);

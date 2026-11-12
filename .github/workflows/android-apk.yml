@@ -132,6 +132,34 @@ jobs:
           cp "$so" ../android/apk/app/src/main/jniLibs/arm64-v8a/libvulkan_freedreno.so
           echo "turnip: $so -> libvulkan_freedreno.so ($(stat -c %s "$so") bytes)"
 
+      # Graphics: reims, Zero-copy: Henge's own build of Turnip, the stock one's source with its KGSL import of a
+      # dma-buf made I/O-coherent (android/gpu/turnip/): the driver the app lets use the Mac's memory in place.
+      # Bundled beside the stock driver, which stays the fallback; a failure here leaves the APK with the stock
+      # one alone, and the app copies as before. Built once per change of android/gpu/turnip/ (cached).
+      - name: Cache Henge's Turnip
+        uses: actions/cache@v4
+        with:
+          path: ~/turnip-henge
+          key: turnip-henge-${{ hashFiles('android/gpu/turnip/build.sh', 'android/gpu/turnip/kgsl_coherent_import.py') }}
+
+      - name: "Henge's Turnip: dma-buf imports I/O-coherent (Graphics: reims, Zero-copy)"
+        continue-on-error: true
+        env:
+          TURNIP_WORK: /home/runner/turnip-henge-work
+        run: |
+          set -eu
+          if [ ! -s ~/turnip-henge/libvulkan_freedreno.so ]; then
+            sudo apt-get install -y -q glslang-tools || true
+            android/gpu/turnip/build.sh ~/turnip-henge
+          fi
+          so=~/turnip-henge/libvulkan_freedreno.so
+          file "$so"; readelf -d "$so" | grep NEEDED || true
+          readelf -W --dyn-syms "$so" | awk '$7 != "UND" {print $8}' | grep -q -x -e HMI -e vk_icdGetInstanceProcAddr \
+            || { echo "::warning::Henge's Turnip exports neither HMI nor vk_icdGetInstanceProcAddr; left out"; exit 1; }
+          grep -q -a TU_KGSL_IMPORT_COHERENT "$so" || { echo "::warning::Henge's Turnip lacks the coherent import; left out"; exit 1; }
+          cp "$so" android/apk/app/src/main/jniLibs/arm64-v8a/libvulkan_freedreno_henge.so
+          echo "turnip (Henge's): $(stat -c %s "$so") bytes -> libvulkan_freedreno_henge.so"
+
       - name: Turnip is in the APK's libraries
         run: ls -la android/apk/app/src/main/jniLibs/arm64-v8a/ && test -s android/apk/app/src/main/jniLibs/arm64-v8a/libvulkan_freedreno.so
 

@@ -21,7 +21,9 @@ are copied in at the commit of the first command buffer that uses it, before any
 buffer's work is submitted, which is what the GPU's reads need.
 
 `M2V_COPY_IN_ALL` (any value) restores the comparison of every copy. Every 10 s of commits a line
-says what the copies in cost: `metal2vulkan: copied host buffers: ...`.
+says what the copies in cost: `metal2vulkan: copied host buffers: ...`; and (0.3.52) every 10 s of
+completions another says what the merges back cost: `... N completions compared X MiB and wrote Y
+MiB of the GPU's changes back to the Mac's pages, in Z ms`.
 
 Each edit must match exactly once, so a changed upstream stops the build.
 
@@ -100,6 +102,63 @@ EDITS = {
                     compared >> 20,
                     unused >> 20,
                     nanos / 1_000_000,
+                );
+            }
+        }
+    }
+"""),
+    ],
+    'crates/metal2vulkan-runtime/src/copied.rs#merges': [
+        # What the merges back cost (0.3.52): the other half of a copy's upkeep, which no line showed.
+        ("""        let owed = self.owed.swap(false, Ordering::AcqRel);
+        let (mut moved, mut dropped) = (0u64, 0u64);
+""", """        let owed = self.owed.swap(false, Ordering::AcqRel);
+        let (mut moved, mut dropped) = (0u64, 0u64);
+        // Henge's Android port (m2v_copy_in_used.py): what the merges back cost, every 10 s.
+        let henge_began = std::time::Instant::now();
+        let mut henge_compared = 0u64;
+"""),
+        ("""            compared += 1;
+            let (copy, pages) = (entry.copy, entry.pages);
+""", """            compared += 1;
+            henge_compared += entry.snapshot.len() as u64;
+            let (copy, pages) = (entry.copy, entry.pages);
+"""),
+        ("""        counts.copied_merges(compared, skipped);
+    }
+""", """        counts.copied_merges(compared, skipped);
+        // Henge's Android port (m2v_copy_in_used.py): a line every 10 s of completions that compared
+        // a copy: how many did, the bytes compared, the bytes the GPU changed that went back to the
+        // pages (or were dropped), and the time, the reports to the pages' logs included.
+        if compared > 0 {
+            static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            static TURNS: AtomicU64 = AtomicU64::new(0);
+            static NANOS: AtomicU64 = AtomicU64::new(0);
+            static COMPARED: AtomicU64 = AtomicU64::new(0);
+            static WROTE: AtomicU64 = AtomicU64::new(0);
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            let start = *START.get_or_init(std::time::Instant::now);
+            TURNS.fetch_add(1, Ordering::Relaxed);
+            NANOS.fetch_add(
+                u64::try_from(henge_began.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            COMPARED.fetch_add(henge_compared, Ordering::Relaxed);
+            WROTE.fetch_add(moved + dropped, Ordering::Relaxed);
+            let now = start.elapsed().as_secs();
+            let said = SAID.load(Ordering::Relaxed);
+            if now >= said + 10
+                && SAID
+                    .compare_exchange(said, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                eprintln!(
+                    "metal2vulkan: copied host buffers: {} completions compared {} MiB and wrote {} MiB \\
+                     of the GPU's changes back to the Mac's pages, in {} ms",
+                    TURNS.swap(0, Ordering::Relaxed),
+                    COMPARED.swap(0, Ordering::Relaxed) >> 20,
+                    WROTE.swap(0, Ordering::Relaxed) >> 20,
+                    NANOS.swap(0, Ordering::Relaxed) / 1_000_000,
                 );
             }
         }
@@ -185,7 +244,7 @@ def main() -> None:
     root = pathlib.Path(sys.argv[1])
     changed = 0
     for rel, edits in EDITS.items():
-        path = root / rel
+        path = root / rel.split('#')[0] # a file's second group of edits is keyed 'path#name'
         text = path.read_text()
         for old, new in edits:
             if new in text:

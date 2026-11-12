@@ -343,6 +343,88 @@ by confirming both map.rs anchors match exactly once. Not yet exercised on the t
 clears the crash for good still needs the on-device boot, but no mapping call site can now reach the
 fatal length check.
 
+0.3.50 on the tablet (2026-11-12, build 55; Zero-copy on, the udmabuf kernel): the first run on Turnip with
+`/dev/udmabuf` open. `dma-bufs of host pages: imported, images over them: true`, two frames, then the first
+IOSurface texture ended the app: `newTextureWithDescriptor:iosurface:plane:: the Vulkan runtime refused it:
+invalid use of new_buffer_with_descriptor: DmaBuf`. The next start marked Turnip as crashed and ran on
+Qualcomm's driver, on copies: up to 13 GiB compared in 4.1 s of a 10 s window at 25 frames a second, the
+1280x800 RGBA16Float framebuffer a shadowed texture, its pass split in two. The tablet in that run: 590 to
+1160 MB of memory available, 4 to 5.6 GB of 6.1 GB of swap used, the hottest sensor 93 to 101 C, the fastest
+core held to 2.2 of 2.8 GHz, the JIT cache filled and dropped four times in 330 s.
+
+0.3.52, from that log. Read from the pinned sources, not guessed:
+
+- **Why Turnip died** (`m2v_dma_buf_checks.py`). `Problem::DmaBuf` has one site in metal2vulkan,
+  `Device::import_from_source`: the dma-bufs reims-vgpu's source made failed `answers`, the runtime's check
+  of its source's contract, which it treats as misuse and reims-vgpu as the app's death. `answers` is the
+  chunks' lengths against the request (`chunks_cover`, which one chunk of the request's own length passes
+  by construction: what reims-vgpu makes of a 0x7d0000-byte surface within udmabuf's raised limits) and,
+  for each descriptor, "is a dma-buf of at least its chunk's length": `fstatfs` must succeed and name the
+  dma-buf file system. On Android that call is a `getattr` on a superblock with no SELinux label of its own
+  (there is no genfscon for `dmabuf`), which an app's domain is not given: EACCES, so a descriptor udmabuf
+  just made is "no dma-buf". That is the likeliest cause; the log could not show it. Now a descriptor is a
+  dma-buf where `fstatfs` says so or where the kernel names its file `/dmabuf:` (`/proc/self/fd`) or its
+  fdinfo has a dma-buf's `exp_name:`; and an answer that still fails the check is logged in full (the
+  request, the chunks, each descriptor's size, file system or `fstatfs` error, and name) and becomes a copy
+  of the pages, as on a driver that imports no dma-bufs. Nothing in that path ends the app any more.
+- **Why the import must not simply be let through** (`android/gpu/turnip/`). metal2vulkan never flushes or
+  invalidates around a dma-buf import: "the CPU's writes through it and the GPU's through the imports meet
+  in the same pages with no flush or invalidate (the types are host-coherent)". That holds on the desktop
+  GPUs it was measured on. Turnip's own cached allocations on KGSL hold it too: they are asked for with
+  `KGSL_MEMFLAGS_IOCOHERENT`. Its *import* of a dma-buf does not: `kgsl_bo_init_dmabuf` passes `.flags = 0`,
+  which KGSL takes as write-combined and never I/O-coherent, and Turnip's own comment on imports says it
+  has "no way of handling" a producer's cached memory. The Mac's RAM is exactly that: written by the JIT
+  through cached mappings. In place on the stock driver, the GPU would read main memory while what the Mac
+  just drew sits in a CPU cache: stale blocks in every CPU-drawn window. Cleaning the caches by hand at each
+  commit would need each import's uses known there and time per byte at every commit (not measured). So
+  Henge builds its own Turnip: the stock
+  release's source (whitebelyash/mesa-unified, `turnip/gen8`, pinned) with one change,
+  `kgsl_coherent_import.py`: with `TU_KGSL_IMPORT_COHERENT` set an import asks KGSL for
+  `IOCOHERENT` and the write-back cache mode, reads back the flags KGSL kept (`IOCTL_KGSL_GPUOBJ_INFO`), and
+  under `=require` refuses an import that was not kept coherent with `VK_ERROR_INVALID_EXTERNAL_HANDLE`,
+  which metal2vulkan answers with a copy. The CI builds it (three minutes, cached) into the APK as
+  `libvulkan_freedreno_henge.so` beside the stock driver.
+- **Who decides** (`host.c`'s `in_place_policy`, `m2v_no_host_import.py`). metal2vulkan's dma-buf route is
+  on only with `M2V_DMABUF_INPLACE=1`, which the app sets only for a driver file that carries the string
+  `TU_KGSL_IMPORT_COHERENT` (Henge's build), together with `TU_KGSL_IMPORT_COHERENT=require`. On the stock
+  Turnip and on Qualcomm's driver the route is off and everything is a copy, as before 0.3.37. Settings,
+  *Mac's memory in place*: Auto, Off (`in-place-off`), Force (`in-place-force`: in place on a driver not
+  known to be coherent, to see what it does). The log's lines, in order: `reims: the Mac's memory in
+  place: ...`, `metal2vulkan: no VK_EXT_external_memory_host; dma-bufs of host pages: ...`, and at the
+  first import `turnip: dma-buf imports: KGSL keeps them I/O-coherent ... (flags ...)`.
+- **Which driver runs** (`VmService`). Henge's Turnip first; if it takes a build of the app down, the stock
+  Turnip (on copies); if that does, Qualcomm's. Settings, *Turnip build*: Henge's or Stock. And a death
+  Android records as its own doing (low memory, the user, an update; a SIGKILL where the low-memory killer
+  is reported as a signal) no longer counts against the GPU: before, any kill of the app during a reims run
+  marked Turnip as crashed for the build, or sent the next run to Graphics: GPU.
+- **The JIT cache** (`host/jit_region.c`). A full flush set `used = 0` and kept every page: after the first
+  fill the engine held all 768 MB for good, whatever the heartbeat's "MB" said, and Android compressed dead
+  code into swap that the next fill had to bring back to overwrite. `hv_jit_reset` now gives the pages
+  back (`MADV_REMOVE` through the writable alias of the memfd, which unmaps both mappings); every other CPU
+  is parked at the dispatcher then, so nothing holds an address in it. Measured on Linux: 64 MB resident
+  to 0 at each reset, refilled and run again (`tests/test_jit_region.c`). The heartbeat says `N MB in use
+  (M MB given back at flushes)`. `HV_JIT_KEEP=1` keeps the pages. Settings, *JIT cache*: 768 (as before),
+  512, 384, 256 MB (`--jit-mb`).
+- **Huge pages** (`devices/vmapple.c`). 84 MB of the Mac's 4096 were in huge pages in that run: the kernel
+  gives one only where 2 MB lie free together at the first touch. Settings, *Huge pages: Eager*
+  (`HV_RAM_THP=2`): a thread touches the RAM in order as the Mac starts (`MADV_POPULATE_WRITE`), the same
+  memory the boot takes anyway, while whole runs are still to be had. The app's mapping of the RAM asks for
+  huge pages too.
+
+None of the GPU part has run on the tablet. What the first run's log decides, in order: whether
+`metal2vulkan: ...: the dma-bufs made of ... do not answer the request` still appears (then its text says
+which half of the check, and the pages are copies); whether Turnip's line says KGSL keeps imports
+I/O-coherent (if not, copies again, by design); and with both good, whether the `copied host buffers` line's
+"MiB live" and "compared" fall to what is left outside the Mac's own pages.
+
+What was looked at and left: a log of the JIT's writes as metal2vulkan's dirty source (its source is KVM's
+ioctls, read by the device itself: not a callback a JIT can answer); the scheduler floor reims-vgpu's FIFO
+threads ask for (`sched_setattr` is refused an app; the app's process is already in `top-app`); the
+comparison's own speed. The other half of a copy's upkeep, the merge back of the GPU's writes at each
+completion, had no line at all: `m2v_copy_in_used.py` now prints one every 10 s (`N completions compared X
+MiB and wrote Y MiB of the GPU's changes back to the Mac's pages, in Z ms`), so the next log on copies says
+whether it is worth working on (its changed blocks are merged eight bytes at a time).
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

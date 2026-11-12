@@ -561,6 +561,18 @@ public class MainActivity extends Activity {
                         + "the app works around each, less exactly.", 13, DIM, false);
             dnote.setPadding(dp(17), 0, dp(17), dp(12));
             c.addView(dnote);
+            if ("turnip".equals(reimsDriver()) && GpuView.turnipHenge(this) != null) {
+                c.addView(hairline());
+                c.addView(choiceRow("Turnip build", new String[]{"Henge's", "Stock"}, "stock".equals(prefs.getString("turnipBuild", "henge")) ? 1 : 0,
+                        i -> { prefs.edit().putString("turnipBuild", i == 1 ? "stock" : "henge").apply(); render(true); }));
+                TextView bnote = text("stock".equals(prefs.getString("turnipBuild", "henge"))
+                        ? "The Turnip release as it is published. It cannot share memory with the Mac safely, so the GPU works on copies."
+                        : "The same Turnip with one change of Henge's: memory it is handed by the Mac is shared with the CPU properly "
+                            + "(I/O-coherent), so with Zero-copy on the GPU draws from and into the Mac's own memory. If it does not "
+                            + "start, the stock one is used.", 13, DIM, false);
+                bnote.setPadding(dp(17), 0, dp(17), dp(12));
+                c.addView(bnote);
+            }
         }
         c.addView(hairline());
         c.addView(choiceRow("Touch", new String[]{"Direct", "Trackpad"}, "trackpad".equals(prefs.getString("touch", "direct")) ? 1 : 0,
@@ -609,17 +621,55 @@ public class MainActivity extends Activity {
         if (new java.io.File("/dev/udmabuf").exists()) {
             c.addView(choiceRow("Zero-copy", new String[]{"Off", "On"}, "on".equals(prefs.getString("zerocopy", "off")) ? 1 : 0,
                     i -> { prefs.edit().putString("zerocopy", i == 1 ? "on" : "off").apply(); render(true); }));
-            TextView znote = text("Needs root and Graphics: reims. The GPU side reaches the Mac's memory through /dev/udmabuf; with the "
-                    + "Turnip driver the Mac's buffers are used in place, not copied. Experimental. Close Henge from recents and "
-                    + "open it again after changing this.", 13, DIM, false);
+            TextView znote = text("Needs root and Graphics: reims. The GPU side reaches the Mac's memory through /dev/udmabuf; with "
+                    + "Henge's build of the Turnip driver the Mac's buffers are used in place, not copied. Experimental. Close Henge "
+                    + "from recents and open it again after changing this.", 13, DIM, false);
             znote.setPadding(dp(17), 0, dp(17), dp(12));
             c.addView(znote);
             c.addView(hairline());
+            if ("on".equals(prefs.getString("zerocopy", "off")) && "reims".equals(prefs.getString("gpu", "on"))) {
+                final java.io.File inOff = new java.io.File(VmService.reimsHomeDir(this), "in-place-off");
+                final java.io.File inForce = new java.io.File(VmService.reimsHomeDir(this), "in-place-force");
+                c.addView(choiceRow("Mac's memory in place", new String[]{"Auto", "Off", "Force"}, inOff.exists() ? 1 : inForce.exists() ? 2 : 0,
+                        i -> {
+                            try {
+                                inOff.getParentFile().mkdirs();
+                                if (i == 1) inOff.createNewFile(); else inOff.delete();
+                                if (i == 2) inForce.createNewFile(); else inForce.delete();
+                            } catch (Exception ignored) { }
+                            render(true);
+                        }));
+                TextView inote = text(inOff.exists()
+                        ? "The GPU always works on copies of the Mac's memory, checked for changes at each batch of drawing."
+                        : inForce.exists()
+                            ? "The GPU uses the Mac's memory in place even on a driver that does not share it safely: expect stale or "
+                                + "torn pixels. Only to see what a driver does."
+                            : "The GPU uses the Mac's memory in place where the driver shares it safely with the CPU (Henge's Turnip, "
+                                + "and the kernel keeps it so), and copies otherwise. If windows show stale or torn contents, pick Off.",
+                        13, DIM, false);
+                inote.setPadding(dp(17), 0, dp(17), dp(12));
+                c.addView(inote);
+                c.addView(hairline());
+            }
         }
-        c.addView(choiceRow("Huge pages", new String[]{"Off", "On"}, "on".equals(prefs.getString("hugepages", "off")) ? 1 : 0,
-                i -> { prefs.edit().putString("hugepages", i == 1 ? "on" : "off").apply(); render(true); }));
+        final int[] jitSizes = {0, 512, 384, 256};
+        int jitNow = 0;
+        for (int i = 0; i < jitSizes.length; i++) if (jitSizes[i] == prefs.getInt("jitMb", 0)) jitNow = i;
+        c.addView(choiceRow("JIT cache", new String[]{"768 MB", "512", "384", "256"}, jitNow,
+                i -> { prefs.edit().putInt("jitMb", jitSizes[i]).apply(); render(true); }));
+        TextView jnote = text("Room for the Mac's code as the CPU engine translates it. When it fills, all of it is dropped and its "
+                + "memory given back to Android, then code is translated again as it runs. Smaller leaves the tablet more memory "
+                + "and re-translates more often; if the tablet is short of memory (the log's \"memory available\"), try 384.", 13, DIM, false);
+        jnote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(jnote);
+        c.addView(hairline());
+        final String hugeNow = prefs.getString("hugepages", "off");
+        c.addView(choiceRow("Huge pages", new String[]{"Off", "On", "Eager"}, "eager".equals(hugeNow) ? 2 : "on".equals(hugeNow) ? 1 : 0,
+                i -> { prefs.edit().putString("hugepages", i == 2 ? "eager" : i == 1 ? "on" : "off").apply(); render(true); }));
         TextView hnote = text("Needs root. The Mac's RAM in 2 MB pages (JIT engine, Mac's memory: In RAM): the CPU engine finds "
-                + "the Mac's memory faster. The Mac's memory is then taken 2 MB at a time. Experimental; put back when the Mac stops.", 13, DIM, false);
+                + "the Mac's memory faster. The Mac's memory is then taken 2 MB at a time. Eager takes all of it as the Mac starts, "
+                + "while the tablet still has whole 2 MB pieces free: more of it ends up huge (the log's \"MB in huge pages\"), and "
+                + "the Mac's whole memory is in use from the first second. Experimental; put back when the Mac stops.", 13, DIM, false);
         hnote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(hnote);
         c.addView(hairline());
