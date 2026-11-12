@@ -210,6 +210,17 @@ public class VmService extends Service {
                 appendLog(log, "henge app: Android ended the app (" + exitReason(death[0]) + "), which is not a crash of the "
                         + "GPU's: reims and its Vulkan driver are used as before. If it was memory, close other apps or lower "
                         + "the Mac's memory or the JIT cache (Settings)");
+            } else if ("reims-turnip-henge".equals(lastMode) && "reims".equals(gpu) && !"install".equals(mode)
+                    && "on".equals(prefs.getString("zerocopy", "off"))
+                    && !new File(reimsHomeDir(this), "render-in-place-off").exists()
+                    && !new File(reimsHomeDir(this), "in-place-off").exists()) {
+                // The run that died drew the Mac's framebuffer in place (on by default since 0.3.54, after one good
+                // run on the tablet): the first suspect, and the driver keeps its place. Off until Settings says On.
+                try { new File(reimsHomeDir(this), "render-in-place-off").createNewFile(); } catch (Exception ignored) { }
+                appendLog(log, "henge app: the run that took the app down drew the Mac's screen in place (Settings > "
+                        + "Framebuffer in place): it is off now, and Henge's Turnip is used as before. Its \"reims:\" and "
+                        + "\"metal2vulkan:\" lines above say where it died. If the next crash comes with it off, the "
+                        + "driver is what changes");
             } else if ("reims-turnip-henge".equals(lastMode) && "reims".equals(gpu) && !"install".equals(mode) && build.equals(lastBuild)) {
                 // Henge's own Turnip died: the stock one next, on copies, until the app is updated.
                 prefs.edit().putString("turnipHengeCrashed", build).apply();
@@ -267,6 +278,11 @@ public class VmService extends Service {
         // Settings > JIT cache: the translated code's room, 768 MB where nothing is set (host/vm.c).
         int jitMb = prefs.getInt("jitMb", 0);
         if (!install && !gunyah() && jitMb >= 64) { cmd.add("--jit-mb"); cmd.add(Integer.toString(jitMb)); }
+        // Settings > JIT cache memory: Keep. The cache's pages stay the engine's when it drops its translations
+        // (host/jit_region.c gives them back otherwise): to compare, with the heartbeat's swap figures.
+        final boolean jitKeep = !install && !gunyah() && "keep".equals(prefs.getString("jitMemory", "give"));
+        // Settings > Engine statistics: the JIT's own report every minute, in the log (core/dispatch.c print_stats).
+        if (!install && !gunyah() && "on".equals(prefs.getString("engineStats", "off"))) { cmd.add("--stats"); cmd.add("60"); }
         if (gunyah()) { cmd.add("--engine"); cmd.add("gunyah"); }
         // Graphics: reims: the GPU device runs in this process (libhengegpu.so), up before the engine needs it.
         boolean reims = !install && "reims".equals(gpu);
@@ -344,6 +360,7 @@ public class VmService extends Service {
             boolean ramInMemory = !install && !"storage".equals(prefs.getString("ram", "memory"))
                     && !build.equals(prefs.getString("ramFileBuild", ""));
             if (ramInMemory) pb.environment().put("HV_RAM_MEMFD", "1");
+            if (jitKeep) pb.environment().put("HV_JIT_KEEP", "1");
             // Huge pages: On asks for them as the Mac touches its memory; Eager also touches all of it at the start,
             // while the tablet still has 2 MB runs of free memory to give (devices/vmapple.c).
             String huge = prefs.getString("hugepages", "off");
@@ -530,16 +547,25 @@ public class VmService extends Service {
      * runs, so the Mac's RAM (a memfd the engine asks huge pages for, devices/vmapple.c) is in 2 MB pages.
      * The setting as it was is kept and put back when the Mac stops, or at the next start. Answers whether
      * the kernel now gives them.
+     *
+     * 0.3.53: asking was not enough. On the tablet (build 57) On showed no huge pages in the log and Eager 14 to
+     * 18 MB of 4096. The kernel hands one out only where 2 MB of memory lie free in one piece at that moment; the
+     * likely cause (not measured until this build's log lines) is free memory in crumbs after hours of use, and
+     * kernel settings that do not make room. So, while the Mac runs (each put back after): the free memory is
+     * compacted once before the engine starts ({@link #hugeCompact}), and the kernel's own settings for huge
+     * pages are set so that it tries for one when the Mac touches its memory and gathers the Mac's small pages
+     * into huge ones in the background ({@link #hugeKnobs}). The log says what each step found.
      */
     private boolean hugePages(File log, boolean on) {
         android.content.SharedPreferences p = getSharedPreferences("henge", MODE_PRIVATE);
-        final String file = "/sys/kernel/mm/transparent_hugepage/shmem_enabled";
+        final String file = THP + "shmem_enabled";
         String saved = p.getString("shmemHuge", "");
         if (saved.matches("[a-z_]+")) {
             DeviceCheck.sh(true, "echo " + saved + " > " + file + "; true");
             p.edit().remove("shmemHuge").commit();
             appendLog(log, "henge app: huge pages off: shared memory's are `" + saved + "` again");
         }
+        hugeKnobsBack(log, p);
         if (!on) return false;
         // The file reads like "always within_size advise [never] deny force": the one in brackets is set.
         String now = DeviceCheck.sh(true, "cat " + file + "; true").trim();
@@ -555,7 +581,124 @@ public class VmService extends Service {
         }
         String after = DeviceCheck.sh(true, "cat " + file + "; true").trim();
         appendLog(log, "henge app: huge pages: shared memory's were `" + was + "`, now: " + after);
-        return after.contains("[advise]") || after.contains("[always]") || after.contains("[within_size]") || after.contains("[force]");
+        boolean gives = after.contains("[advise]") || after.contains("[always]") || after.contains("[within_size]") || after.contains("[force]");
+        if (gives) {
+            try { hugeKnobs(log, p); } catch (Exception e) { appendLog(log, "henge app: huge pages: the kernel's settings were left as they are: " + e); }
+            try { hugeCompact(log); } catch (Exception e) { appendLog(log, "henge app: huge pages: memory was not compacted: " + e); }
+        }
+        return gives;
+    }
+
+    private static final String THP = "/sys/kernel/mm/transparent_hugepage/";
+
+    /** The value a sysfs file of the kernel's shows as set: the word in brackets, or the file's one word. */
+    private static String setting(String text) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\[([a-z+_]+)\\]").matcher(text);
+        return m.find() ? m.group(1) : text.trim();
+    }
+
+    /**
+     * The kernel's huge-page settings while the Mac runs (root), those that differ kept in the preference
+     * `thpKnobs` (lines of file=value) for {@link #hugeKnobsBack}:
+     * - `enabled` never -> madvise: khugepaged, the kernel thread that gathers small pages into huge ones, runs
+     *   only while this is not `never` (as Linux 6.1's source reads; not checked on a tablet); `madvise` gives huge pages
+     *   to memory that asks, as the Mac's RAM does, and to nothing else.
+     * - `defrag` never -> madvise, defer -> defer+madvise: where memory that asked is first touched and no 2 MB
+     *   piece is free, the kernel makes one (moves pages aside) instead of giving small pages at once.
+     * - khugepaged: 16384 pages looked at every 2 s (the kernel's default, 4096 every 10 s, takes 43 minutes
+     *   to pass over 4 GB once; this takes about 2), and a 2 MB range gathered only where at most 64 of its
+     *   512 pages are untouched (default 511: one touched page makes 2 MB, which would grow the Mac's memory).
+     * Its pause after a huge page it could not get stays the kernel's (a minute): where the tablet has no
+     * memory for them, it does not keep trying.
+     */
+    private void hugeKnobs(File log, android.content.SharedPreferences p) {
+        final String[] files = {"enabled", "defrag", "khugepaged/pages_to_scan", "khugepaged/scan_sleep_millisecs", "khugepaged/max_ptes_none"};
+        StringBuilder read = new StringBuilder("cd " + THP + " || exit 0; ");
+        for (String f : files) read.append("echo \"").append(f).append("=$(cat ").append(f).append(" 2>/dev/null)\"; ");
+        java.util.Map<String, String> now = new java.util.LinkedHashMap<>();
+        for (String line : DeviceCheck.sh(true, read + "true").split("\n")) {
+            int eq = line.indexOf('=');
+            if (eq > 0) now.put(line.substring(0, eq).trim(), setting(line.substring(eq + 1)));
+        }
+        java.util.Map<String, String> want = new java.util.LinkedHashMap<>();
+        String enabled = now.get("enabled"), defrag = now.get("defrag");
+        if ("never".equals(enabled)) want.put("enabled", "madvise");
+        if ("never".equals(defrag)) want.put("defrag", "madvise");
+        else if ("defer".equals(defrag)) want.put("defrag", "defer+madvise");
+        long scan = number(now.get("khugepaged/pages_to_scan")), sleep = number(now.get("khugepaged/scan_sleep_millisecs")),
+             none = number(now.get("khugepaged/max_ptes_none"));
+        if (scan >= 0 && scan < 16384) want.put("khugepaged/pages_to_scan", "16384");
+        if (sleep > 2000) want.put("khugepaged/scan_sleep_millisecs", "2000");
+        if (none > 64) want.put("khugepaged/max_ptes_none", "64");
+        StringBuilder keep = new StringBuilder(), write = new StringBuilder("cd " + THP + " || exit 0; "), said = new StringBuilder();
+        for (java.util.Map.Entry<String, String> e : want.entrySet()) {
+            String was = now.get(e.getKey());
+            if (was == null || !was.matches("[a-z0-9+_]+")) continue; // not a value this could put back
+            keep.append(e.getKey()).append('=').append(was).append('\n');
+            write.append("echo ").append(e.getValue()).append(" > ").append(e.getKey()).append("; ");
+            said.append(said.length() > 0 ? ", " : "").append(e.getKey()).append(' ').append(was).append(" -> ").append(e.getValue());
+        }
+        if (keep.length() > 0) {
+            p.edit().putString("thpKnobs", keep.toString()).commit(); // before the writes: a kill between them still puts them back
+            DeviceCheck.sh(true, write + "true");
+        }
+        appendLog(log, "henge app: huge pages: the kernel's settings while the Mac runs: "
+                + (said.length() > 0 ? said : "left as they are") + " (they were: " + now + ")");
+    }
+
+    private static long number(String s) {
+        try { return s == null ? -1 : Long.parseLong(s.trim()); } catch (NumberFormatException e) { return -1; }
+    }
+
+    /** Puts back what {@link #hugeKnobs} changed (when the Mac stops, or at the next start after a kill). */
+    private void hugeKnobsBack(File log, android.content.SharedPreferences p) {
+        String kept = p.getString("thpKnobs", "");
+        if (kept.isEmpty()) return;
+        StringBuilder write = new StringBuilder("cd " + THP + " || exit 0; ");
+        int n = 0;
+        for (String line : kept.split("\n")) {
+            int eq = line.indexOf('=');
+            if (eq <= 0) continue;
+            String f = line.substring(0, eq), v = line.substring(eq + 1);
+            if (!f.matches("[a-z_/]+") || !v.matches("[a-z0-9+_]+")) continue;
+            write.append("echo ").append(v).append(" > ").append(f).append("; ");
+            n++;
+        }
+        if (n > 0) DeviceCheck.sh(true, write + "true");
+        p.edit().remove("thpKnobs").commit();
+        appendLog(log, "henge app: huge pages off: " + n + " of the kernel's settings are as they were again");
+    }
+
+    /**
+     * The tablet's free memory gathered into whole pieces before the engine takes the Mac's RAM (root:
+     * /proc/sys/vm/compact_memory), with how much of it lay in pieces of 2 MB or more before and after
+     * (/proc/buddyinfo): that figure is the most the Mac's first touches can get as huge pages.
+     */
+    private void hugeCompact(File log) {
+        long before = freeInHugePieces();
+        long t0 = android.os.SystemClock.elapsedRealtime();
+        DeviceCheck.sh(true, "echo 1 > /proc/sys/vm/compact_memory; true", 30);
+        long ms = android.os.SystemClock.elapsedRealtime() - t0, after = freeInHugePieces();
+        appendLog(log, "henge app: huge pages: " + (before < 0 ? "?" : String.valueOf(before)) + " MB of the tablet's free memory lay in pieces of 2 MB or more; "
+                + (after < 0 ? "?" : String.valueOf(after)) + " MB after compacting it (" + ms + " ms)");
+    }
+
+    /** Free memory in pieces of 2 MB or more, in MB, from /proc/buddyinfo (a count per order after each zone's name); -1 unread. */
+    private static long freeInHugePieces() {
+        String text = DeviceCheck.sh(true, "cat /proc/buddyinfo; true");
+        long page = android.system.Os.sysconf(android.system.OsConstants._SC_PAGESIZE), bytes = 0;
+        boolean any = false;
+        for (String line : text.split("\n")) {
+            int zone = line.indexOf("zone");
+            if (zone < 0) continue;
+            String[] t = line.substring(zone + 4).trim().split("\\s+");
+            for (int order = 0; order + 1 < t.length; order++) { // t[0] is the zone's name
+                long size = page << order, count = number(t[order + 1]);
+                if (count > 0 && size >= (2L << 20)) bytes += count * size;
+                any = true;
+            }
+        }
+        return any ? bytes >> 20 : -1;
     }
 
     /**

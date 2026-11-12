@@ -1922,10 +1922,10 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
     if (!e->nogroup && e->ngrp && emit_group_copies(e, code, b->va, i) != 0) return -1;
     cold_on(e);
     emit_ool(e);
-    if (m->stats_interval) {
-        m->stats.words_inline += inline_words;
-        m->stats.words_ool += e->n - (e->flat ? inline_words : 0);
-        m->stats.words_pool += e->npool * 2;
+    { /* always: the heartbeat's bytes a block */
+        __atomic_fetch_add(&m->stats.words_inline, inline_words, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&m->stats.words_ool, e->n - (e->flat ? inline_words : 0), __ATOMIC_RELAXED);
+        __atomic_fetch_add(&m->stats.words_pool, e->npool * 2, __ATOMIC_RELAXED);
     }
 
     /* Pool after the cold code, 8-byte aligned; both parts start 8-byte aligned. */

@@ -136,10 +136,23 @@ void px_row_to_rgba8(uint32_t fourcc, const uint8_t *src, uint8_t *dst, uint32_t
 
 /* ------------------------------------------------------------ screen (screen_vk.c) -- */
 typedef struct Screen Screen;
-Screen *screen_create(void *native_window); /* NULL window: off-screen (tests) */
+Screen *screen_create(void *native_window); /* NULL window: off-screen (tests), 1280x800, the blit's form */
+/* Tests: off-screen, as a window of w x h would be shown (the swapchain at the frame's scale where it fits). */
+Screen *screen_create_offscreen(uint32_t w, uint32_t h);
 void screen_destroy(Screen *s);
-/* A frame, RGBA8, w x h, tightly packed. Copies it; presents now. Returns 0 if shown. */
+/* The frame's own pixels: RGBA8, w x h, tightly packed, in memory of the screen's that the next screen_present
+   shows. Whoever draws the frame writes here, so nothing copies it on the way. The pointer holds until the
+   next call for another size, or the screen's end; *fresh (if asked) is 1 where the memory is new and holds
+   anything, 0 where it still holds what was last written. NULL without memory. */
+uint8_t *screen_frame(Screen *s, uint32_t w, uint32_t h, int *fresh);
+/* Shows what screen_frame's memory holds; returns when the GPU has read it. Returns 0 if shown. */
+int screen_present(Screen *s, uint32_t w, uint32_t h);
+/* A frame, RGBA8, w x h, tightly packed, from elsewhere: copied into the frame's memory and presented. */
 int screen_show(Screen *s, const uint8_t *rgba, uint32_t w, uint32_t h);
+/* The frame's memory as it is now, and its size; NULL where there is none. */
+const uint8_t *screen_frame_now(Screen *s, uint32_t *w, uint32_t *h);
+/* What the screen presents through, in words, for a log line. */
+void screen_words(Screen *s, char *out, size_t n);
 /* Tests: the last frame as the GPU drew it (RGBA8, swapchain-sized). */
 int screen_readback(Screen *s, uint8_t **rgba, uint32_t *w, uint32_t *h);
 
@@ -184,5 +197,17 @@ void replay_present_now(Replay *r);
 void replay_enable_draws(Replay *r, const char *air2spv, const char *cache_dir);
 /* Graphics: reims: a whole frame (RGBA8, w x h, tightly packed) drawn elsewhere, shown as it is. */
 void replay_show_frame(Replay *r, const uint8_t *rgba, uint32_t w, uint32_t h);
+/* Graphics: reims: the same without a copy on the way. replay_frame_begin answers the frame's own pixels (the
+   screen's memory where there is a screen, else the replay's), for w x h, and holds the presenter off them
+   until replay_frame_end; *kept is 1 where they still hold what the last begin..end left there (the last
+   frame, with whatever was drawn over it), 0 where they hold anything. NULL without memory (nothing is held
+   then, and no end follows). replay_frame_end with changed != 0 has the presenter show them. */
+uint8_t *replay_frame_begin(Replay *r, uint32_t w, uint32_t h, int *kept);
+void replay_frame_end(Replay *r, int changed);
+/* Graphics: reims: how many of those frames the presenter put on the screen since this was last asked, and the
+   time that took (the copy into the swapchain, the present and the wait for the GPU). */
+void replay_present_stats(Replay *r, uint64_t *presents, uint64_t *ns);
+/* Graphics: reims: what the replay's screen presents through, in words (screen_words). */
+void replay_screen_words(Replay *r, char *out, size_t n);
 
 #endif

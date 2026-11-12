@@ -149,5 +149,111 @@ int main(void) {
     fail |= !ring_ok;
     replay_stop(rr);
     unlink(lpath);
+
+    /* The screen at the frame's own scale (0.3.53): a window of 3200x2136 (the Mi Pad 7's) shows a 1280x800
+       frame through a 1280x854 swapchain, the frame's pixels one to one between two black bars, written
+       straight into the screen's memory. */
+    {
+        Screen *sc = screen_create_offscreen(3200, 2136);
+        if (!sc) { fprintf(stderr, "no Vulkan\n"); return 1; }
+        int fresh = -1;
+        uint8_t *fp = screen_frame(sc, 1280, 800, &fresh);
+        int ok = fp && fresh == 1;
+        for (uint32_t y = 0; ok && y < 800; y++)
+            for (uint32_t x = 0; x < 1280; x++) {
+                uint8_t *q = fp + ((size_t)y * 1280 + x) * 4;
+                q[0] = (uint8_t)x, q[1] = (uint8_t)y, q[2] = (uint8_t)(x ^ y), q[3] = 255;
+            }
+        ok = ok && screen_present(sc, 1280, 800) == 0;
+        uint8_t *rb = NULL;
+        uint32_t rw = 0, rh = 0;
+        ok = ok && screen_readback(sc, &rb, &rw, &rh) == 0 && rw == 1280 && rh == 854;
+        int exact = ok;
+        for (uint32_t y = 0; exact && y < 800; y += 7)
+            for (uint32_t x = 0; x < 1280; x += 5) {
+                const uint8_t *q = rb + ((size_t)(y + 27) * rw + x) * 4;
+                if (q[0] != (uint8_t)x || q[1] != (uint8_t)y || q[2] != (uint8_t)(x ^ y)) { exact = 0; break; }
+            }
+        int bars = ok;
+        for (uint32_t x = 0; bars && x < 1280; x += 3) {
+            const uint8_t *top = rb + ((size_t)26 * rw + x) * 4, *bottom = rb + ((size_t)827 * rw + x) * 4;
+            if (top[0] | top[1] | top[2] | bottom[0] | bottom[1] | bottom[2]) bars = 0;
+        }
+        printf("%s frame's scale: a 1280x800 frame in a 3200x2136 window is a %ux%u image, its pixels %s, its bars %s\n",
+               ok && exact && bars ? "ok  " : "FAIL", rw, rh, exact ? "one to one" : "WRONG", bars ? "black" : "NOT BLACK");
+        fail |= !(ok && exact && bars);
+        free(rb), rb = NULL;
+        /* The same memory again: not fresh, and what was written is still there (a pointer is drawn over it). */
+        fresh = -1;
+        uint8_t *again = screen_frame(sc, 1280, 800, &fresh);
+        ok = again == fp && fresh == 0 && again[4 * 1281 + 0] == 1 && again[4 * 1281 + 1] == 1;
+        printf("%s frame's scale: the frame's memory is kept between frames\n", ok ? "ok  " : "FAIL");
+        fail |= !ok;
+        /* Another mode: the swapchain follows the frame. 1920x1080 in the same window: 1920x1282. */
+        fp = screen_frame(sc, 1920, 1080, &fresh);
+        ok = fp && fresh == 1;
+        if (ok) memset(fp, 0x80, (size_t)1920 * 1080 * 4);
+        ok = ok && screen_present(sc, 1920, 1080) == 0 && screen_readback(sc, &rb, &rw, &rh) == 0 && rw == 1920 && rh == 1282;
+        ok = ok && rb[((size_t)101 * rw + 5) * 4] == 0x80 && rb[((size_t)100 * rw + 5) * 4] == 0 && rb[((size_t)1180 * rw + 1900) * 4] == 0x80 &&
+             rb[((size_t)1181 * rw + 1900) * 4] == 0;
+        printf("%s frame's scale: a 1920x1080 frame next is a %ux%u image\n", ok ? "ok  " : "FAIL", rw, rh);
+        fail |= !ok;
+        free(rb), rb = NULL;
+        screen_destroy(sc);
+
+        /* A window smaller than the frame: the window's size and the blit, as before. */
+        sc = screen_create_offscreen(1000, 700);
+        fp = sc ? screen_frame(sc, 1280, 800, NULL) : NULL;
+        ok = fp != NULL;
+        for (size_t i = 0; ok && i < (size_t)1280 * 800; i++) fp[i * 4] = 0, fp[i * 4 + 1] = 200, fp[i * 4 + 2] = 0, fp[i * 4 + 3] = 255;
+        ok = ok && screen_present(sc, 1280, 800) == 0 && screen_readback(sc, &rb, &rw, &rh) == 0 && rw == 1000 && rh == 700;
+        /* scale 0.78125: 1000x625, bars of 37 rows */
+        ok = ok && rb[((size_t)350 * rw + 500) * 4 + 1] == 200 && rb[((size_t)10 * rw + 500) * 4 + 1] == 0;
+        printf("%s a window smaller than the frame: scaled by the blit into %ux%u\n", ok ? "ok  " : "FAIL", rw, rh);
+        fail |= !ok;
+        free(rb), rb = NULL;
+
+        /* Graphics: reims's frames through the replay, written in place: the first begin's pixels are new, the
+           next still hold the frame, and the presenter shows them from the screen's memory. */
+        Replay *er = replay_for_test(&g, sc);
+        int kept = -1;
+        uint8_t *ep = replay_frame_begin(er, 640, 400, &kept);
+        ok = ep && kept == 0;
+        if (ep) {
+            for (size_t i = 0; i < (size_t)640 * 400; i++) ep[i * 4] = 250, ep[i * 4 + 1] = 0, ep[i * 4 + 2] = 0, ep[i * 4 + 3] = 255;
+            replay_frame_end(er, 1);
+        }
+        replay_present_now(er);
+        /* 640x400 fits the 1000x700 window: its own scale again, 640x448, bars of 24 rows */
+        ok = ok && screen_readback(sc, &rb, &rw, &rh) == 0 && rw == 640 && rh == 448 && rb[((size_t)200 * rw + 300) * 4] == 250 &&
+             rb[((size_t)10 * rw + 300) * 4] == 0;
+        free(rb), rb = NULL;
+        kept = -1;
+        uint8_t *ep2 = replay_frame_begin(er, 640, 400, &kept);
+        ok = ok && ep2 == ep && kept == 1 && ep2[0] == 250;
+        if (ep2) replay_frame_end(er, 0);
+        kept = -1;
+        ep2 = replay_frame_begin(er, 800, 500, &kept);
+        ok = ok && ep2 && kept == 0;
+        if (ep2) replay_frame_end(er, 0);
+        printf("%s reims frames are written in the screen's memory: new, then kept, new again at another size\n", ok ? "ok  " : "FAIL");
+        fail |= !ok;
+        replay_stop(er);
+        screen_destroy(sc);
+
+        /* With no screen the replay keeps them itself. */
+        er = replay_for_test(&g, NULL);
+        kept = -1;
+        ep = replay_frame_begin(er, 64, 32, &kept);
+        ok = ep && kept == 0;
+        if (ep) ep[0] = 77, replay_frame_end(er, 1);
+        kept = -1;
+        ep2 = replay_frame_begin(er, 64, 32, &kept);
+        ok = ok && ep2 && kept == 1 && ep2[0] == 77;
+        if (ep2) replay_frame_end(er, 0);
+        printf("%s reims frames with no screen stay with the replay\n", ok ? "ok  " : "FAIL");
+        fail |= !ok;
+        replay_stop(er);
+    }
     return fail;
 }

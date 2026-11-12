@@ -541,6 +541,19 @@ public class MainActivity extends Activity {
         TextView gnote = text(GPU_NOTES[Math.max(0, java.util.Arrays.asList(GPU_MODES).indexOf(gpuMode()))], 13, DIM, false);
         gnote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(gnote);
+        if ("reims".equals(gpuMode()) || "vulkan".equals(gpuMode())) {
+            c.addView(hairline());
+            final boolean blit = "blit".equals(prefs.getString("screenScale", "compositor"));
+            c.addView(choiceRow("Screen scaling", new String[]{"Compositor", "Blit"}, blit ? 1 : 0,
+                    i -> { prefs.edit().putString("screenScale", i == 1 ? "blit" : "compositor").apply(); render(true); }));
+            TextView snote = text(blit
+                    ? "As before 0.3.53: every frame is stretched to the tablet's full resolution by the GPU before it is shown."
+                    : "The Mac's picture is handed to Android at its own size and Android's compositor stretches it to the "
+                        + "screen: much less work for the GPU at every frame, and less memory. If the picture is missing, "
+                        + "stretched wrongly or touches land off target, pick Blit and tell us.", 13, DIM, false);
+            snote.setPadding(dp(17), 0, dp(17), dp(12));
+            c.addView(snote);
+        }
         if ("reims".equals(gpuMode())) {
             c.addView(hairline());
             c.addView(choiceRow("Mac screen", REIMS_MODE_LABELS, Math.max(0, java.util.Arrays.asList(REIMS_MODES).indexOf(reimsMode())),
@@ -650,6 +663,25 @@ public class MainActivity extends Activity {
                 inote.setPadding(dp(17), 0, dp(17), dp(12));
                 c.addView(inote);
                 c.addView(hairline());
+                if (!inOff.exists()) {
+                    final java.io.File renderOff = new java.io.File(VmService.reimsHomeDir(this), "render-in-place-off");
+                    c.addView(choiceRow("Framebuffer in place", new String[]{"On", "Off"}, renderOff.exists() ? 1 : 0,
+                            i -> {
+                                try {
+                                    renderOff.getParentFile().mkdirs();
+                                    if (i == 1) renderOff.createNewFile(); else renderOff.delete();
+                                } catch (Exception ignored) { }
+                                render(true);
+                            }));
+                    TextView rnote = text("With Henge's Turnip only. On: the GPU draws the Mac's screen straight into the Mac's "
+                            + "memory. Off: it draws into a copy and copies the screen in and back at every frame. In the one "
+                            + "comparison so far (a Mi Pad 7) On took about a seventh off the GPU's time per frame. If the picture is wrong, turn it off; after a "
+                            + "crash Henge turns it off by itself. Close Henge from recents and open it again after changing this.",
+                            13, DIM, false);
+                    rnote.setPadding(dp(17), 0, dp(17), dp(12));
+                    c.addView(rnote);
+                    c.addView(hairline());
+                }
             }
         }
         final int[] jitSizes = {0, 512, 384, 256};
@@ -659,17 +691,36 @@ public class MainActivity extends Activity {
                 i -> { prefs.edit().putInt("jitMb", jitSizes[i]).apply(); render(true); }));
         TextView jnote = text("Room for the Mac's code as the CPU engine translates it. When it fills, all of it is dropped and its "
                 + "memory given back to Android, then code is translated again as it runs. Smaller leaves the tablet more memory "
-                + "and re-translates more often; if the tablet is short of memory (the log's \"memory available\"), try 384.", 13, DIM, false);
+                + "and re-translates more often: at 384 the Mi Pad 7 dropped it one to three times every 30 seconds with four "
+                + "Mac apps open. If the tablet is short of memory (the log's \"memory available\"), try 512 first.", 13, DIM, false);
         jnote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(jnote);
+        c.addView(hairline());
+        c.addView(choiceRow("JIT cache memory", new String[]{"Give back", "Keep"}, "keep".equals(prefs.getString("jitMemory", "give")) ? 1 : 0,
+                i -> { prefs.edit().putString("jitMemory", i == 1 ? "keep" : "give").apply(); render(true); }));
+        TextView knote = text("Give back: when the cache is dropped its memory goes back to Android until code fills it again. "
+                + "Keep: the engine holds on to it, so the tablet has that much less but does not have to find it again every "
+                + "time. Which is faster on a tablet short of memory is not known yet: the log's swap figures say.", 13, DIM, false);
+        knote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(knote);
+        c.addView(hairline());
+        c.addView(choiceRow("Engine statistics", new String[]{"Off", "On"}, "on".equals(prefs.getString("engineStats", "off")) ? 1 : 0,
+                i -> { prefs.edit().putString("engineStats", i == 1 ? "on" : "off").apply(); render(true); }));
+        TextView statsNote = text("On: once a minute the CPU engine writes where its time goes into the log (some thirty lines: "
+                + "memory lookups that missed, slow memory accesses, interrupts, how idle the Mac is). For finding what to "
+                + "make faster; it costs a little speed while on.", 13, DIM, false);
+        statsNote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(statsNote);
         c.addView(hairline());
         final String hugeNow = prefs.getString("hugepages", "off");
         c.addView(choiceRow("Huge pages", new String[]{"Off", "On", "Eager"}, "eager".equals(hugeNow) ? 2 : "on".equals(hugeNow) ? 1 : 0,
                 i -> { prefs.edit().putString("hugepages", i == 2 ? "eager" : i == 1 ? "on" : "off").apply(); render(true); }));
         TextView hnote = text("Needs root. The Mac's RAM in 2 MB pages (JIT engine, Mac's memory: In RAM): the CPU engine finds "
-                + "the Mac's memory faster. The Mac's memory is then taken 2 MB at a time. Eager takes all of it as the Mac starts, "
-                + "while the tablet still has whole 2 MB pieces free: more of it ends up huge (the log's \"MB in huge pages\"), and "
-                + "the Mac's whole memory is in use from the first second. Experimental; put back when the Mac stops.", 13, DIM, false);
+                + "the Mac's memory faster. Before the Mac starts, Henge has the tablet gather its free memory into whole pieces "
+                + "(a second or two) and sets the kernel to hand out 2 MB pages and to gather the Mac's small pages into them as "
+                + "it runs. Eager also takes the Mac's memory as it starts, for as long as the tablet has memory to spare. How "
+                + "much ends up huge depends on how full the tablet is: the log's \"MB in huge pages\" says. Experimental; "
+                + "every setting is put back when the Mac stops.", 13, DIM, false);
         hnote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(hnote);
         c.addView(hairline());

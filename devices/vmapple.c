@@ -283,16 +283,41 @@ static uint64_t tick(HvMachine *m, HvCpu *cpu) {
 }
 
 #ifdef __linux__
+/* One number of /proc/meminfo in MB (-1: not there). */
+static long long meminfo_mb(const char *key) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return -1;
+    char line[160];
+    long long v = -1, kb;
+    size_t n = strlen(key);
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, key, n) && line[n] == ':' && sscanf(line + n + 1, "%lld", &kb) == 1) { v = kb >> 10; break; }
+    fclose(f);
+    return v;
+}
+
 /* HV_RAM_THP=2: touch the guest's RAM in order, 32 MB at a call, so the kernel hands out its huge pages while
    memory still has them (hv_vmapple_create). MADV_POPULATE_WRITE (Linux 5.14) takes the pages as a write
-   fault would and changes no byte; a kernel without it ends the walk at the first call. */
+   fault would and changes no byte; a kernel without it ends the walk at the first call.
+
+   It stops where the tablet has no memory left to give without swapping (0.3.53). On the tablet (2026-11-12,
+   build 57) the walk took all 4096 MB in 2.7 s with about 1 GB available, and 14 to 18 MB of it ended up
+   huge. The likely reason (not measured): past what was free, each page it took pushed another out to swap (a
+   zero page costs zram nothing, which would explain the speed), and a page that comes back from swap comes
+   back small. Touching ahead can only help for memory the tablet has; the rest is taken as the Mac touches
+   it, huge where a 2 MB piece is free then. */
 static void *ram_populate(void *arg) {
     struct { uint8_t *at; uint64_t size; } *all = arg;
     const uint64_t step = 32ull << 20;
+    const long long floor_mb = 768;
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     uint64_t done = 0;
+    long long left = -1;
+    const char *why = "all of it";
     for (; done < all->size; done += step) {
+        left = meminfo_mb("MemAvailable");
+        if (left >= 0 && left < floor_mb) { why = "the tablet has no more to give without swapping"; break; }
         uint64_t n = all->size - done < step ? all->size - done : step;
         if (madvise(all->at + done, n, 23 /* MADV_POPULATE_WRITE */) != 0) {
             fprintf(stderr, "hengevm: guest RAM touched ahead: stopped at %llu MB (%s)\n", (unsigned long long)(done >> 20), strerror(errno));
@@ -300,9 +325,27 @@ static void *ram_populate(void *arg) {
         }
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    fprintf(stderr, "hengevm: guest RAM touched ahead: %llu MB in %.1f s (the heartbeat's \"MB in huge pages\" says how much of it is huge)\n",
-            (unsigned long long)(done >> 20), (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
+    fprintf(stderr, "hengevm: guest RAM touched ahead: %llu of %llu MB in %.1f s (%s; %lld MB of the tablet's memory still available, "
+                    "%lld MB of shared memory in huge pages)\n",
+            (unsigned long long)(done >> 20), (unsigned long long)(all->size >> 20),
+            (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9, why, meminfo_mb("MemAvailable"), meminfo_mb("ShmemHugePages"));
     return NULL;
+}
+
+/* The RAM file mapped on a 2 MB boundary: the kernel maps a huge page of a file whole only where the mapping
+   and the file agree on where 2 MB pieces start. It places such a mapping there itself while huge pages for
+   shared memory are on; this does not depend on that. MAP_FAILED: the caller maps it plainly. */
+static uint8_t *map_on_2mb(int fd, uint64_t size) {
+    const uint64_t align = 2ull << 20;
+    uint8_t *reserved = mmap(NULL, size + align, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (reserved == MAP_FAILED) return MAP_FAILED;
+    uint8_t *at = (uint8_t *)(((uintptr_t)reserved + align - 1) & ~(uintptr_t)(align - 1));
+    uint8_t *ram = mmap(at, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    if (ram == MAP_FAILED) { munmap(reserved, size + align); return MAP_FAILED; }
+    if (at > reserved) munmap(reserved, (size_t)(at - reserved));
+    uint8_t *end = at + size, *reserved_end = reserved + size + align;
+    if (reserved_end > end) munmap(end, (size_t)(reserved_end - end));
+    return ram;
 }
 #endif
 
@@ -340,7 +383,8 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
         if (fd >= 0 && ftruncate(fd, (off_t)ram_size) == 0) {
             if (fcntl(fd, 1033 /* F_ADD_SEALS */, 2 /* F_SEAL_SHRINK */) != 0)
                 fprintf(stderr, "hengevm: guest RAM could not be sealed against shrinking (%s): no dma-bufs of it\n", strerror(errno));
-            b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (getenv("HV_RAM_THP")) b->ram = map_on_2mb(fd, ram_size);
+            if (b->ram == MAP_FAILED) b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         }
         if (b->ram != MAP_FAILED) {
             static char name[64];
@@ -357,8 +401,9 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
                `advise` with root): 2 MB pages for the Mac's RAM, so the JIT's loads and stores miss the host's
                TLB less. Not on Gunyah, which takes its own memory and resets the tablet on huge pages. */
             if (getenv("HV_RAM_THP")) {
-                fprintf(stderr, "hengevm: guest RAM asked for in huge pages: %s\n",
-                        madvise(b->ram, ram_size, MADV_HUGEPAGE) == 0 ? "the kernel took the request" : strerror(errno));
+                fprintf(stderr, "hengevm: guest RAM asked for in huge pages: %s (mapped %s a 2 MB boundary)\n",
+                        madvise(b->ram, ram_size, MADV_HUGEPAGE) == 0 ? "the kernel took the request" : strerror(errno),
+                        (uintptr_t)b->ram & ((2u << 20) - 1) ? "OFF" : "on");
                 /* HV_RAM_THP=2 (Settings > Huge pages: Eager): the kernel gives a huge page only where 2 MB of
                    memory lie free together when the page is first touched, and a tablet's memory is cut up
                    more the longer the Mac runs (the tablet, 2026-11-12: 84 MB of 4096 in huge pages). So the

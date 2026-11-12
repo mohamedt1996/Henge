@@ -4,7 +4,8 @@
    This file is the host reims-vgpu's C API asks for, shaped like QEMU's apple-gfx-mmio.c on the same API:
    guest RAM as one memory-map range over the RAM file, the IOSurface mapper device beside the GPU, the
    two interrupt lines pulsed per raise, one display whose frames are drawn into a frame target and
-   handed to the replay's presenter (replay_show_frame) for the screen. */
+   read back straight into the screen's own memory (replay_frame_begin), where the replay's presenter
+   shows them. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE /* Dl_info, dladdr */
 #endif
@@ -52,11 +53,20 @@ typedef struct {
     uint32_t mode_w, mode_h;
     RvgFrameTarget *target;
     uint32_t tw, th;
-    uint8_t *pixels, *shown; /* RGBA8: the last frame, and it with the pointer drawn over it */
+    /* The frame's pixels are the screen's own (replay_frame_begin): the target is read back straight into
+       them and the pointer drawn over them there. What the pointer covers is kept aside (under) and put back
+       before it is drawn again, so a pointer that moves copies its own few pixels and no frame. Before
+       0.3.53 a frame was read back into a buffer here, copied into a second with the pointer over it, copied
+       into the replay's, and copied into the screen's: four copies of 4 MB a frame, three for a pointer move. */
+    uint8_t *under;
+    size_t under_cap;
+    uint32_t ux, uy, uw, uh; /* the rectangle kept in under; uw == 0: nothing is drawn over the frame */
     uint8_t *glyph;
     uint32_t gw, gh;
     int hx, hy, cursor_on;
     Replay *sink;
+    pthread_mutex_t show_lock; /* held while a frame is written to the sink: reims_host_set_sink waits for it.
+                                  Taken before `lock`, never while holding it. */
     uint64_t frames, mmio;
     /* Where a register access's time goes, since the last log line (reg_lock): from the engine's post to
        this side's thread taking it, and inside the library; and the registers that took the most. */
@@ -375,21 +385,38 @@ static void on_move(void *ctx) {
     pthread_mutex_unlock(&h->lock);
 }
 
-/* The pointer over the frame: premultiplied RGBA over RGBA. Lock held. */
-static void compose(Host *h) {
-    size_t bytes = (size_t)h->tw * h->th * 4;
-    memcpy(h->shown, h->pixels, bytes);
+/* The pointer off the frame: the pixels it covered, put back. px: the frame's, tw x th. */
+static void pointer_lift(Host *h, uint8_t *px) {
+    for (uint32_t y = 0; y < h->uh; y++)
+        memcpy(px + ((size_t)(h->uy + y) * h->tw + h->ux) * 4, h->under + (size_t)y * h->uw * 4, (size_t)h->uw * 4);
+    h->uw = h->uh = 0;
+}
+
+/* The pointer over the frame: what it covers kept aside, then premultiplied RGBA over RGBA. `lock` held (the
+   glyph is the callbacks'). Nothing is drawn over the frame when this is called. */
+static void pointer_drop(Host *h, uint8_t *px) {
+    h->uw = h->uh = 0;
     if (!h->cursor_on || !h->glyph || !h->disp) return;
     RvgDisplayCoord at = rvg_display_cursor_position(h->disp);
     int x0 = (int)at.x - h->hx, y0 = (int)at.y - h->hy;
-    for (uint32_t cy = 0; cy < h->gh; cy++) {
-        int y = y0 + (int)cy;
-        if (y < 0 || y >= (int)h->th) continue;
-        const uint8_t *s = h->glyph + (size_t)cy * h->gw * 4;
-        for (uint32_t cx = 0; cx < h->gw; cx++, s += 4) {
-            int x = x0 + (int)cx;
-            if (x < 0 || x >= (int)h->tw) continue;
-            uint8_t *d = h->shown + ((size_t)y * h->tw + (size_t)x) * 4;
+    int x1 = x0 + (int)h->gw, y1 = y0 + (int)h->gh;
+    int cx0 = x0 < 0 ? 0 : x0, cy0 = y0 < 0 ? 0 : y0;
+    int cx1 = x1 > (int)h->tw ? (int)h->tw : x1, cy1 = y1 > (int)h->th ? (int)h->th : y1;
+    if (cx0 >= cx1 || cy0 >= cy1) return; /* off the screen */
+    uint32_t w = (uint32_t)(cx1 - cx0), hgt = (uint32_t)(cy1 - cy0);
+    size_t need = (size_t)w * hgt * 4;
+    if (need > h->under_cap) {
+        uint8_t *more = realloc(h->under, need);
+        if (!more) return;
+        h->under = more, h->under_cap = need;
+    }
+    for (uint32_t y = 0; y < hgt; y++)
+        memcpy(h->under + (size_t)y * w * 4, px + ((size_t)(cy0 + (int)y) * h->tw + (size_t)cx0) * 4, (size_t)w * 4);
+    h->ux = (uint32_t)cx0, h->uy = (uint32_t)cy0, h->uw = w, h->uh = hgt;
+    for (int y = cy0; y < cy1; y++) {
+        const uint8_t *s = h->glyph + ((size_t)(y - y0) * h->gw + (size_t)(cx0 - x0)) * 4;
+        uint8_t *d = px + ((size_t)y * h->tw + (size_t)cx0) * 4;
+        for (int x = cx0; x < cx1; x++, s += 4, d += 4) {
             uint32_t keep = 255u - s[3];
             for (int k = 0; k < 3; k++) d[k] = (uint8_t)(s[k] + (d[k] * keep + 127) / 255);
         }
@@ -402,10 +429,8 @@ static int make_target(Host *h, uint32_t w, uint32_t hgt) {
     RvgFrameTargetConfig c = {sizeof c, w, hgt, RVG_PIXEL_FORMAT_RGBA8_UNORM};
     RvgStatus st = rvg_frame_target_create(h->dev, &c, &h->target);
     if (st != RVG_OK) { hlog("reims: frame target %ux%u: %s", w, hgt, rvg_status_message(st)); return -1; }
-    free(h->pixels), free(h->shown);
-    h->pixels = calloc((size_t)w * hgt, 4), h->shown = calloc((size_t)w * hgt, 4);
     h->tw = w, h->th = hgt;
-    return h->pixels && h->shown ? 0 : -1;
+    return 0;
 }
 
 /* Frames are encoded only while a screen is attached; the guest's presents complete either way. */
@@ -429,18 +454,50 @@ static void *render_loop(void *arg) {
             rvg_frame_commit(f);
             rvg_frame_wait(f);
             rvg_frame_release(f);
-            t1 = now_ns();
-            size_t stride = (size_t)h->tw * 4;
-            st = rvg_frame_target_read_pixels(h->target, h->pixels, stride, stride * h->th);
-            if (st != RVG_OK) { hlog("reims: read pixels: %s", rvg_status_message(st)); continue; }
-            h->frames++;
-            t2 = now_ns();
+            t1 = t2 = now_ns();
         }
-        pthread_mutex_lock(&h->lock);
-        compose(h);
-        if (h->sink) replay_show_frame(h->sink, h->shown, h->tw, h->th); /* under the lock: set_sink waits for it */
+        /* The sink's own pixels, held from here to replay_frame_end; `lock` only around the pointer, never
+           around the library's read (its callbacks take `lock`). */
+        pthread_mutex_lock(&h->show_lock);
+        sink = h->sink; /* read under show_lock: reims_host_set_sink holds it to change it */
+        int kept = 0;
+        uint8_t *px = sink ? replay_frame_begin(sink, h->tw, h->th, &kept) : NULL;
+        if (!px) { pthread_mutex_unlock(&h->show_lock); continue; }
+        int changed = 0;
+        if (frame) {
+            size_t stride = (size_t)h->tw * 4;
+            RvgStatus st = rvg_frame_target_read_pixels(h->target, px, stride, stride * h->th);
+            t2 = now_ns();
+            /* The read wrote over the pointer (and a failed one may have written some rows): nothing is
+               kept of what lay under it, and the next frame draws the whole again. */
+            h->uw = h->uh = 0;
+            if (st != RVG_OK) hlog("reims: read pixels: %s", rvg_status_message(st));
+            else {
+                h->frames++, changed = 1;
+                pthread_mutex_lock(&h->lock);
+                pointer_drop(h, px);
+                pthread_mutex_unlock(&h->lock);
+            }
+        } else if (kept) {
+            /* The pointer alone: off where it was, on where it is. */
+            pthread_mutex_lock(&h->lock);
+            pointer_lift(h, px);
+            pointer_drop(h, px);
+            pthread_mutex_unlock(&h->lock);
+            changed = 1;
+        } else {
+            /* These pixels are new (another screen, another size) and hold no frame to draw a pointer over:
+               draw the frame. */
+            h->uw = h->uh = 0;
+            pthread_mutex_lock(&h->lock);
+            h->frame_pending = 1;
+            pthread_mutex_unlock(&h->lock);
+        }
+        replay_frame_end(sink, changed);
+        pthread_mutex_unlock(&h->show_lock);
         /* Where a frame's time goes, for the log (beat_loop): drawing it to the target and waiting for the
-           GPU, reading it back, then the pointer and the tablet's screen. */
+           GPU, reading it back into the screen's memory, then the pointer and handing it to the presenter. */
+        pthread_mutex_lock(&h->lock);
         if (frame) h->t_encode += t1 - t0, h->t_read += t2 - t1, h->t_frames++;
         h->t_show += now_ns() - t2, h->t_shows++;
         pthread_mutex_unlock(&h->lock);
@@ -571,11 +628,20 @@ static void *beat_loop(void *arg) {
             uint64_t n = h->t_frames, s = h->t_shows, te = h->t_encode, tr = h->t_read, ts = h->t_show;
             h->t_frames = h->t_shows = h->t_encode = h->t_read = h->t_show = 0;
             pthread_mutex_unlock(&h->lock);
+            /* The screen's side of a frame (the replay's presenter, another thread): the copy into the swapchain,
+               the present, the wait for the GPU. */
+            uint64_t put = 0, put_ns = 0;
+            char screen[200] = "no screen";
+            pthread_mutex_lock(&h->show_lock);
+            if (h->sink) replay_present_stats(h->sink, &put, &put_ns), replay_screen_words(h->sink, screen, sizeof screen);
+            pthread_mutex_unlock(&h->show_lock);
             double secs = (now_ns() - last) / 1e9;
             hlog("reims: %llu MMIO accesses, %llu interrupts; %llu presents, %llu frames shown; "
-                 "%.1f frames/s, each %.1f ms to draw, %.1f ms to read back, %.1f ms to show",
+                 "%.1f frames/s, each %.1f ms to draw, %.1f ms to read back into the screen's memory, %.1f ms for the pointer "
+                 "and the hand-over; the screen (%s) put %llu on the display, %.1f ms each",
                  (unsigned long long)h->mmio, (unsigned long long)h->h->irqs, (unsigned long long)guest, (unsigned long long)h->frames,
-                 n / secs, n ? te / 1e6 / n : 0.0, n ? tr / 1e6 / n : 0.0, s ? ts / 1e6 / s : 0.0);
+                 n / secs, n ? te / 1e6 / n : 0.0, n ? tr / 1e6 / n : 0.0, s ? ts / 1e6 / s : 0.0, screen,
+                 (unsigned long long)put, put ? put_ns / 1e6 / put : 0.0);
             last = now_ns();
             reg_report(h);
         }
@@ -643,12 +709,23 @@ static int file_holds(const char *path, const char *needle) {
    kernel does not keep so; it carries the variable's name, which is how it is told from a stock build. So:
    in place on that driver alone (M2V_DMABUF_INPLACE=1, which m2v_no_host_import.py reads), copies on any
    other. Two files in the home change it (Settings, "Mac's memory in place"): in-place-off (always copies) and
-   in-place-force (in place on a Turnip that is not known to be coherent: to see what it does, not to use). */
+   in-place-force (in place on a Turnip that is not known to be coherent: to see what it does, not to use).
+
+   The framebuffer in place (Settings, "Framebuffer in place"): on the coherent driver the textures the GPU writes
+   over the Mac's pages, the Mac's framebuffer first of all, are asked for in place too (M2V_RENDER_IN_PLACE=1,
+   m2v_render_in_place.py), where metal2vulkan otherwise draws into an image of its own and copies the framebuffer
+   in and back on the GPU at every frame. An experiment in 0.3.53 (a file render-in-place turned it on); on by
+   default since 0.3.54, after the tablet ran it: the framebuffer was taken in place, a frame's drawing fell from
+   4.0 to 3.4 ms, and the pass that split in two because of the shadow no longer did. A file render-in-place-off
+   turns it off: Settings, or the app itself after a crash. */
 static void in_place_policy(Host *h, const char *driver) {
-    unsetenv("M2V_DMABUF_INPLACE"), unsetenv("TU_KGSL_IMPORT_COHERENT");
+    unsetenv("M2V_DMABUF_INPLACE"), unsetenv("TU_KGSL_IMPORT_COHERENT"), unsetenv("M2V_RENDER_IN_PLACE");
     if (!driver || !*driver) return; /* the system's driver imports no dma-bufs: copies, nothing to decide */
-    char off[1100] = "", force[1100] = "";
-    if (h->home[0]) snprintf(off, sizeof off, "%s/in-place-off", h->home), snprintf(force, sizeof force, "%s/in-place-force", h->home);
+    char off[1100] = "", force[1100] = "", render_off[1100] = "";
+    if (h->home[0]) {
+        snprintf(off, sizeof off, "%s/in-place-off", h->home), snprintf(force, sizeof force, "%s/in-place-force", h->home);
+        snprintf(render_off, sizeof render_off, "%s/render-in-place-off", h->home);
+    }
     int coherent = file_holds(driver, "TU_KGSL_IMPORT_COHERENT");
     if (off[0] && access(off, F_OK) == 0) {
         hlog("reims: the Mac's memory in place: off (Settings); the GPU works on copies");
@@ -658,6 +735,15 @@ static void in_place_policy(Host *h, const char *driver) {
         hlog("reims: the Mac's memory in place: this Turnip imports dma-bufs I/O-coherent (Henge's build), so the GPU "
              "uses the Mac's pages where /dev/udmabuf gives them (Settings > Zero-copy) and copies the rest; "
              "its \"turnip: dma-buf imports:\" line says what the kernel kept");
+        if (render_off[0] && access(render_off, F_OK) == 0) {
+            hlog("reims: the framebuffer in place: off (Settings, or a crash with it on); the GPU draws the Mac's screen "
+                 "into a copy");
+        } else {
+            setenv("M2V_RENDER_IN_PLACE", "1", 1);
+            hlog("reims: the framebuffer in place: textures the GPU draws into over the Mac's pages are asked for in "
+                 "place too; the \"metal2vulkan: (Henge)\" lines say which were taken. A wrong picture: Settings > "
+                 "Framebuffer in place: Off");
+        }
     } else if (force[0] && access(force, F_OK) == 0) {
         setenv("M2V_DMABUF_INPLACE", "1", 1);
         hlog("reims: the Mac's memory in place: FORCED (Settings) on a driver not known to import coherently with the "
@@ -869,6 +955,7 @@ int reims_host_start(const char *path, const char *log_path, const char *home, c
     if (log_fd >= 0) dup2(log_fd, 2);
     h->ram_fd = -1;
     pthread_mutex_init(&h->lock, NULL);
+    pthread_mutex_init(&h->show_lock, NULL);
     pthread_mutex_init(&h->reg_lock, NULL);
     pthread_cond_init(&h->wake, NULL);
     rvg_log_set_handler(on_log, NULL, RVG_LOG_INFO);
@@ -908,7 +995,7 @@ void reims_host_stop(void) {
     if (h->ram) munmap(h->ram, h->ram_size);
     if (h->ram_fd >= 0) close(h->ram_fd);
     if (h->h) munmap(h->h, HV_REIMS_FILE_BYTES);
-    free(h->pixels), free(h->shown), free(h->glyph);
+    free(h->under), free(h->glyph);
     free(h);
 }
 
@@ -918,11 +1005,13 @@ void reims_host_set_sink(Replay *r) {
     pthread_mutex_lock(&host_lock);
     Host *h = H;
     if (h) {
+        pthread_mutex_lock(&h->show_lock); /* a frame being written to the old one ends first */
         pthread_mutex_lock(&h->lock);
         h->sink = r;
         h->frame_pending = 1; /* draw the current frame for the new screen */
         pthread_cond_signal(&h->wake);
         pthread_mutex_unlock(&h->lock);
+        pthread_mutex_unlock(&h->show_lock);
     }
     pthread_mutex_unlock(&host_lock);
 }
