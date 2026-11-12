@@ -16,7 +16,9 @@ This patch gives a device without the extension an Importer that imports nothing
 
   - Importer::new returns such an importer instead of the refusal, with the host page as its
     alignment, and with the dma-buf route where the device has its extensions (0.3.37: Turnip
-    does, and with /dev/udmabuf reims-vgpu gives the pages a source of dma-bufs);
+    does, and with /dev/udmabuf reims-vgpu gives the pages a source of dma-bufs) and the app
+    says the driver's imports are coherent with the CPU's caches (0.3.52: M2V_DMABUF_INPLACE=1;
+    Turnip's stock KGSL import is not, see android/gpu/turnip/);
   - import_backing, the one place the pages' pointer reaches the driver, answers the runtime's own
     `unpinnable` refusal first, which every caller already turns into dma-bufs of the pages where
     the device imports them and the pages come with a source of them, and into a copy otherwise;
@@ -69,11 +71,26 @@ EDITS = {
                 };
                 function.map_or(std::ptr::null(), |function| function as *const c_void)
             };
-            let dma_buf = dma_buf.then(|| ash::khr::external_memory_fd::DeviceFn::load(load));
+            // In place only where the app says the driver's imports of dma-bufs are coherent with
+            // the CPU's caches (M2V_DMABUF_INPLACE=1, set by android/gpu/reims/host.c for a Turnip
+            // whose KGSL imports are I/O-coherent). The runtime never flushes or invalidates
+            // (`dma_buf.rs`, "The bytes"): Turnip's stock import on KGSL maps the pages for the GPU
+            // without I/O coherence, so the GPU would read main memory while the Mac's writes still
+            // sit in the CPU's caches. Elsewhere the device's dma-buf route stays unused: copies.
+            let offered = dma_buf;
+            let in_place = std::env::var_os("M2V_DMABUF_INPLACE").is_some_and(|v| v == "1");
+            let dma_buf = (offered && in_place)
+                .then(|| ash::khr::external_memory_fd::DeviceFn::load(load));
             let dma_buf_images = dma_buf.is_some() && dma_buf_images;
             eprintln!(
                 "metal2vulkan: no VK_EXT_external_memory_host; dma-bufs of host pages: {}, images over them: {}",
-                if dma_buf.is_some() { "imported" } else { "not offered by this driver (copies)" },
+                if dma_buf.is_some() {
+                    "imported (the Mac's pages are used in place)"
+                } else if offered {
+                    "the driver imports them, but not coherently with the CPU's caches as far as the app knows (copies)"
+                } else {
+                    "not offered by this driver (copies)"
+                },
                 dma_buf_images,
             );
             return Ok(Importer {

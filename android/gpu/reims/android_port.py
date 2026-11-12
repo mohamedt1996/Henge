@@ -212,6 +212,10 @@ def main() -> None:
     # copies, not a refusal that ends the app at the first IOSurface texture (m2v_no_host_import.py).
     import subprocess
     subprocess.run([sys.executable, '-I', str(HERE / 'm2v_no_host_import.py'), str(m2v)], check=True)
+    # Dma-bufs of host pages the runtime cannot check (Android refuses an app the fstatfs its check
+    # makes) are told by the kernel's name for them, and an answer that still fails is a copy of the
+    # pages, said in the log, not the app's death (m2v_dma_buf_checks.py).
+    subprocess.run([sys.executable, '-I', str(HERE / 'm2v_dma_buf_checks.py'), str(m2v)], check=True)
     # Framebuffer fetch on a device with neither ordered form (Qualcomm): input attachments without the
     # order flags, best effort (m2v_unordered_fetch.py), instead of refusing WindowServer's pipelines.
     subprocess.run([sys.executable, '-I', str(HERE / 'm2v_unordered_fetch.py'), str(m2v)], check=True)

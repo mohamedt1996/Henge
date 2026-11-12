@@ -173,11 +173,23 @@ public class VmService extends Service {
         File active = new File(files, "run.active");
         String build = Integer.toString(buildNumber(this));
         // Graphics: reims on Turnip: asked for, bundled, and not the driver that took this build down before.
+        // Two Turnips may be bundled: Henge's own build (I/O-coherent dma-buf imports: the Mac's memory in place,
+        // GpuView.turnipHenge) and the stock one. Henge's first; if it took this build down, the stock one; if
+        // that did too, the system's driver.
         android.content.SharedPreferences prefs = getSharedPreferences("henge", MODE_PRIVATE);
         boolean turnipAsked = "reims".equals(gpu) && !install && "turnip".equals(prefs.getString("reimsDriver", "turnip"));
-        boolean turnip = turnipAsked && GpuView.turnip(this) != null && !build.equals(prefs.getString("turnipCrashed", ""));
+        boolean ours = turnipAsked && GpuView.turnipHenge(this) != null && !"stock".equals(prefs.getString("turnipBuild", "henge"))
+                && !build.equals(prefs.getString("turnipHengeCrashed", ""));
+        boolean turnip = ours || (turnipAsked && GpuView.turnip(this) != null && !build.equals(prefs.getString("turnipCrashed", "")));
         if (active.exists()) {
-            logLastCrash(log);
+            int[] death = logLastCrash(log);
+            // Android ending the app (memory short, the user, an update) is no fault of the GPU's: only a death
+            // Android records as a crash, or one it has no record of, changes what the next run uses. A SIGKILL
+            // (status 9) is the low-memory killer's on a device that reports it as "signalled".
+            boolean crashed = death == null || death[0] == android.app.ApplicationExitInfo.REASON_CRASH_NATIVE
+                    || death[0] == android.app.ApplicationExitInfo.REASON_CRASH
+                    || death[0] == android.app.ApplicationExitInfo.REASON_INITIALIZATION_FAILURE
+                    || (death[0] == android.app.ApplicationExitInfo.REASON_SIGNALED && death[1] != 9);
             String last = "";
             try { last = new String(Files.readAllBytes(active.toPath()), StandardCharsets.UTF_8).trim(); } catch (Exception ignored) { }
             String lastMode = last.contains("@") ? last.substring(0, last.indexOf('@')) : last;
@@ -194,10 +206,22 @@ public class VmService extends Service {
                 if (ext != null) DeviceCheck.sh(true, "cp " + sq(kmsg.getPath()) + " " + sq(new File(ext, "gunyah-kmsg-last.txt").getPath())
                         + "; rm -f " + sq(kmsg.getPath()) + "; true");
             }
-            if ("reims-turnip".equals(lastMode) && "reims".equals(gpu) && !"install".equals(mode) && build.equals(lastBuild)) {
+            if (!crashed && lastMode.startsWith("reims") && "reims".equals(gpu) && !"install".equals(mode)) {
+                appendLog(log, "henge app: Android ended the app (" + exitReason(death[0]) + "), which is not a crash of the "
+                        + "GPU's: reims and its Vulkan driver are used as before. If it was memory, close other apps or lower "
+                        + "the Mac's memory or the JIT cache (Settings)");
+            } else if ("reims-turnip-henge".equals(lastMode) && "reims".equals(gpu) && !"install".equals(mode) && build.equals(lastBuild)) {
+                // Henge's own Turnip died: the stock one next, on copies, until the app is updated.
+                prefs.edit().putString("turnipHengeCrashed", build).apply();
+                ours = false;
+                turnip = turnipAsked && GpuView.turnip(this) != null && !build.equals(prefs.getString("turnipCrashed", ""));
+                appendLog(log, "henge app: reims on Henge's Turnip took the app down last time (its \"reims:\" lines above say "
+                        + "where); this build uses " + (turnip ? "the stock Turnip" : "the system's Vulkan driver")
+                        + " from now on. An update of the app tries Henge's Turnip again");
+            } else if ("reims-turnip".equals(lastMode) && "reims".equals(gpu) && !"install".equals(mode) && build.equals(lastBuild)) {
                 // Turnip's death is not reims's: the same screen on the system's driver, until the app is updated.
                 prefs.edit().putString("turnipCrashed", build).apply();
-                turnip = false;
+                turnip = ours;
                 appendLog(log, "henge app: reims on Turnip took the app down last time (its \"reims:\" lines above say where); "
                         + "this build uses the system's Vulkan driver from now on. An update of the app tries Turnip again");
             } else if (lastMode.startsWith("reims") && "reims".equals(gpu) && !"install".equals(mode)) {
@@ -212,7 +236,8 @@ public class VmService extends Service {
             }
         }
         try (FileOutputStream o = new FileOutputStream(active)) {
-            o.write((("install".equals(mode) ? "install" : turnip && "reims".equals(gpu) ? "reims-turnip" : gpu) + "@" + build).getBytes(StandardCharsets.UTF_8));
+            o.write((("install".equals(mode) ? "install" : turnip && "reims".equals(gpu) ? (ours ? "reims-turnip-henge" : "reims-turnip") : gpu)
+                    + "@" + build).getBytes(StandardCharsets.UTF_8));
         } catch (Exception ignored) { }
         File lib = libraryDir(this), image = findImage(this, release);
         String engine = getApplicationInfo().nativeLibraryDir + "/libhengevm.so";
@@ -239,6 +264,9 @@ public class VmService extends Service {
         cmd.add("--sound"); cmd.add(sound ? "1" : "0");
         cmd.add("--ram"); cmd.add(Integer.toString(gunyah() ? Math.min(ram, 3072) : ram));
         cmd.add("--cpus"); cmd.add(Integer.toString(cpus));
+        // Settings > JIT cache: the translated code's room, 768 MB where nothing is set (host/vm.c).
+        int jitMb = prefs.getInt("jitMb", 0);
+        if (!install && !gunyah() && jitMb >= 64) { cmd.add("--jit-mb"); cmd.add(Integer.toString(jitMb)); }
         if (gunyah()) { cmd.add("--engine"); cmd.add("gunyah"); }
         // Graphics: reims: the GPU device runs in this process (libhengegpu.so), up before the engine needs it.
         boolean reims = !install && "reims".equals(gpu);
@@ -264,8 +292,15 @@ public class VmService extends Service {
         // The Vulkan driver reims-vgpu runs on: the system's, or Turnip where the build bundles it and the setting asks.
         String vulkanLib = null;
         if (reims) {
-            File lib2 = GpuView.turnip(this);
-            if (turnip && lib2 != null) vulkanLib = lib2.getPath();
+            File lib2 = ours ? GpuView.turnipHenge(this) : GpuView.turnip(this);
+            if (turnip && lib2 != null) {
+                vulkanLib = lib2.getPath();
+                if (!ours && GpuView.turnipHenge(this) != null)
+                    appendLog(log, "henge app: the stock Turnip is used (" + ("stock".equals(prefs.getString("turnipBuild", "henge"))
+                            ? "Settings" : "Henge's own took this build of the app down before") + "): the GPU works on copies of the Mac's memory");
+                else if (!ours)
+                    appendLog(log, "henge app: this build has no Turnip of Henge's own (its CI step failed): the stock one, on copies of the Mac's memory");
+            }
             else if (turnipAsked && lib2 == null) appendLog(log, "henge app: this build has no Turnip; the system's Vulkan driver is used");
             else if (turnipAsked) appendLog(log, "henge app: Turnip took this build of the app down before; the system's Vulkan driver is used");
         }
@@ -309,8 +344,11 @@ public class VmService extends Service {
             boolean ramInMemory = !install && !"storage".equals(prefs.getString("ram", "memory"))
                     && !build.equals(prefs.getString("ramFileBuild", ""));
             if (ramInMemory) pb.environment().put("HV_RAM_MEMFD", "1");
-            if (!install && hugePages(log, ramInMemory && !gunyah() && "on".equals(prefs.getString("hugepages", "off"))))
-                pb.environment().put("HV_RAM_THP", "1");
+            // Huge pages: On asks for them as the Mac touches its memory; Eager also touches all of it at the start,
+            // while the tablet still has 2 MB runs of free memory to give (devices/vmapple.c).
+            String huge = prefs.getString("hugepages", "off");
+            if (!install && hugePages(log, ramInMemory && !gunyah() && !"off".equals(huge)))
+                pb.environment().put("HV_RAM_THP", "eager".equals(huge) ? "2" : "1");
             // The Mac's disk: the data is flushed at each of macOS's flushes (fdatasync), not the file's times too.
             pb.environment().put("HV_FLUSH", "2");
             // Graphics: reims: the Mac's screen size (Settings), every pixel of which is copied on this driver.
@@ -364,19 +402,22 @@ public class VmService extends Service {
     }
 
     /** Android's record of this app's last death (ApplicationExitInfo, Android 11+), with the tombstone's
-     *  backtrace from Android 12: the native crash the app's own handler may not have caught. */
-    private void logLastCrash(File log) {
-        if (android.os.Build.VERSION.SDK_INT < 30) return;
+     *  backtrace from Android 12: the native crash the app's own handler may not have caught. Answers its reason
+     *  and status, or null where Android keeps no record. */
+    private int[] logLastCrash(File log) {
+        if (android.os.Build.VERSION.SDK_INT < 30) return null;
+        int[] death = null;
         try {
             android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
             java.util.List<android.app.ApplicationExitInfo> exits = am.getHistoricalProcessExitReasons(null, 0, 1);
-            if (exits.isEmpty()) return;
+            if (exits.isEmpty()) return null;
             android.app.ApplicationExitInfo e = exits.get(0);
+            death = new int[]{e.getReason(), e.getStatus()};
             appendLog(log, "henge app: Android's record of the last death: reason " + e.getReason() + " (" + exitReason(e.getReason())
                     + "), status " + e.getStatus() + ", " + e.getDescription() + ", at " + new java.util.Date(e.getTimestamp()));
             if (android.os.Build.VERSION.SDK_INT >= 31 && e.getReason() == android.app.ApplicationExitInfo.REASON_CRASH_NATIVE) {
                 try (java.io.InputStream in = e.getTraceInputStream()) {
-                    if (in == null) { appendLog(log, "henge app: no tombstone kept"); return; }
+                    if (in == null) { appendLog(log, "henge app: no tombstone kept"); return death; }
                     java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(in, StandardCharsets.UTF_8));
                     StringBuilder sb = new StringBuilder("henge app: tombstone:\n");
                     int lines = 0;
@@ -395,6 +436,7 @@ public class VmService extends Service {
         } catch (Exception ex) {
             appendLog(log, "henge app: could not read Android's record of the last death: " + ex);
         }
+        return death;
     }
 
     private static String exitReason(int r) {
@@ -407,6 +449,14 @@ public class VmService extends Service {
             case android.app.ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE: return "excessive resource usage";
             case android.app.ApplicationExitInfo.REASON_USER_REQUESTED: return "user requested";
             case android.app.ApplicationExitInfo.REASON_OTHER: return "other";
+            case android.app.ApplicationExitInfo.REASON_USER_STOPPED: return "stopped by the user";
+            case android.app.ApplicationExitInfo.REASON_DEPENDENCY_DIED: return "a process it depends on died";
+            case android.app.ApplicationExitInfo.REASON_PERMISSION_CHANGE: return "a permission changed";
+            case android.app.ApplicationExitInfo.REASON_EXIT_SELF: return "it exited by itself";
+            case android.app.ApplicationExitInfo.REASON_INITIALIZATION_FAILURE: return "it failed to start";
+            case 14: return "frozen too long";   // REASON_FREEZER, API 34
+            case 15: return "its package changed state"; // REASON_PACKAGE_STATE_CHANGE, API 34
+            case 16: return "the app was updated";       // REASON_PACKAGE_UPDATED, API 34
             default: return "?";
         }
     }

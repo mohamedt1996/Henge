@@ -605,7 +605,67 @@ static uint8_t *map_ram_aligned(int fd, uint64_t size) {
     if (at > reserved) munmap(reserved, (size_t)(at - reserved));
     uint8_t *end = at + size, *reserved_end = reserved + size + align;
     if (reserved_end > end) munmap(end, (size_t)(reserved_end - end));
+    /* Settings > Huge pages: the engine asks for the Mac's RAM in 2 MB pages; a page first touched from this
+       side (the GPU reading a surface the Mac has not written yet) is then huge too, and this mapping, on its
+       2 MB boundary, maps the huge ones as such. Nothing where the kernel's shared-memory huge pages are off. */
+    madvise(ram, size, MADV_HUGEPAGE);
     return ram;
+}
+
+/* Whether the file at `path` holds the bytes of `needle` anywhere (a driver's own strings). */
+static int file_holds(const char *path, const char *needle) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC), found = 0;
+    struct stat st;
+    size_t n = strlen(needle);
+    if (fd < 0) return 0;
+    if (fstat(fd, &st) == 0 && (size_t)st.st_size >= n && n) {
+        const char *p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (p != MAP_FAILED) {
+            for (const char *at = p, *end = p + st.st_size - n; at <= end && !found; at++) {
+                at = memchr(at, needle[0], (size_t)(end - at) + 1);
+                if (!at) break;
+                found = !memcmp(at, needle, n);
+            }
+            munmap((void *)p, (size_t)st.st_size);
+        }
+    }
+    close(fd);
+    return found;
+}
+
+/* The Mac's memory in place (Settings > Zero-copy, a kernel with /dev/udmabuf): whether the Vulkan driver at
+   `driver` may be given dma-bufs of the Mac's own pages to draw from and into, instead of copies of them.
+   metal2vulkan never flushes or invalidates around such an import (it takes it for coherent with the CPU's
+   caches, as on the desktop GPUs it was written against), and the Mac's CPUs write those pages through cached
+   mappings. Turnip's stock import of a dma-buf on KGSL is not I/O-coherent, so the GPU would read main memory
+   while what the Mac just drew sits in a CPU cache: stale blocks on the screen. Henge's own build of Turnip
+   (android/gpu/turnip) imports them I/O-coherent where TU_KGSL_IMPORT_COHERENT asks and refuses an import the
+   kernel does not keep so; it carries the variable's name, which is how it is told from a stock build. So:
+   in place on that driver alone (M2V_DMABUF_INPLACE=1, which m2v_no_host_import.py reads), copies on any
+   other. Two files in the home change it (Settings, "Mac's memory in place"): in-place-off (always copies) and
+   in-place-force (in place on a Turnip that is not known to be coherent: to see what it does, not to use). */
+static void in_place_policy(Host *h, const char *driver) {
+    unsetenv("M2V_DMABUF_INPLACE"), unsetenv("TU_KGSL_IMPORT_COHERENT");
+    if (!driver || !*driver) return; /* the system's driver imports no dma-bufs: copies, nothing to decide */
+    char off[1100] = "", force[1100] = "";
+    if (h->home[0]) snprintf(off, sizeof off, "%s/in-place-off", h->home), snprintf(force, sizeof force, "%s/in-place-force", h->home);
+    int coherent = file_holds(driver, "TU_KGSL_IMPORT_COHERENT");
+    if (off[0] && access(off, F_OK) == 0) {
+        hlog("reims: the Mac's memory in place: off (Settings); the GPU works on copies");
+    } else if (coherent) {
+        setenv("TU_KGSL_IMPORT_COHERENT", "require", 1);
+        setenv("M2V_DMABUF_INPLACE", "1", 1);
+        hlog("reims: the Mac's memory in place: this Turnip imports dma-bufs I/O-coherent (Henge's build), so the GPU "
+             "uses the Mac's pages where /dev/udmabuf gives them (Settings > Zero-copy) and copies the rest; "
+             "its \"turnip: dma-buf imports:\" line says what the kernel kept");
+    } else if (force[0] && access(force, F_OK) == 0) {
+        setenv("M2V_DMABUF_INPLACE", "1", 1);
+        hlog("reims: the Mac's memory in place: FORCED (Settings) on a driver not known to import coherently with the "
+             "CPU's caches: stale or torn pixels are expected");
+    } else {
+        hlog("reims: the Mac's memory in place: not on this driver (a stock Turnip's dma-buf imports are not coherent "
+             "with the CPU's caches); the GPU works on copies");
+    }
 }
 
 /* ------------------------------------------------------------------ bring-up -- */
@@ -694,6 +754,7 @@ static int bring_up(Host *h) {
     /* The Vulkan driver: the system's through the loader, or the app's own (Turnip) opened directly as
        the ICD (metal2vulkan reads M2V_VULKAN_LIBRARY, Henge's port). */
     unsetenv("M2V_VULKAN_LIBRARY"), unsetenv("M2V_VULKAN_GIPA");
+    in_place_policy(h, NULL);
     if (h->vulkan[0]) {
         /* The app's own driver needs platform libraries an app's namespace is refused: opened as Android
            opens a vendor driver (turnip_load.cpp), and metal2vulkan takes its entry point. */
@@ -708,6 +769,7 @@ static int bring_up(Host *h) {
             snprintf(hex, sizeof hex, "%#llx", (unsigned long long)(uintptr_t)gipa);
             setenv("M2V_VULKAN_GIPA", hex, 1);
             hlog("reims: Vulkan driver: %s (%s)", h->vulkan, reims_turnip_error());
+            in_place_policy(h, h->vulkan);
         } else {
             hlog("reims: Vulkan driver: %s did not open (%s); the system's instead", h->vulkan, reims_turnip_error());
             h->vulkan[0] = 0;
@@ -721,6 +783,7 @@ static int bring_up(Host *h) {
            system's, so a bad Turnip build costs the exactness, not the run. */
         hlog("reims: rvg_device_create on %s: %s; trying the system's Vulkan driver", h->vulkan, rvg_status_message(st));
         unsetenv("M2V_VULKAN_LIBRARY"), unsetenv("M2V_VULKAN_GIPA");
+        in_place_policy(h, NULL);
         h->vulkan[0] = 0;
         set_stage("rvg_device_create (the system's Vulkan driver, after the app's own failed)");
         st = rvg_device_create(&dc, &h->dev);

@@ -21,6 +21,7 @@ typedef struct HvJitRegion {
     size_t used;        /* in instructions */
     size_t limit;       /* in instructions; 0: all of it (HV_JIT_CAP: a smaller cache in the same region, to compare) */
     int owned;          /* mapped here (closed here) rather than handed in */
+    uint64_t released;  /* bytes given back to the kernel at resets so far (Linux: hv_jit_reset) */
 } HvJitRegion;
 
 int hv_jit_region_open(HvJitRegion *region, size_t bytes);

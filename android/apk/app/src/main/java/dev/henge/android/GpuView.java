@@ -63,5 +63,14 @@ public class GpuView extends SurfaceView implements SurfaceHolder.Callback {
         java.io.File f = new java.io.File(c.getApplicationInfo().nativeLibraryDir, "libvulkan_freedreno.so");
         return f.exists() ? f : null;
     }
+    /**
+     * Henge's own build of Turnip (android/gpu/turnip): the stock one's source, with its import of a dma-buf
+     * on KGSL made I/O-coherent, so it may use the Mac's memory in place (Settings > Zero-copy). Null where the
+     * build has none (its CI step failed): the stock driver then, on copies.
+     */
+    static java.io.File turnipHenge(Context c) {
+        java.io.File f = new java.io.File(c.getApplicationInfo().nativeLibraryDir, "libvulkan_freedreno_henge.so");
+        return f.exists() ? f : null;
+    }
     static native void nativeReimsStop();
 }
