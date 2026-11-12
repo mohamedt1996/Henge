@@ -116,6 +116,67 @@ def main() -> None:
         end = t.index('            return;\n        }\n', at) + len('            return;\n        }\n')
         t = t[:end] + rounding + t[end:]
         regs.write_text(t)
+    # Every mapping the library makes funnels through MemoryMap::new_range_mapping (the device root's
+    # pages, the FIFO rings, the IOSurface ring and descriptor tables, the GPU tasks' roots;
+    # new_contiguous_mapping calls it too). It dies unless the total length is whole guest pages
+    # (fatal_unless!(total_length % APV_PAGE_SIZE == 0, MappingLengthUnaligned)). APV_PAGE_SIZE is a
+    # compile-time 16 KiB on arm64, not the host's page: macOS maps on 16 KiB guest pages, but this
+    # host's are 4 KiB, so a length that is whole 4 KiB host pages yet not whole 16 KiB guest pages
+    # (an IOSurface ring of ring_size x 16 bytes is the one the tablet hit) reaches here and ends the
+    # app. The host VM (os/linux/vm.rs) already rounds every length to its own 4 KiB pages in
+    # allocate_anywhere, protect_max, remap and deallocate, so this guard is stricter than the host
+    # needs. The ring site's own rounding above covers one caller; this rounds at the funnel so every
+    # caller is covered. The length is rounded up to a whole guest page, the tail backed by the
+    # allocation's own zeros; the caller's ranges still tile the requested length, so the coverage
+    # check compares against that, and the Mapping spans the rounded length so its teardown frees it
+    # all. A mapping past the end of RAM is still refused (None), not fatal, as before.
+    mapf = reims / 'crates' / 'reims-vgpu-core' / 'src' / 'memory' / 'map.rs'
+    t = mapf.read_text()
+    assert_anchor = (
+        '        let vm = self.platform.vm();\n'
+        '        // A total length of 0 passes the assert.\n'
+        '        crate::fatal_unless!(\n'
+        '            total_length % const { NonZeroU64::new(APV_PAGE_SIZE).unwrap() } == 0,\n'
+        '            DeathKind::MappingLengthUnaligned\n'
+        '        );\n'
+    )
+    round_up = (
+        '        let vm = self.platform.vm();\n'
+        '        // Henge\'s Android port: macOS maps on 16 KiB guest pages, but this host\'s are\n'
+        '        // 4 KiB, so a length that is whole host pages yet not whole guest pages (an\n'
+        '        // IOSurface ring of ring_size x 16 bytes, a descriptor table, a task root) reaches\n'
+        '        // this, the one path every mapping funnels through, and upstream makes it host\n'
+        '        // death. The length is rounded up to a whole guest page instead; the host VM rounds\n'
+        '        // every length to its own 4 KiB pages regardless, so this only lifts core\'s\n'
+        '        // stricter guard, and the caller\'s index math keeps the guest\'s logical length.\n'
+        '        let requested = total_length;\n'
+        '        let total_length = requested.div_ceil(APV_PAGE_SIZE).saturating_mul(APV_PAGE_SIZE);\n'
+        '        if total_length != requested {\n'
+        '            log::warn!(\n'
+        '                "mapping length {requested} is not whole guest pages; mapping {total_length} bytes"\n'
+        '            );\n'
+        '        }\n'
+        '        // Now whole guest pages by construction (0 stays 0); the guard still holds.\n'
+        '        crate::fatal_unless!(\n'
+        '            total_length % const { NonZeroU64::new(APV_PAGE_SIZE).unwrap() } == 0,\n'
+        '            DeathKind::MappingLengthUnaligned\n'
+        '        );\n'
+    )
+    cover_anchor = '        if mapped != total_length {\n'
+    cover_new = (
+        '        // Henge\'s Android port: the caller\'s ranges tile the requested length; the\n'
+        '        // rounding up to a whole guest page above is backed by the allocation\'s zeros.\n'
+        '        if mapped != requested {\n'
+    )
+    if round_up not in t:
+        if t.count(assert_anchor) != 1:
+            sys.exit(f'android_port: {mapf}: the map-length assert not found once; upstream changed')
+        t = t.replace(assert_anchor, round_up)
+    if cover_new not in t:
+        if t.count(cover_anchor) != 1:
+            sys.exit(f'android_port: {mapf}: the mapping-coverage check not found once; upstream changed')
+        t = t.replace(cover_anchor, cover_new)
+    mapf.write_text(t)
     # The IOSurface mapper device sizes its descriptor table, its page mappings and the features it
     # offers by the HOST's page size (sysconf), which equals the guest's on every host the library
     # supports (Apple silicon: 16 KiB both; x86-64 Linux: 4 KiB both). Android arm64 is 4 KiB host

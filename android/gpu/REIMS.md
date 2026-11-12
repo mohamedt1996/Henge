@@ -312,6 +312,37 @@ map granule to a compile-time `PAGE_SIZE` — 16 KiB on arm64, 4 KiB on x86-64 �
 the device/descriptor page-size edits already force.) No pin moved; the crash is not cleared by any
 available bump and the on-device test still stands.
 
+Unaligned mapping length made survivable at the funnel (2026-11-12). The pinned source was read to
+find every site that enforces a page-aligned mapping length. There is one fatal site,
+`MemoryMap::new_range_mapping` in `reims-vgpu-core/src/memory/map.rs`
+(`fatal_unless!(total_length % APV_PAGE_SIZE == 0, MappingLengthUnaligned)`); the other
+`MappingLengthUnaligned` references are its `DeathKind` and tests. That one function is the funnel
+**every** mapping goes through: the device root's pages and FIFO, the FIFO rings, the IOSurface ring
+(`iosurface/regs.rs`) and descriptor table, the GPU task roots (`gpu_task/handshake.rs`), and
+`new_contiguous_mapping` all call it. On the pinned commit `APV_PAGE_SIZE` is a **compile-time**
+constant (`1 << APV_PAGE_SHIFT`, `APV_PAGE_SHIFT = 14` on arm64), i.e. 16 KiB — *not* the host's
+`sysconf` page — so this is not a 4 KiB/16 KiB mix-up at the check itself. The real cause is that the
+check is **stricter than the host needs**: the Vulkan platform's `HostVm` (`os/linux/vm.rs`) already
+rounds every length to its own 4 KiB host pages in `allocate_anywhere`, `protect_max`, the remaps and
+`deallocate`, so a length that is whole 4 KiB host pages but not whole 16 KiB guest pages (macOS's
+IOSurface mapper writes such a ring, `ring_size x 16` bytes) would map fine, yet core aborts the
+process first. The earlier fix only pre-rounded the ring in `regs.rs`, leaving the FIFO, task-root
+and descriptor callers able to reach the fatal check with such a length.
+
+`android_port.py` now rounds the length up to a whole guest page **at the funnel**
+(`new_range_mapping`), not just at the ring: an unaligned `total_length` is rounded up to
+`APV_PAGE_SIZE` (logged once as a warning), the allocation, the protect and the `Mapping`'s teardown
+all span the rounded length so nothing leaks, the rounded tail is backed by the allocation's own
+zeros, and the range-coverage check compares the mapped ranges against the *requested* length so the
+caller's index math keeps the guest's logical size. A mapping past the end of guest RAM is still
+refused (`None`), not fatal, as before. The ring's existing `regs.rs` rounding is kept as a harmless
+belt-and-suspenders (map.rs then sees an already-aligned length). The edit is anchored on the exact
+pinned text and exits the build if that text changed; it was verified by running the whole
+`android_port.py` against fresh clones of both pinned commits (green, and idempotent on a re-run) and
+by confirming both map.rs anchors match exactly once. Not yet exercised on the tablet: whether this
+clears the crash for good still needs the on-device boot, but no mapping call site can now reach the
+fatal length check.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
