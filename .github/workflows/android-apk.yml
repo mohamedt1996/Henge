@@ -50,9 +50,19 @@ jobs:
         run: |
           if [ ! -f ~/deps/arm64/lib/libcurl.a ] || [ ! -d ~/deps/src/lzfse ]; then android/build_deps.sh ~/deps/arm64; fi
 
+      - name: Graphics host libapplegfx-vulkan (arm64, best effort)
+        run: |
+          # A second, independent GPU host (android/pvg_applegfx.c). Best effort: on failure the engine builds
+          # without it and Graphics: applegfx logs that it is absent.
+          if android/applegfx/build.sh "$HOME/applegfx-out"; then
+            echo "APPLEGFX=$HOME/applegfx-out" >> "$GITHUB_ENV"
+          else
+            echo "applegfx: libapplegfx-vulkan did not build; the engine is built without it"
+          fi
+
       - name: Engine (hengevm-android, static arm64)
         run: |
-          make -f android/Makefile build/android/hengevm-android DEPS=$HOME/deps/arm64 -j"$(nproc)"
+          make -f android/Makefile build/android/hengevm-android DEPS=$HOME/deps/arm64 ${APPLEGFX:+APPLEGFX=$APPLEGFX} -j"$(nproc)"
           mkdir -p android/apk/app/src/main/jniLibs/arm64-v8a
           cp build/android/hengevm-android android/apk/app/src/main/jniLibs/arm64-v8a/libhengevm.so
           aarch64-linux-gnu-strip android/apk/app/src/main/jniLibs/arm64-v8a/libhengevm.so

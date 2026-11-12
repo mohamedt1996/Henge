@@ -49,8 +49,14 @@ $(B)/%.o: devices/%.c devices/*.h android/compat/aes_soft.h | $(B)
 $(B)/pvg_android.o: android/pvg_android.c | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 # Linked as an object, not from the archive: it overrides vmapple.c's weak hv_pvg_external_create.
+# Graphics: applegfx (android/pvg_applegfx.c). With APPLEGFX=<dir> (android/applegfx/build.sh output) the
+# engine links libapplegfx-vulkan and the backend is live; without it the backend logs it is absent.
+ifdef APPLEGFX
+APPLEGFX_CFLAGS = -DHAVE_APPLEGFX -I$(APPLEGFX)/include
+APPLEGFX_LIB = $(APPLEGFX)/libapplegfx-vulkan.a
+endif
 $(B)/pvg_applegfx.o: android/pvg_applegfx.c | $(B)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(APPLEGFX_CFLAGS) -c $< -o $@
 $(B)/pvg_reims.o: android/pvg_reims.c android/gpu/reims_link.h android/gpu/ram_fd.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -84,7 +90,7 @@ $(B)/gunyah-probe: android/tools/gunyah_probe.c android/tools/gunyah_probe_blobs
 $(B)/libhengerestore.a: android/build_restore.sh host/install.c host/libusb_shim.c
 	DEPS=$(DEPS) android/build_restore.sh
 RESTORE_LIBS = $(B)/libhengerestore.a $(DEPS)/libzip/lib/libzip.a -L$(DEPS)/lib -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz
-$(B)/hengevm-android: $(B)/seccomp_compat.o $(B)/runner.o $(B)/gunyah.o $(B)/pvg_reims.o $(B)/pvg_applegfx.o $(B)/curl_android.o $(B)/fetch.o $(LZFSE_OBJ) $(B)/vm.o $(B)/usb_host.o $(B)/net_slirp.o $(B)/vnc.o $(B)/audio_android.o $(B)/host_stubs.o $(B)/libhengevm.a $(B)/libhengerestore.a
+$(B)/hengevm-android: $(B)/seccomp_compat.o $(B)/runner.o $(B)/gunyah.o $(B)/pvg_reims.o $(B)/pvg_applegfx.o $(APPLEGFX_LIB) $(B)/curl_android.o $(B)/fetch.o $(LZFSE_OBJ) $(B)/vm.o $(B)/usb_host.o $(B)/net_slirp.o $(B)/vnc.o $(B)/audio_android.o $(B)/host_stubs.o $(B)/libhengevm.a $(B)/libhengerestore.a
 	$(CC) $(CFLAGS) $(filter-out $(B)/libhengerestore.a,$^) $(RESTORE_LIBS) $(SLIRP_LIBS) $(LIBS) -Wl,--wrap=curl_easy_init -o $@
 	python3 android/nosyscall.py $@
 

@@ -1076,8 +1076,8 @@ public class MainActivity extends Activity {
             "Experimental: the whole GPU device is reims-vgpu running in this app, drawing macOS's Metal work on the "
                     + "tablet's GPU through metal2vulkan, as a Mac's own paravirtual GPU would. Keep the app open while the Mac runs.",
             "Experimental: a second, independent GPU host (libapplegfx-vulkan), chosen instead of reims so the GPU is "
-                    + "not bet on one project. Not built into this app yet: for now it falls back to Graphics: GPU and the "
-                    + "log says so. Pick reims for the working paravirtual GPU."};
+                    + "not bet on one project. It loads and initialises on the tablet (its version is in the log), but does "
+                    + "not drive the screen yet, so the picture stays on Graphics: GPU. Pick reims for the working GPU."};
 
     private String gpuMode() { return prefs.getString("gpu", "on"); }
     static final String[] REIMS_MODES = {"1024x768", "1280x800", "1600x1000", "1920x1080"};
