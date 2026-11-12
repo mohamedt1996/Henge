@@ -706,11 +706,11 @@ public class MainActivity extends Activity {
         c.addView(hairline());
         c.addView(choiceRow("Engine statistics", new String[]{"Off", "On"}, "on".equals(prefs.getString("engineStats", "off")) ? 1 : 0,
                 i -> { prefs.edit().putString("engineStats", i == 1 ? "on" : "off").apply(); render(true); }));
-        TextView enote = text("On: once a minute the CPU engine writes where its time goes into the log (some thirty lines: "
+        TextView statsNote = text("On: once a minute the CPU engine writes where its time goes into the log (some thirty lines: "
                 + "memory lookups that missed, slow memory accesses, interrupts, how idle the Mac is). For finding what to "
                 + "make faster; it costs a little speed while on.", 13, DIM, false);
-        enote.setPadding(dp(17), 0, dp(17), dp(12));
-        c.addView(enote);
+        statsNote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(statsNote);
         c.addView(hairline());
         final String hugeNow = prefs.getString("hugepages", "off");
         c.addView(choiceRow("Huge pages", new String[]{"Off", "On", "Eager"}, "eager".equals(hugeNow) ? 2 : "on".equals(hugeNow) ? 1 : 0,
