@@ -711,17 +711,20 @@ static int file_holds(const char *path, const char *needle) {
    other. Two files in the home change it (Settings, "Mac's memory in place"): in-place-off (always copies) and
    in-place-force (in place on a Turnip that is not known to be coherent: to see what it does, not to use).
 
-   A third, render-in-place (Settings, "Framebuffer in place", an experiment, 0.3.53): on the coherent driver the
-   textures the GPU writes over the Mac's pages, the Mac's framebuffer first of all, are asked for in place too
-   (M2V_RENDER_IN_PLACE=1, m2v_render_in_place.py), where metal2vulkan otherwise draws into an image of its own
-   and copies the framebuffer in and back on the GPU at every frame. The app takes the file away after a crash. */
+   The framebuffer in place (Settings, "Framebuffer in place"): on the coherent driver the textures the GPU writes
+   over the Mac's pages, the Mac's framebuffer first of all, are asked for in place too (M2V_RENDER_IN_PLACE=1,
+   m2v_render_in_place.py), where metal2vulkan otherwise draws into an image of its own and copies the framebuffer
+   in and back on the GPU at every frame. An experiment in 0.3.53 (a file render-in-place turned it on); on by
+   default since 0.3.54, after the tablet ran it: the framebuffer was taken in place, a frame's drawing fell from
+   4.0 to 3.4 ms, and the pass that split in two because of the shadow no longer did. A file render-in-place-off
+   turns it off: Settings, or the app itself after a crash. */
 static void in_place_policy(Host *h, const char *driver) {
     unsetenv("M2V_DMABUF_INPLACE"), unsetenv("TU_KGSL_IMPORT_COHERENT"), unsetenv("M2V_RENDER_IN_PLACE");
     if (!driver || !*driver) return; /* the system's driver imports no dma-bufs: copies, nothing to decide */
-    char off[1100] = "", force[1100] = "", render[1100] = "";
+    char off[1100] = "", force[1100] = "", render_off[1100] = "";
     if (h->home[0]) {
         snprintf(off, sizeof off, "%s/in-place-off", h->home), snprintf(force, sizeof force, "%s/in-place-force", h->home);
-        snprintf(render, sizeof render, "%s/render-in-place", h->home);
+        snprintf(render_off, sizeof render_off, "%s/render-in-place-off", h->home);
     }
     int coherent = file_holds(driver, "TU_KGSL_IMPORT_COHERENT");
     if (off[0] && access(off, F_OK) == 0) {
@@ -732,11 +735,14 @@ static void in_place_policy(Host *h, const char *driver) {
         hlog("reims: the Mac's memory in place: this Turnip imports dma-bufs I/O-coherent (Henge's build), so the GPU "
              "uses the Mac's pages where /dev/udmabuf gives them (Settings > Zero-copy) and copies the rest; "
              "its \"turnip: dma-buf imports:\" line says what the kernel kept");
-        if (render[0] && access(render, F_OK) == 0) {
+        if (render_off[0] && access(render_off, F_OK) == 0) {
+            hlog("reims: the framebuffer in place: off (Settings, or a crash with it on); the GPU draws the Mac's screen "
+                 "into a copy");
+        } else {
             setenv("M2V_RENDER_IN_PLACE", "1", 1);
-            hlog("reims: the framebuffer in place (Settings, an experiment): textures the GPU draws into over the Mac's "
-                 "pages are asked for in place too; the \"metal2vulkan: (Henge)\" lines say which were taken. A wrong "
-                 "picture or a slower one: turn it off");
+            hlog("reims: the framebuffer in place: textures the GPU draws into over the Mac's pages are asked for in "
+                 "place too; the \"metal2vulkan: (Henge)\" lines say which were taken. A wrong picture: Settings > "
+                 "Framebuffer in place: Off");
         }
     } else if (force[0] && access(force, F_OK) == 0) {
         setenv("M2V_DMABUF_INPLACE", "1", 1);

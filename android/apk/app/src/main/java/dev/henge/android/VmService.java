@@ -211,13 +211,16 @@ public class VmService extends Service {
                         + "GPU's: reims and its Vulkan driver are used as before. If it was memory, close other apps or lower "
                         + "the Mac's memory or the JIT cache (Settings)");
             } else if ("reims-turnip-henge".equals(lastMode) && "reims".equals(gpu) && !"install".equals(mode)
-                    && new File(reimsHomeDir(this), "render-in-place").exists()) {
-                // The run that died had the framebuffer in place on (Settings, an experiment that had not run on a
-                // tablet when it shipped): that is the first suspect, and the driver keeps its place.
-                new File(reimsHomeDir(this), "render-in-place").delete();
-                appendLog(log, "henge app: the run that took the app down had Settings > Framebuffer in place on (an "
-                        + "experiment): it is off again, and Henge's Turnip is used as before. Its \"reims:\" and "
-                        + "\"metal2vulkan:\" lines above say where it died");
+                    && "on".equals(prefs.getString("zerocopy", "off"))
+                    && !new File(reimsHomeDir(this), "render-in-place-off").exists()
+                    && !new File(reimsHomeDir(this), "in-place-off").exists()) {
+                // The run that died drew the Mac's framebuffer in place (on by default since 0.3.54, after one good
+                // run on the tablet): the first suspect, and the driver keeps its place. Off until Settings says On.
+                try { new File(reimsHomeDir(this), "render-in-place-off").createNewFile(); } catch (Exception ignored) { }
+                appendLog(log, "henge app: the run that took the app down drew the Mac's screen in place (Settings > "
+                        + "Framebuffer in place): it is off now, and Henge's Turnip is used as before. Its \"reims:\" and "
+                        + "\"metal2vulkan:\" lines above say where it died. If the next crash comes with it off, the "
+                        + "driver is what changes");
             } else if ("reims-turnip-henge".equals(lastMode) && "reims".equals(gpu) && !"install".equals(mode) && build.equals(lastBuild)) {
                 // Henge's own Turnip died: the stock one next, on copies, until the app is updated.
                 prefs.edit().putString("turnipHengeCrashed", build).apply();
@@ -275,6 +278,11 @@ public class VmService extends Service {
         // Settings > JIT cache: the translated code's room, 768 MB where nothing is set (host/vm.c).
         int jitMb = prefs.getInt("jitMb", 0);
         if (!install && !gunyah() && jitMb >= 64) { cmd.add("--jit-mb"); cmd.add(Integer.toString(jitMb)); }
+        // Settings > JIT cache memory: Keep. The cache's pages stay the engine's when it drops its translations
+        // (host/jit_region.c gives them back otherwise): to compare, with the heartbeat's swap figures.
+        final boolean jitKeep = !install && !gunyah() && "keep".equals(prefs.getString("jitMemory", "give"));
+        // Settings > Engine statistics: the JIT's own report every minute, in the log (core/dispatch.c print_stats).
+        if (!install && !gunyah() && "on".equals(prefs.getString("engineStats", "off"))) { cmd.add("--stats"); cmd.add("60"); }
         if (gunyah()) { cmd.add("--engine"); cmd.add("gunyah"); }
         // Graphics: reims: the GPU device runs in this process (libhengegpu.so), up before the engine needs it.
         boolean reims = !install && "reims".equals(gpu);
@@ -352,6 +360,7 @@ public class VmService extends Service {
             boolean ramInMemory = !install && !"storage".equals(prefs.getString("ram", "memory"))
                     && !build.equals(prefs.getString("ramFileBuild", ""));
             if (ramInMemory) pb.environment().put("HV_RAM_MEMFD", "1");
+            if (jitKeep) pb.environment().put("HV_JIT_KEEP", "1");
             // Huge pages: On asks for them as the Mac touches its memory; Eager also touches all of it at the start,
             // while the tablet still has 2 MB runs of free memory to give (devices/vmapple.c).
             String huge = prefs.getString("hugepages", "off");

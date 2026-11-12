@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 """metal2vulkan's textures over the Mac's pages that the GPU writes (the Mac's framebuffer): in place,
-where the app asks for it (M2V_RENDER_IN_PLACE=1, Settings > Framebuffer in place). An experiment, off
-unless asked. Run by android_port.py on the metal2vulkan checkout, after m2v_dma_buf_checks.py.
+where the app asks for it (M2V_RENDER_IN_PLACE=1, Settings > Framebuffer in place). An experiment in
+0.3.53, off unless asked; the app asks by default since 0.3.54 (the tablet's run is at the end). Run
+by android_port.py on the metal2vulkan checkout, after m2v_dma_buf_checks.py.
 
 What the tablet's log says at every start (build 57, Henge's Turnip, the Mac's pages imported as
 dma-bufs): "a 2D RGBA16Float texture of 1280x800 over a buffer at offset 0 with rows of 10240 bytes:
@@ -36,10 +37,18 @@ saying why. Where the check's verdict is not known yet it is waited for, three s
 the framebuffer is made early in a boot, and a texture made before the verdict stays a shadow for its
 life.
 
-Never run on a device before it shipped (no /dev/udmabuf off the tablet): the app asks for it only
-where the user turned it on, and turns it off again by itself after a crash of the GPU's side
-(VmService). The log says, eight times at most, what each such texture's usage was and whether it was
-asked for in place.
+Never run on a device before it shipped (no /dev/udmabuf off the tablet). The log says, eight times at
+most, what each such texture's usage was and whether it was asked for in place.
+
+The tablet, 2026-11-13 (build 58, two runs of seven minutes, the second with this on): the framebuffer
+(Metal usage 0x5: ShaderRead and RenderTarget) "is an image in place: the GPU renders into the Mac's
+pages"; no refusal, no crash; the user found the second run the better one. A frame's drawing took 3.4
+ms against 4.0 in the run without (the two runs drew different things, so the figure is a pointer, not
+a measurement), and the notices "a render pass of 2 color attachments in 2 instances: its draws keep
+different attachments out of their subpass" and its 8 MB scratch image did not appear: that split was
+the shadow's. Two small RG8 and 40-row textures whose rows hold bytes between the texels stayed shadows,
+as meant. So the app asks for it wherever the Mac's memory is used in place, and turns it off by itself
+after a crash of the GPU's side (VmService), or where Settings says Off.
 
 Each edit must match exactly once, so a changed upstream stops the build.
 

@@ -69,6 +69,28 @@ static void host_state(FILE *out) {
             fprintf(out, ", %lld MB in huge pages (%lld MB mapped whole)", huge >> 10, whole > 0 ? whole >> 10 : 0);
         if (swap_total > 0 && swap_free >= 0) fprintf(out, ", %lld of %lld MB of swap used", (swap_total - swap_free) >> 10, swap_total >> 10);
     }
+    /* What the tablet moved through swap since the last line (/proc/vmstat counts pages since boot), and the
+       page faults that had to wait for it: on a tablet short of memory every page that comes back is unpacked
+       on the same cores the Mac's CPUs run on, while one of them stands still. */
+    f = fopen("/proc/vmstat", "r");
+    if (f) {
+        static long long last_in = -1, last_out, last_major;
+        char line[160];
+        long long in = -1, outp = -1, major = -1, v;
+        while (fgets(line, sizeof line, f)) {
+            if (sscanf(line, "pswpin %lld", &v) == 1) in = v;
+            else if (sscanf(line, "pswpout %lld", &v) == 1) outp = v;
+            else if (sscanf(line, "pgmajfault %lld", &v) == 1) major = v;
+        }
+        fclose(f);
+        if (in >= 0 && outp >= 0) {
+            long long page = sysconf(_SC_PAGESIZE);
+            if (last_in >= 0)
+                fprintf(out, " (%lld MB swapped in and %lld MB out since the last line, %lld page faults waited for storage or swap)",
+                        (in - last_in) * page >> 20, (outp - last_out) * page >> 20, major >= 0 ? major - last_major : 0);
+            last_in = in, last_out = outp, last_major = major;
+        }
+    }
     f = fopen("/proc/pressure/memory", "r");
     if (f) {
         char line[160];
@@ -244,6 +266,37 @@ static void dump_cpu(int i, HvCpu *c) {
             (unsigned long long)c->esr_el1, (unsigned long long)c->far_el1, (unsigned long long)c->x[0],
             (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[3], (unsigned long long)c->daif);
 }
+/* How long the Mac's CPU threads ran and how long they stood ready with no core to run on, since the last line
+   (/proc/self/task/<tid>/schedstat: run time and run-queue wait, in ns). A CPU thread that waits has lost its
+   core to another thread: the app's GPU threads, Android. What is left of the interval it slept (the Mac idle,
+   or a page fault). */
+static void cpu_threads_state(FILE *out) {
+    static uint64_t last_run[HV_MAX_CPUS], last_wait[HV_MAX_CPUS];
+    static struct timespec last_t;
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    double dt = last_t.tv_sec ? (double)(t.tv_sec - last_t.tv_sec) + (t.tv_nsec - last_t.tv_nsec) / 1e9 : 0;
+    last_t = t;
+    int n = __atomic_load_n(&fast_ntids, __ATOMIC_ACQUIRE), read = 0;
+    if (n > HV_MAX_CPUS) n = HV_MAX_CPUS;
+    double ran = 0, waited = 0;
+    for (int k = 0; k < n; k++) {
+        char path[64];
+        snprintf(path, sizeof path, "/proc/self/task/%d/schedstat", (int)fast_tids[k]);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        unsigned long long run = 0, wait = 0;
+        if (fscanf(f, "%llu %llu", &run, &wait) == 2) {
+            if (last_run[k] || last_wait[k]) ran += (run - last_run[k]) / 1e9, waited += (wait - last_wait[k]) / 1e9, read++;
+            last_run[k] = run, last_wait[k] = wait;
+        }
+        fclose(f);
+    }
+    if (read && dt > 0)
+        fprintf(out, " | the Mac's %d CPU threads ran %.0f%% of the time and waited %.1f%% of it for a core", read,
+                100.0 * ran / (dt * read), 100.0 * waited / (dt * read));
+}
+
 static void *install_heartbeat(void *arg) {
     (void)arg;
     uint64_t last[HV_MAX_CPUS] = {0}, last_pc[HV_MAX_CPUS] = {0};
@@ -304,9 +357,31 @@ static void *install_heartbeat(void *arg) {
                     (unsigned long long)(spared - last_spared), (unsigned long long)(m->stats.translations - last_tr),
                     (unsigned long long)(m->stats.block_flushes - last_drop), (unsigned long long)(m->stats.flush_full - last_full),
                     (double)m->jit.used * 4 / (1 << 20), (double)m->jit.released / (1 << 20));
+            /* What the translating costs and what it translates (0.3.54; the counters are core/dispatch.c's): the
+               time in the translator of all CPUs together; how many of the blocks were in the cache before its
+               last drop (the same code again: the cache is smaller than what the Mac runs) and how many of those
+               at the same place in the Mac's memory (the rest moved: the Mac paged it out and in); a block's size
+               in the Mac's instructions and in bytes of the cache; code pages the Mac wrote over (their blocks die
+               at once and their space with them until the next drop), blocks two CPUs made at once, and how much
+               of what the last drops threw away was dead already. */
+            static HvStats was, now;
+            now = m->stats;
+            uint64_t tr = now.translations - was.translations;
+            uint64_t words = (now.words_inline - was.words_inline) + (now.words_ool - was.words_ool) + (now.words_pool - was.words_pool);
+            uint64_t sampled = now.drop_sampled - was.drop_sampled;
+            if (tr)
+                fprintf(stderr, "; translating took %.2f s of the CPUs' time; %.0f%% of the blocks were in the cache before its last drop (%.0f%% at the same "
+                                "memory); a block is %.1f instructions, %.0f bytes; %llu code pages written over, %llu blocks made twice",
+                        (now.translate_ticks - was.translate_ticks) / 24e6, 100.0 * (now.retrans_va - was.retrans_va) / tr,
+                        100.0 * (now.retrans_vapa - was.retrans_vapa) / tr, (double)(now.translated_insns - was.translated_insns) / tr,
+                        4.0 * words / tr, (unsigned long long)(now.flush_smc - was.flush_smc),
+                        (unsigned long long)(now.dup_translations - was.dup_translations));
+            if (sampled) fprintf(stderr, "; %.0f%% of what was dropped was dead already", 100.0 * (now.drop_stale - was.drop_stale) / sampled);
+            was = now;
             last_busy = busy, last_fl = fl, last_flus = flus, last_spared = spared;
             last_tr = m->stats.translations, last_full = m->stats.flush_full, last_drop = m->stats.block_flushes;
         }
+        cpu_threads_state(stderr);
         host_state(stderr);
         if (u) fprintf(stderr, " | usb: %s, kernel driver %s (status %#x)", u->rom_on ? "iBoot has it" : "iBoot let go",
                        u->pci_on ? "on" : "not started", u->vio.status);
@@ -356,6 +431,7 @@ static void on_signal(int sig) {
 
 int main(int argc, char **argv) {
     int vnc_port = 5900;
+    int stats_seconds = 0; /* --stats N: the engine's own statistics every N s (core/dispatch.c print_stats), as host/main.c has */
     const char *gpu = "on", *shader_dir = NULL, *engine = "jit";
     const char *install_dir = NULL, *release = "15.6.1", *ipsw = NULL, *cache = NULL;
     uint64_t disk_gb = 64;
@@ -385,6 +461,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--net")) vc.no_net = !atoi(v);
         else if (!strcmp(a, "--sound")) vc.no_sound = !atoi(v);
         else if (!strcmp(a, "--jit-mb")) vc.jit_bytes = (size_t)atoi(v) << 20;
+        else if (!strcmp(a, "--stats")) stats_seconds = atoi(v);
         else usage();
     }
     static char rom_path[1100], ipsw_path[1100], work[1100];
@@ -533,6 +610,13 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (getenv("HV_RAM_KEEP")) hv_android_share_with_app(getenv("HV_RAM_FILE")); /* the renderer opens it by name */
+    if (stats_seconds > 0 && !gunyah) {
+        /* Settings > Engine statistics: every N s, where the JIT's time goes (TLB misses, slow memory accesses,
+           exceptions, interrupts, the Mac's idle share and thirty lines more). Set after the machine is made,
+           which clears it. The counters cost a little on the paths they count. */
+        hv_vm_machine()->stats_interval = stats_seconds;
+        fprintf(stderr, "hengevm: engine statistics every %d s (Settings)\n", stats_seconds);
+    }
     if (vnc_port) {
         if (hv_vnc_start(vnc_port) == 0) fprintf(stderr, "hengevm: display on vnc://127.0.0.1:%d\n", vnc_port);
         else fprintf(stderr, "hengevm: vnc port %d unavailable\n", vnc_port);

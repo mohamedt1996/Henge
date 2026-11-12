@@ -502,6 +502,58 @@ the patched library draws a frame into the presenter's memory; the pointer's lif
 compose at twelve positions, clipped ones and one off the screen included. Not tested: anything on Adreno,
 Android's compositor scaling the swapchain, the kernel's huge-page settings, the experiment.
 
+0.3.53 on the tablet (2026-11-13, build 58; two runs of seven minutes, the second with Framebuffer in place
+on; JIT cache 512 MB, Huge pages On, the same four Mac apps).
+
+- The screen: `a 1280x827 swapchain at the frame's scale in a 3200x2067 window, scaled by the compositor`, and
+  2053x800 in a 3200x1247 window while Android's keyboard was up. No fallback to the blit. A present took 1.5
+  to 1.7 ms (no figure from before to set against it).
+- A frame, weighted by frames, 0.3.52's third run / the first / the second: drawing 4.75 / 4.02 / 3.43 ms; the
+  read back 1.83 / 1.66 / 1.54 ms; the pointer and the hand-over 1.75 / 0.21 / 0.26 ms (it was two copies of
+  the frame). Peaks of 50.6 / 55.3 / 52.4 frames a second. The runs drew different things.
+- A window of ten seconds with 5 frames and 598 presents: the pointer moving, each a few pixels' work.
+- Framebuffer in place: taken (`that texture is an image in place`), no refusal, no crash, the better run by
+  the user's eye, and the two-attachment pass no longer split (`m2v_render_in_place.py` has the detail). On
+  by default from 0.3.54.
+- Huge pages did not come: 18 MB in the first run, 0 in the second. The kernel's own settings had khugepaged
+  off outright (`pages_to_scan 1`, `scan_sleep_millisecs 4294967295`, `enabled never`, `defrag never`);
+  compacting left 320 MB and then 64 MB free in pieces of 2 MB or more, of a tablet with 0.5 to 1 GB
+  available and 3.7 to 4.9 GB in swap. There is no room for them beside a 4 GB Mac on this tablet.
+- The first run after the update had two waits of 2 s and one dropped draw again (the driver's own pipeline
+  cache starts empty when the driver's build changes); the second none.
+- Heat: 93 to 101 C in the first run's first minutes with the fastest core at 2.5 to 2.7 GHz; in the second
+  it was held to 1.7 to 1.9 GHz from the third minute while the hottest sensor read 74 to 82 C, so what
+  holds it back is not that sensor (the case's temperature, most likely).
+- The JIT cache at 512 MB still dropped about once every 30 s: 1.5 to 3.6 million blocks translated each 30 s.
+
+0.3.54, from that log.
+
+- **The JIT cache's refill, looked at and measured off the tablet, not changed.** `tests/bench_translate.c`
+  translates glibc's code block by block: a block is 4.4 instructions and becomes 206 bytes of host code
+  (the tablet's log: 265 bytes), eleven times the guest's, 61% of the inline part the loads and stores'
+  lookup in the software TLB; translating one takes some 3 to 4 thousand instructions, about a microsecond
+  on the tablet's cores. At 70 thousand blocks a second that is a few percent of the four CPUs' time, with
+  the trips through the dispatcher and the chains patched again after a drop perhaps as much again: an
+  estimate, under a tenth of the CPUs' time in all. So the refill is not where the Mac's speed goes, and the
+  cures that would end it (a cache that evicts by parts, smaller translations) are deep changes to code
+  that cannot be run here. One thing is open: the memory given back at each drop (0.3.52). In the log the
+  tablet's available memory jumps by some 400 MB at a drop (998 MB with 50 MB of cache in use, 915 with 120)
+  and is back near 570 to 650 by the time the cache is half full, where it stays while the cache grows on:
+  so about half of what is given back is taken by something else within seconds, and the cache's second
+  half is made room for by reclaim, some 250 MB every 30 s, swap among it. Keeping the pages would end that
+  and leave the tablet 250 MB less on average. Which costs the Mac less is not known: Settings > JIT cache
+  memory: Keep (`HV_JIT_KEEP=1`) against Give back, with the heartbeat's new swap figures, says.
+- **What the next log says instead** (the heartbeat, every 30 s, always on): the time spent translating; the
+  share of the blocks that were in the cache before its last drop, by address and by address and memory
+  (the same code again against code that is new, and code the Mac paged out and in against code that
+  stayed); a block's size in instructions and bytes; code pages written over, blocks two CPUs made at
+  once, and how much of what a drop threw away was dead already; what the tablet moved through swap and how
+  many page faults waited for it; and how much of the time the Mac's CPU threads ran and how much they stood
+  ready without a core. Settings > Engine statistics adds the engine's own report once a minute (`--stats
+  60`: TLB misses, slow memory accesses by cause, exceptions, interrupts, the Mac's idle share).
+- Framebuffer in place is on unless Settings says Off; a crash with it on turns it off before it blames the
+  driver.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

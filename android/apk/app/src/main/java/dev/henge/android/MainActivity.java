@@ -664,20 +664,20 @@ public class MainActivity extends Activity {
                 c.addView(inote);
                 c.addView(hairline());
                 if (!inOff.exists()) {
-                    final java.io.File inRender = new java.io.File(VmService.reimsHomeDir(this), "render-in-place");
-                    c.addView(choiceRow("Framebuffer in place", new String[]{"Off", "On"}, inRender.exists() ? 1 : 0,
+                    final java.io.File renderOff = new java.io.File(VmService.reimsHomeDir(this), "render-in-place-off");
+                    c.addView(choiceRow("Framebuffer in place", new String[]{"On", "Off"}, renderOff.exists() ? 1 : 0,
                             i -> {
                                 try {
-                                    inRender.getParentFile().mkdirs();
-                                    if (i == 1) inRender.createNewFile(); else inRender.delete();
+                                    renderOff.getParentFile().mkdirs();
+                                    if (i == 1) renderOff.createNewFile(); else renderOff.delete();
                                 } catch (Exception ignored) { }
                                 render(true);
                             }));
-                    TextView rnote = text("An experiment, with Henge's Turnip only. The GPU draws the Mac's screen straight into the "
-                            + "Mac's memory; otherwise it draws into a copy and copies the screen in and back at every frame. Less "
-                            + "work for the GPU if it works. It has not been run on a tablet yet: if the picture is wrong or slower, "
-                            + "turn it off; after a crash Henge turns it off by itself. Close Henge from recents and open it again "
-                            + "after changing this.", 13, DIM, false);
+                    TextView rnote = text("With Henge's Turnip only. On: the GPU draws the Mac's screen straight into the Mac's "
+                            + "memory. Off: it draws into a copy and copies the screen in and back at every frame. In the one "
+                            + "comparison so far (a Mi Pad 7) On took about a seventh off the GPU's time per frame. If the picture is wrong, turn it off; after a "
+                            + "crash Henge turns it off by itself. Close Henge from recents and open it again after changing this.",
+                            13, DIM, false);
                     rnote.setPadding(dp(17), 0, dp(17), dp(12));
                     c.addView(rnote);
                     c.addView(hairline());
@@ -695,6 +695,22 @@ public class MainActivity extends Activity {
                 + "Mac apps open. If the tablet is short of memory (the log's \"memory available\"), try 512 first.", 13, DIM, false);
         jnote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(jnote);
+        c.addView(hairline());
+        c.addView(choiceRow("JIT cache memory", new String[]{"Give back", "Keep"}, "keep".equals(prefs.getString("jitMemory", "give")) ? 1 : 0,
+                i -> { prefs.edit().putString("jitMemory", i == 1 ? "keep" : "give").apply(); render(true); }));
+        TextView knote = text("Give back: when the cache is dropped its memory goes back to Android until code fills it again. "
+                + "Keep: the engine holds on to it, so the tablet has that much less but does not have to find it again every "
+                + "time. Which is faster on a tablet short of memory is not known yet: the log's swap figures say.", 13, DIM, false);
+        knote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(knote);
+        c.addView(hairline());
+        c.addView(choiceRow("Engine statistics", new String[]{"Off", "On"}, "on".equals(prefs.getString("engineStats", "off")) ? 1 : 0,
+                i -> { prefs.edit().putString("engineStats", i == 1 ? "on" : "off").apply(); render(true); }));
+        TextView enote = text("On: once a minute the CPU engine writes where its time goes into the log (some thirty lines: "
+                + "memory lookups that missed, slow memory accesses, interrupts, how idle the Mac is). For finding what to "
+                + "make faster; it costs a little speed while on.", 13, DIM, false);
+        enote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(enote);
         c.addView(hairline());
         final String hugeNow = prefs.getString("hugepages", "off");
         c.addView(choiceRow("Huge pages", new String[]{"Off", "On", "Eager"}, "eager".equals(hugeNow) ? 2 : "on".equals(hugeNow) ? 1 : 0,

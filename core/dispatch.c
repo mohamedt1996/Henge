@@ -18,6 +18,11 @@
 #include "sysreg.h"
 #include "translate.h"
 
+/* The blocks translated since the cache's last drop, and those of the cache before it: 2 MB of bits each, by
+   address and by address and memory (lookup, under the translation lock; swapped here with every CPU parked). */
+static uint64_t seen_va[2][1 << 18], seen_vapa[2][1 << 18];
+static int seen_now;
+
 void hv_flush_blocks(HvMachine *m) {
     /* Every other CPU is parked (stop_the_world): the one moment the TLB layout can change. */
     if ((hv_knob[HV_K_TLBT] != 0) != hv_tlb_tmajor) {
@@ -29,6 +34,16 @@ void hv_flush_blocks(HvMachine *m) {
             }
     }
     m->stats.block_flushes++;
+    /* How much of what goes was dead already (its code page written since): one block in 8, for the heartbeat. A
+       cache that fills with dead code wants another cure than one that fills with live code. */
+    for (int i = 0; i < m->nblocks; i += 8) {
+        const HvBlock *b = &m->blocks[i];
+        if (!b->ram) continue;
+        m->stats.drop_sampled++;
+        if (b->ram->page_gen[b->pg] != b->gen) m->stats.drop_stale++;
+    }
+    seen_now = !seen_now;
+    memset(seen_va[seen_now], 0, sizeof seen_va[0]), memset(seen_vapa[seen_now], 0, sizeof seen_vapa[0]);
     __atomic_add_fetch(&m->jit_gen, 1, __ATOMIC_SEQ_CST);
     for (int i = 0; i < m->ncpus; i++)
         if (m->cpus[i]) {
@@ -155,12 +170,12 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     }
     /* Translate without the lock, into this thread's buffer... */
     HvBlock nb = {.va = va, .pa = pa, .flags = flags, .gen = gen, .ram = ram, .pg = pg, .maker = cpu->index + 1, .jit_gen = __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST)};
-    uint64_t t0 = m->stats_interval ? mach_absolute_time() : 0;
+    /* Timed always (two clock reads beside a translation of a few thousand instructions): the Android heartbeat
+       says what share of the CPUs' time translating takes (android/runner.c). */
+    uint64_t t0 = mach_absolute_time();
     if (hv_translate_emit(m, &nb, code, avail) != 0) goto flush_unlocked;
-    if (m->stats_interval) {
-        m->stats.translate_ticks += mach_absolute_time() - t0;
-        m->stats.translated_insns += nb.ninsns;
-    }
+    __atomic_fetch_add(&m->stats.translate_ticks, mach_absolute_time() - t0, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&m->stats.translated_insns, nb.ninsns, __ATOMIC_RELAXED);
     /* ...and place it in the region (space is reserved atomically, so no lock either)... */
     size_t used0 = m->jit.used;
     if (hv_translate_place(m, &nb) != 0) { /* JIT region full: start over */
@@ -182,6 +197,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     }
     b = find(m, h, va, pa, flags, gen); /* another CPU may have just made it: ours is dropped (its space stays used until a flush) */
     if (b) {
+        m->stats.dup_translations++;
         pthread_mutex_unlock(&m->tr_mu);
         jc[j].va = va, jc[j].b = b;
         return b;
@@ -193,15 +209,17 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     b = &m->blocks[m->nblocks];
     *b = nb;
     m->stats.translations++;
-    if (m->stats_interval) {
-        m->stats.translated_words += m->jit.used - used0;
-        static uint64_t seen_va[1 << 18], seen_vapa[1 << 18]; /* was this code translated before? (hashed, so approximate) */
+    if (m->stats_interval) m->stats.translated_words += m->jit.used - used0;
+    { /* Was this block in the cache before its last drop? (hashed, so approximate: some 10% too many at 2 million
+         blocks a cache.) By address alone, and by address and memory: the first without the second is code that
+         moved in the Mac's memory. */
+        uint64_t *sv = seen_va[seen_now], *sp = seen_vapa[seen_now], *pv = seen_va[!seen_now], *pp = seen_vapa[!seen_now];
         uint32_t hv = (uint32_t)(((va >> 2) ^ flags) * 0x9e3779b97f4a7c15ull >> 40);
         uint32_t hp = (uint32_t)((((va >> 2) ^ flags) * 0x9e3779b97f4a7c15ull ^ pa * 0xc2b2ae3d27d4eb4full) >> 40);
-        if (seen_va[hv >> 6] >> (hv & 63) & 1) m->stats.retrans_va++;
-        if (seen_vapa[hp >> 6] >> (hp & 63) & 1) m->stats.retrans_vapa++;
-        seen_va[hv >> 6] |= 1ull << (hv & 63);
-        seen_vapa[hp >> 6] |= 1ull << (hp & 63);
+        if (pv[hv >> 6] >> (hv & 63) & 1) m->stats.retrans_va++;
+        if (pp[hp >> 6] >> (hp & 63) & 1) m->stats.retrans_vapa++;
+        sv[hv >> 6] |= 1ull << (hv & 63);
+        sp[hp >> 6] |= 1ull << (hp & 63);
     }
     m->nblocks++;
     b->next = m->hash[h];
