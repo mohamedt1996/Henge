@@ -56,6 +56,14 @@ int hv_vm_ncpus(void) { return ncpus; }
 /* arm64 boot_args: {u16 Revision, u16 Version, u64 virtBase, physBase, memSize,
    topOfKernelData, Video {baseAddr, display, rowBytes, width, height, depth}, ...}.
    Found by scanning page starts for one whose physBase is the RAM base. */
+/* Graphics: applegfx (android/pvg_applegfx.c) drives libapplegfx-vulkan inside the engine and publishes its
+   frames here, the same route pvg_lite uses. Weak so builds without that backend (or without HAVE_APPLEGFX)
+   link and simply report "no frame". */
+__attribute__((weak)) int hv_pvg_applegfx_frame(const uint8_t **pixels, uint32_t *width, uint32_t *height) {
+    (void)pixels, (void)width, (void)height;
+    return -1;
+}
+
 int hv_vm_boot_display(HvBootDisplay *d) {
     /* What the guest's GPU has drawn, once it has drawn anything. */
     HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
@@ -63,6 +71,12 @@ int hv_vm_boot_display(HvBootDisplay *d) {
     uint32_t fw, fh;
     /* No pvg_lite (the GPU device is the host's, Android's Graphics: reims): the boot framebuffer only. */
     if (pvg && hv_pvg_lite_frame(pvg, &frame, &fw, &fh) == 0) {
+        d->pixels = (uint8_t *)frame;
+        d->width = fw, d->height = fh, d->stride = fw * 4;
+        return 0;
+    }
+    /* Graphics: applegfx presents its library-rendered frames through this same accessor. */
+    if (hv_pvg_applegfx_frame(&frame, &fw, &fh) == 0) {
         d->pixels = (uint8_t *)frame;
         d->width = fw, d->height = fh, d->stride = fw * 4;
         return 0;
