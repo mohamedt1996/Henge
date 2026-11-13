@@ -366,6 +366,15 @@ public class VmService extends Service {
             String huge = prefs.getString("hugepages", "off");
             if (!install && hugePages(log, ramInMemory && !gunyah() && !"off".equals(huge)))
                 pb.environment().put("HV_RAM_THP", "eager".equals(huge) ? "2" : "1");
+            // Settings > Cores for the Mac: a fast core of its own for each of the Mac's CPUs (the engine binds them),
+            // Android's other groups kept off those cores, the fast cores kept out of deep idle states (coreTuning).
+            boolean coresOn = !install && !gunyah() && !"off".equals(prefs.getString("coreTuning", "on"));
+            boolean awakeOn = coresOn && !"off".equals(prefs.getString("coreAwake", "on"));
+            pb.environment().put("HV_CPU_PIN", coresOn ? "1" : "0");
+            String coreKept = "";
+            try { coreKept = install ? "" : coreTuning(log, coresOn, awakeOn, cpus); }
+            catch (Exception e) { appendLog(log, "henge app: cores: left as they are: " + e); }
+            final String coreKeptNow = coreKept;
             // The Mac's disk: the data is flushed at each of macOS's flushes (fdatasync), not the file's times too.
             pb.environment().put("HV_FLUSH", "2");
             // Graphics: reims: the Mac's screen size (Settings), every pixel of which is copied on this driver.
@@ -378,6 +387,7 @@ public class VmService extends Service {
             process = pb.start();
             if (sound) new Thread(() -> playSound(log), "sound").start();
             if (!install) new Thread(() -> favourEngine(pidFile, log), "favour").start();
+            if (!coreKeptNow.isEmpty()) new Thread(() -> coreWatch(pidFile, log, coreKeptNow), "core-watch").start();
             if (!install) fullSpeed(log, "on".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("fullspeed", "off")));
             code = process.waitFor();
         } catch (Exception e) {
@@ -394,6 +404,7 @@ public class VmService extends Service {
         }
         if (!install) fullSpeed(log, false);
         if (!install) hugePages(log, false);
+        if (!install) coreTuningBack(log, getSharedPreferences("henge", MODE_PRIVATE));
         if (gunyah()) DeviceCheck.sh(true, "rm -f " + sq(new File(files, "gunyah-kmsg.txt").getPath()) + "; true"); // it ended: no reset
         if (reims && GpuView.loaded) GpuView.nativeReimsStop();
         active.delete();
@@ -505,6 +516,239 @@ public class VmService extends Service {
                     : "henge app: could not put the engine among Android's foreground work (no root?): " + out);
         } catch (Exception e) {
             appendLog(log, "henge app: could not put the engine among Android's foreground work: " + e);
+        }
+    }
+
+    /** The tablet's cores by kind, as the engine reckons them (android/runner.c hv_host_cpu_thread, the same rule). */
+    private static final class Cores {
+        final java.util.List<Integer> slow = new ArrayList<>();  // the slowest kind
+        final java.util.List<Integer> mac = new ArrayList<>();   // one per Mac CPU: the fastest first, of a speed the highest number first
+        final java.util.List<Integer> spare = new ArrayList<>(); // fast cores no Mac CPU has
+        final java.util.List<Integer> fast = new ArrayList<>();  // mac + spare
+    }
+
+    /** null where the cores' speeds cannot be read, are all one speed, or there are fewer fast cores than Mac CPUs. */
+    private static Cores cores(int macCpus) {
+        java.util.List<long[]> all = new ArrayList<>(); // {core, kHz}
+        for (int i = 0; i < 64; i++) {
+            try {
+                String t = new String(Files.readAllBytes(new File("/sys/devices/system/cpu/cpu" + i + "/cpufreq/cpuinfo_max_freq").toPath()),
+                        StandardCharsets.UTF_8).trim();
+                all.add(new long[]{i, Long.parseLong(t)});
+            } catch (Exception e) { break; }
+        }
+        if (all.isEmpty()) return null;
+        long lo = Long.MAX_VALUE, hi = 0;
+        for (long[] c : all) { lo = Math.min(lo, c[1]); hi = Math.max(hi, c[1]); }
+        if (lo == hi) return null;
+        Cores k = new Cores();
+        java.util.List<long[]> fast = new ArrayList<>();
+        for (long[] c : all) { if (c[1] > lo) fast.add(c); else k.slow.add((int) c[0]); }
+        final java.util.Comparator<long[]> order = (a, b) -> a[1] != b[1] ? Long.compare(b[1], a[1]) : Long.compare(b[0], a[0]);
+        java.util.Collections.sort(fast, order);
+        if (macCpus < 1 || macCpus > fast.size()) return null;
+        for (int i = 0; i < fast.size(); i++) {
+            int core = (int) fast.get(i)[0];
+            k.fast.add(core);
+            if (i < macCpus) k.mac.add(core); else k.spare.add(core);
+        }
+        return k;
+    }
+
+    private static String list(java.util.Collection<Integer> cores) {
+        java.util.List<Integer> sorted = new ArrayList<>(cores);
+        java.util.Collections.sort(sorted);
+        StringBuilder sb = new StringBuilder();
+        for (int c : sorted) sb.append(sb.length() > 0 ? "," : "").append(c);
+        return sb.toString();
+    }
+
+    /** A kernel list of cores ("0-3,7") as a set; null where it is not one. */
+    private static java.util.Set<Integer> parseCores(String text) {
+        java.util.Set<Integer> set = new java.util.TreeSet<>();
+        try {
+            for (String part : text.trim().split(",")) {
+                if (part.isEmpty()) continue;
+                String[] ends = part.split("-");
+                int a = Integer.parseInt(ends[0].trim()), b = ends.length > 1 ? Integer.parseInt(ends[1].trim()) : a;
+                if (a < 0 || b < a || b > 255) return null;
+                for (int c = a; c <= b; c++) set.add(c);
+            }
+        } catch (Exception e) { return null; }
+        return set.isEmpty() ? null : set;
+    }
+
+    /** The files coreTuning may write and put back, and what may be written to them: nothing else reaches a root shell. */
+    private static boolean tunable(String file, String value) {
+        return (file.matches("/dev/cpuset/[a-z-]+/cpus") || file.matches("/sys/devices/system/cpu/cpu[0-9]+/power/pm_qos_resume_latency_us")
+                || file.equals("/proc/sys/vm/page-cluster") || file.equals("/sys/kernel/mm/lru_gen/enabled"))
+                && value.matches("[0-9a-zA-Z,/-]{1,40}");
+    }
+
+    private static String restoreScript(String kept) {
+        StringBuilder sh = new StringBuilder();
+        for (String line : kept.split("\n")) {
+            int eq = line.indexOf('=');
+            if (eq <= 0) continue;
+            String f = line.substring(0, eq), v = line.substring(eq + 1);
+            if (tunable(f, v)) sh.append("echo ").append(v).append(" > ").append(f).append("; ");
+        }
+        return sh.toString();
+    }
+
+    /**
+     * Settings > Cores for the Mac, and > Fast cores awake (root; 0.3.56). While the Mac runs, each put back
+     * when it stops, by a root shell that waits for the engine to go where the app itself is killed
+     * ({@link #coreWatch}), or else at the next start:
+     *
+     * - Android's other groups are kept off the Mac's cores. The engine gives each of the Mac's CPUs a fast
+     *   core of its own (android/runner.c); the log had those threads standing ready without a core 3 to 10%
+     *   of the time. `background`, `system-background` and `restricted` go to the slow cores. A group is only
+     *   ever narrowed, never given a core it did not have. `foreground` (Android's own services, the
+     *   compositor, touch input) and `top-app` (the engine and this app's GPU threads) keep what they have:
+     *   narrowing the first would trade the Mac's speed for the screen's and the touch's.
+     * - Swap: the log gets what the tablet swaps to and how (zram's compressor and how well it packs, any swap
+     *   on storage, swappiness), since a page that comes back is unpacked on the Mac's cores. Two settings
+     *   that cost nothing are set: `vm.page-cluster` 0 (no read-ahead from swap: with zram each page read ahead
+     *   is unpacked for nothing), and the kernel's newer page reclaim (`lru_gen`) on where the kernel has it
+     *   and it is off. The compressor itself cannot be changed while swap is in use.
+     * - Fast cores awake (its own setting): the fast cores take no idle state that needs more than 100 us to
+     *   leave (`pm_qos_resume_latency_us`). The Mac's CPUs and the app's GPU threads hand work to each other
+     *   thousands of times a second, each hand-over waking a sleeping core. Costs a little power.
+     *
+     * Answers what was changed, as lines of file=value-as-it-was, "" where nothing was.
+     */
+    private String coreTuning(File log, boolean groups, boolean awake, int macCpus) {
+        android.content.SharedPreferences p = getSharedPreferences("henge", MODE_PRIVATE);
+        coreTuningBack(log, p);
+        if (!groups && !awake) return "";
+        Cores k = cores(macCpus);
+        if (k == null) {
+            appendLog(log, "henge app: cores: the tablet's cores are of one speed, or fewer fast ones than the Mac has CPUs: nothing is set");
+            return "";
+        }
+        java.util.Map<String, String> want = new java.util.LinkedHashMap<>();
+        StringBuilder read = new StringBuilder();
+        java.util.List<String> files = new ArrayList<>();
+        if (groups) {
+            for (String g : new String[]{"background", "system-background", "restricted"}) files.add("/dev/cpuset/" + g + "/cpus");
+            files.add("/proc/sys/vm/page-cluster");
+            files.add("/sys/kernel/mm/lru_gen/enabled");
+        }
+        if (awake) for (int c : k.fast) files.add("/sys/devices/system/cpu/cpu" + c + "/power/pm_qos_resume_latency_us");
+        for (String f : files) read.append("echo \"").append(f).append("=$(cat ").append(f).append(" 2>/dev/null)\"; ");
+        java.util.Map<String, String> now = new java.util.LinkedHashMap<>();
+        for (String line : DeviceCheck.sh(true, read + "true").split("\n")) {
+            int eq = line.indexOf('=');
+            if (eq > 0 && !line.substring(eq + 1).trim().isEmpty()) now.put(line.substring(0, eq).trim(), line.substring(eq + 1).trim());
+        }
+        if (now.isEmpty()) {
+            appendLog(log, "henge app: cores: no root, or nothing to read: nothing is set");
+            return "";
+        }
+        StringBuilder said = new StringBuilder();
+        if (groups) {
+            java.util.Set<Integer> slow = new java.util.TreeSet<>(k.slow);
+            for (String g : new String[]{"background", "system-background", "restricted"}) {
+                String f = "/dev/cpuset/" + g + "/cpus";
+                java.util.Set<Integer> has = now.containsKey(f) ? parseCores(now.get(f)) : null;
+                if (has == null) continue;
+                java.util.Set<Integer> to = new java.util.TreeSet<>(has);
+                to.retainAll(slow);
+                if (to.isEmpty() || to.equals(has)) continue;
+                want.put(f, list(to));
+                said.append(said.length() > 0 ? ", " : "").append(g).append(' ').append(now.get(f)).append(" -> ").append(list(to));
+            }
+            String cluster = now.get("/proc/sys/vm/page-cluster");
+            if (cluster != null && cluster.matches("[1-9][0-9]*")) {
+                want.put("/proc/sys/vm/page-cluster", "0");
+                said.append(said.length() > 0 ? ", " : "").append("page-cluster ").append(cluster).append(" -> 0");
+            }
+            String gen = now.get("/sys/kernel/mm/lru_gen/enabled");
+            if (gen != null && gen.matches("0x0+")) {
+                want.put("/sys/kernel/mm/lru_gen/enabled", "y");
+                said.append(said.length() > 0 ? ", " : "").append("lru_gen ").append(gen).append(" -> on");
+            }
+        }
+        int woken = 0;
+        if (awake) {
+            for (int c : k.fast) {
+                String f = "/sys/devices/system/cpu/cpu" + c + "/power/pm_qos_resume_latency_us";
+                String was = now.get(f);
+                // "0" is the kernel's "any latency"; a limit already at or under ours is left alone.
+                if (was == null || !was.matches("[0-9]+") || (!was.equals("0") && Long.parseLong(was) <= 100)) continue;
+                want.put(f, "100");
+                woken++;
+            }
+            if (woken > 0) said.append(said.length() > 0 ? ", " : "").append("idle states over 100 us off on cores ").append(list(k.fast));
+        }
+        StringBuilder keep = new StringBuilder(), write = new StringBuilder();
+        for (java.util.Map.Entry<String, String> e : want.entrySet()) {
+            String was = now.get(e.getKey());
+            if (was == null || !tunable(e.getKey(), was) || !tunable(e.getKey(), e.getValue())) continue; // not something this could put back
+            keep.append(e.getKey()).append('=').append(was).append('\n');
+            write.append("echo ").append(e.getValue()).append(" > ").append(e.getKey()).append("; ");
+        }
+        if (keep.length() > 0) {
+            p.edit().putString("coreKnobs", keep.toString()).commit(); // before the writes: a kill between them still puts them back
+            DeviceCheck.sh(true, write + "true", 20);
+        }
+        appendLog(log, "henge app: cores: the Mac's CPUs have cores " + list(k.mac) + " (the engine binds them), "
+                + (k.spare.isEmpty() ? "no fast core is left over" : "core " + list(k.spare) + " is left to the GPU side and Android") + ", slow cores "
+                + list(k.slow) + "; set while the Mac runs: " + (said.length() > 0 ? said : "nothing (all as wanted already)"));
+        if (groups) {
+            // What the tablet swaps to, for the log: nothing here is changed.
+            String swap = DeviceCheck.sh(true, "echo \"swappiness $(cat /proc/sys/vm/swappiness 2>/dev/null)\"; "
+                    + "for z in /sys/block/zram*; do [ -e $z/comp_algorithm ] && echo \"${z##*/}: compressor $(cat $z/comp_algorithm), "
+                    + "mm_stat $(cat $z/mm_stat 2>/dev/null)\"; done; cat /proc/swaps 2>/dev/null; true").trim();
+            appendLog(log, "henge app: swap: " + (swap.isEmpty() ? "nothing readable" : swap.replace("\n", " | "))
+                    + " (mm_stat: bytes stored, bytes they take packed, memory used, ...; a swap that is not zram is on storage and slower: "
+                    + "Xiaomi's Memory extension)");
+        }
+        if (awake) {
+            int first = k.fast.get(0);
+            String states = DeviceCheck.sh(true, "for s in /sys/devices/system/cpu/cpu" + first + "/cpuidle/state*; do "
+                    + "[ -e $s/name ] && echo \"$(cat $s/name) $(cat $s/latency) us\"; done; true").trim();
+            appendLog(log, "henge app: cores: core " + first + "'s idle states and what each takes to leave: "
+                    + (states.isEmpty() ? "not readable" : states.replace("\n", ", ")));
+        }
+        return keep.toString();
+    }
+
+    /** Puts back what {@link #coreTuning} changed (when the Mac stops, or at the next start after a kill). */
+    private void coreTuningBack(File log, android.content.SharedPreferences p) {
+        String kept = p.getString("coreKnobs", "");
+        if (kept.isEmpty()) return;
+        String sh = restoreScript(kept);
+        if (!sh.isEmpty()) DeviceCheck.sh(true, sh + "true", 20);
+        p.edit().remove("coreKnobs").commit();
+        appendLog(log, "henge app: cores: Android's groups, swap settings and idle states are as they were again");
+    }
+
+    /**
+     * A root shell that puts {@link #coreTuning}'s changes back when the engine is gone, whatever became of this
+     * app: Android may end the app for memory (it has), and the tablet's other apps would stay on the slow cores
+     * until Henge was next opened. It waits on the engine's pid, which dies with the app.
+     */
+    private void coreWatch(File pidFile, File log, String kept) {
+        try {
+            String sh = restoreScript(kept);
+            if (sh.isEmpty()) return;
+            String pid = "";
+            for (int i = 0; i < 20 && pid.isEmpty(); i++) {
+                Thread.sleep(500);
+                try { pid = new String(Files.readAllBytes(pidFile.toPath()), StandardCharsets.UTF_8).trim(); } catch (Exception ignored) { }
+            }
+            if (!pid.matches("[0-9]+")) return;
+            // Not where a newer engine has started meanwhile (a quick stop and start): that run's settings are its own
+            // to put back. The pid file still names this engine where nothing started after it.
+            String mine = pidFile.getPath().matches("[A-Za-z0-9_./~-]+")
+                    ? "[ \"$(cat " + pidFile.getPath() + " 2>/dev/null)\" = \"" + pid + "\" ] || exit 0; " : "";
+            // The script holds only what restoreScript let through (paths and plain values): no quote can end it early.
+            DeviceCheck.sh(true, "nohup sh -c 'while [ -d /proc/" + pid + " ]; do sleep 5; done; " + mine + sh + "true' >/dev/null 2>&1 &", 10);
+            appendLog(log, "henge app: cores: a root shell puts them back when the engine (" + pid + ") is gone, also where Android ends this app");
+        } catch (Exception e) {
+            appendLog(log, "henge app: cores: no watch for the engine's end (" + e + "); they are put back when the Mac stops, or at the next start");
         }
     }
 

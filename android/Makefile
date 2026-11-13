@@ -23,7 +23,7 @@ DEVS = $(basename $(notdir $(wildcard devices/*.c)))
 ENGINE = $(CORE:%=$(B)/%.o) $(B)/jit_region.o $(B)/disk.o $(B)/enter.o
 DEV = $(DEVS:%=$(B)/%.o) $(B)/pvg_android.o
 ASM = $(A)/harness.h $(A)/harness.S $(patsubst tests/%,$(A)/%,$(wildcard tests/*_programs.S tests/*_cases.s))
-TESTS = $(B)/test_classify $(B)/test_operands $(B)/test_jit_region $(B)/test_mmu $(B)/test_jit $(B)/test_mem $(B)/test_exc $(B)/test_devices
+TESTS = $(B)/test_classify $(B)/test_operands $(B)/test_jit_region $(B)/test_mmu $(B)/test_xchain $(B)/test_jit $(B)/test_mem $(B)/test_exc $(B)/test_devices
 
 all: $(B)/libhengevm.a $(B)/hengevm-android $(TESTS)
 
@@ -114,6 +114,8 @@ $(B)/test_operands: tests/test_operands.c $(A)/operand_cases.s $(B)/operands.o
 $(B)/test_jit_region: tests/test_jit_region.c $(B)/jit_region.o
 	$(T) $^ $(LIBS) -o $@
 $(B)/test_mmu: tests/test_mmu.c $(ENGINE)
+	$(T) $^ $(LIBS) -o $@
+$(B)/test_xchain: tests/test_xchain.c $(ENGINE)
 	$(T) $^ $(LIBS) -o $@
 $(B)/test_devices: tests/test_devices.c $(ASM) $(ENGINE) $(DEV)
 	$(T) tests/test_devices.c $(A)/devices_programs.S $(A)/harness.S $(ENGINE) $(DEV) $(LIBS) -o $@

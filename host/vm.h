@@ -58,6 +58,8 @@ void hv_vm_start(int cpu0, void (*on_exit)(int reason));
 void hv_vm_prepare_cpu_thread(void);
 /* That, and the scheduling class the guest's CPUs run at. */
 void hv_vm_cpu_qos(void);
+/* Which of the guest's CPUs the calling thread runs (0 on any other thread: CPU 0's is the one that asks first). */
+int hv_vm_this_cpu(void);
 /* Run CPU 0 on the calling thread (what hv_vm_start does on its own thread); returns its exit reason. */
 int hv_vm_run_cpu0(void);
 /* Stop at the next block; the CPUs' threads end. */

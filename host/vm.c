@@ -325,6 +325,10 @@ void hv_vm_prepare_cpu_thread(void) {
 /* A host's own way to favour the calling guest-CPU thread (Android: the fast cores, android/runner.c). */
 __attribute__((weak)) void hv_host_cpu_thread(void) {}
 
+/* The guest CPU the calling thread runs, for that: set by a secondary's thread before it asks. */
+static __thread int this_cpu;
+int hv_vm_this_cpu(void) { return this_cpu; }
+
 /* iOS parks default-QoS threads on efficiency cores readily; the guest's CPUs are what the user waits on. */
 void hv_vm_cpu_qos(void) {
     hv_vm_prepare_cpu_thread();
@@ -345,6 +349,7 @@ void hv_vm_cpu_qos(void) {
 /* CPUs 1 and up: run whenever PSCI CPU_ON starts them; the machine stops with CPU 0. */
 static void *secondary_thread(void *arg) {
     HvCpu *c = arg;
+    this_cpu = (int)c->index;
     hv_vm_cpu_qos();
     int r = hv_run(c);
     if (!c->halted)
