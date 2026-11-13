@@ -52,6 +52,7 @@ typedef struct HvBlock {
 
 #define HV_MAX_RAM 8
 #define HV_MAX_MMIO 48
+#define HV_XHASH_BITS 16 /* buckets of exits chained to another page, by that page (HvMachine.xhead) */
 #define HV_BLOCK_HASH (1 << 21) /* one bucket per block: chains are walked on every front-cache miss */
 #define HV_JC_BITS 16
 #define HV_MAX_BLOCKS (3 << 20) /* a macOS boot runs well over a million distinct blocks; a full flush retranslates them all */
@@ -239,9 +240,17 @@ typedef struct HvMachine {
     /* Exits to another page (see put_branch_exit): the host addend the target
        page's TLB entry must hold for the exit to go straight to the chained
        block (0: a same-page exit), and once chained, the target's physical page
-       (| 1) so that invalidating its code can unchain it. xchained lists them. */
+       (| 1) so that invalidating its code can unchain it. xchained lists them, in the order they were chained;
+       xhead and xlink thread that list by the target's page (HV_XHASH buckets of its page number, each a chain of
+       list positions + 1, 0 its end), so that invalidating a page's code walks the exits into that page and not
+       every chained exit there is. Before 0.3.55 it walked them all under the translation lock: on the tablet
+       (2026-11-13) some 20 thousand exits were chained to other pages every second and the Mac wrote over 150 to
+       200 code pages a second, and the CPUs' waits for the translation lock went from 2% of one CPU's time (at 1
+       to 7 pages a second) to 27, 33 and 41% (at 142, 165 and 206). An entry unchained stays in xchained, off
+       its chain, until the next flush empties all three. */
     uint64_t *slot_xa, *slot_xpa;
     uint32_t *xchained, nxchained;
+    uint32_t *xlink, *xhead;
     uint32_t nslots;
     HvCpu *cpu;              /* CPU 0: the one that polls devices */
     HvCpu *cpus[HV_MAX_CPUS]; /* every CPU, so device and invalidation code can ask them to leave */
@@ -277,6 +286,11 @@ static inline HvBlock *hv_block_find(HvMachine *m, uint32_t h, uint64_t va, uint
     for (HvBlock *b = __atomic_load_n(&m->hash[h], __ATOMIC_ACQUIRE); b; b = __atomic_load_n(&b->next, __ATOMIC_ACQUIRE))
         if (b->va == va && b->pa == pa && b->flags == flags && b->gen == gen) return b;
     return NULL;
+}
+
+/* The bucket of HvMachine.xhead for a page's physical address (with or without the chained flag in bit 0). */
+static inline uint32_t hv_xhash(uint64_t page_pa) {
+    return (uint32_t)(((page_pa >> HV_TLB_PAGE_BITS) * 0x9e3779b97f4a7c15ull) >> (64 - HV_XHASH_BITS));
 }
 
 int hv_machine_init(HvMachine *m, size_t jit_bytes);

@@ -554,6 +554,48 @@ on; JIT cache 512 MB, Huge pages On, the same four Mac apps).
 - Framebuffer in place is on unless Settings says Off; a crash with it on turns it off before it blames the
   driver.
 
+0.3.54 on the tablet (2026-11-13, build 59; one run of eleven minutes, Engine statistics on, JIT cache 512 MB,
+the same four Mac apps). What the new figures said:
+
+- Translating takes 2.5 to 4.5 s of every 30 s of the four CPUs together: 2 to 4% of their time (the engine's
+  own line: 6 to 12% of one CPU). A block is 5 instructions and 265 bytes. So the estimate held.
+- 60 to 76% of the blocks translated were in the cache before its last drop, nearly all at the same place in
+  the Mac's memory: the same code again, not code that moved. The cache is smaller than what the Mac runs.
+  0 to 10% of what a drop threw away was dead; blocks made twice are a thousandth.
+- The Mac is never idle with the four apps open (`wfi 0/s (0% idle)` from the second minute to the ninth).
+- The Mac's CPU threads ran 76 to 95% of the time and stood ready without a core 3 to 10% of it.
+- **The find: the translation lock.** `translation lock 4653/s 41.1% (of one CPU)`. Across the ten reports the
+  waits for it follow the code pages the Mac writes over (`smc`), not the translations: 2.3 to 2.5% of one
+  CPU's time at 1 to 7 pages a second, 5 to 12% at 37 to 72, 27% at 142, 33% at 165, 41% at 206.
+  `hv_invalidate_code` held the lock while it walked every exit chained to another page (`xchained`), to
+  find those into the one page written; some 20 thousand such exits are chained each second and the list
+  empties only when the cache drops, so it held 300 thousand of them on average.
+- No swap figures: Android refuses an app `/proc/vmstat`.
+
+0.3.55, from that log.
+
+- **A code page written over costs what it should.** The exits chained to another page are threaded by the
+  page they go to (`HvMachine.xhead`, `xlink`: 65536 buckets), and `hv_invalidate_code` walks that page's
+  alone. With 300 thousand exits chained, a write took 1.4 ms before and 3.5 us after (`qemu-user`, where an
+  instruction is about a nanosecond; a third of that on the tablet), all of it under the lock every CPU needs
+  to publish a translation. `tests/test_xchain.c` checks the threading against the rule it replaced over 139
+  thousand random chains, 58 thousand writes and a thousand flushes, pages that share a bucket among them,
+  and fails where the walk is broken on purpose.
+- A CPU that finds the translation lock held looks again a few times before it sleeps for it: the holder
+  publishes a block in a fraction of a microsecond, and the 2 to 4 thousand sleeps a second that remained
+  where nothing held the lock long took 6 to 12 us each.
+- The heartbeat has the engine's own page faults and how many of them waited for swap or storage
+  (`/proc/self/stat`, which an app may read).
+- What this should give: where the Mac writes code pages fast (Safari was open; a JavaScript engine writes
+  its own code), up to a third or so of one CPU's time back from waiting, and a tenth from the walk itself.
+  Where it does not, nothing. Not measured on a tablet.
+
+What the statistics leave to do, by size, none of it started: the cache is too small for the code the Mac
+runs (768 MB, the default, drops less; memory is what 512 was chosen for); `tlbi acks` 4 to 10% of one CPU
+(a CPU waits for the others to take a TLB invalidation); the indirect-branch caches refilled after each of
+3 to 5 thousand process switches a second (200 to 460 thousand fills a second); `page end` 50 to 140 thousand
+slow memory accesses a second.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

@@ -56,6 +56,7 @@ void hv_flush_blocks(HvMachine *m) {
     m->nblocks = 0;
     m->nslots = 0;
     m->nxchained = 0;
+    memset(m->xhead, 0, sizeof *m->xhead << HV_XHASH_BITS);
     hv_jit_reset(&m->jit);
     m->jit.limit = hv_knob[HV_K_JITCAP] > 0 ? ((size_t)hv_knob[HV_K_JITCAP] << 20) / sizeof(uint32_t) : 0; /* MB of it to use (testing) */
     /* HV_JIT_POISON: nothing old is left to run, so a stale pointer faults where it is used. */
@@ -188,8 +189,18 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     block_dump(&nb, code);
     /* ...then take the lock only to publish it. */
     if (pthread_mutex_trylock(&m->tr_mu) != 0) {
+        /* Held by another CPU publishing a block of its own, for a fraction of a microsecond: look again a few
+           times before sleeping for it, since a sleep and its wake cost many times what the holder takes (the
+           tablet, 2026-11-13: 2 to 4 thousand waits a second of 6 to 12 us each where nothing held it long). */
         uint64_t w0 = m->stats_interval ? mach_absolute_time() : 0;
-        pthread_mutex_lock(&m->tr_mu);
+        int got = 0;
+        for (int spin = 0; spin < 256 && !got; spin++) {
+#if defined(__aarch64__)
+            __asm__ volatile("yield");
+#endif
+            if ((spin & 7) == 7) got = pthread_mutex_trylock(&m->tr_mu) == 0;
+        }
+        if (!got) pthread_mutex_lock(&m->tr_mu);
         if (m->stats_interval) {
             m->stats.tr_waits++;
             m->stats.tr_wait_ticks += mach_absolute_time() - w0;
@@ -778,8 +789,15 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
             pthread_mutex_unlock(&m->tr_mu);
             return;
         }
+        if (m->nxchained >= m->max_slots) { /* the list is full (exits chained again and again after their page's
+                                               code was written): this one keeps going through its stub */
+            pthread_mutex_unlock(&m->tr_mu);
+            return;
+        }
         m->slot_xpa[idx] = page_pa | 1;
-        m->xchained[m->nxchained++] = idx;
+        uint32_t k = m->nxchained++, h = hv_xhash(page_pa);
+        m->xchained[k] = idx;
+        m->xlink[k] = m->xhead[h], m->xhead[h] = k + 1; /* onto its page's chain (hv_invalidate_code walks it) */
         __atomic_store_n(slot, (uint64_t)(uintptr_t)b->code, __ATOMIC_RELEASE);
         uint32_t *site = m->slot_site[idx];
         int64_t off = site ? b->code - site : 0;

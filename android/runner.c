@@ -69,6 +69,25 @@ static void host_state(FILE *out) {
             fprintf(out, ", %lld MB in huge pages (%lld MB mapped whole)", huge >> 10, whole > 0 ? whole >> 10 : 0);
         if (swap_total > 0 && swap_free >= 0) fprintf(out, ", %lld of %lld MB of swap used", (swap_total - swap_free) >> 10, swap_total >> 10);
     }
+    /* The engine's own page faults since the last line, and those of them that had to wait for a page to come
+       back from swap or storage (/proc/self/stat: minflt and majflt, the 10th and 12th fields). Android lets an
+       app read these where it refuses /proc/vmstat (the tablet, 2026-11-13: no swap figures in the log). A fault
+       that waits stops one of the Mac's CPUs for as long. */
+    f = fopen("/proc/self/stat", "r");
+    if (f) {
+        static unsigned long long last_minor, last_major;
+        static int have;
+        char text[1024];
+        size_t n = fread(text, 1, sizeof text - 1, f);
+        fclose(f);
+        text[n] = 0;
+        const char *after = strrchr(text, ')'); /* the process's name may hold anything, spaces and brackets too */
+        unsigned long long minor = 0, major = 0;
+        if (after && sscanf(after + 1, " %*c %*d %*d %*d %*d %*d %*u %llu %*u %llu", &minor, &major) == 2) {
+            if (have) fprintf(out, ", the engine took %llu page faults, %llu of them waiting for swap or storage", minor - last_minor, major - last_major);
+            last_minor = minor, last_major = major, have = 1;
+        }
+    }
     /* What the tablet moved through swap since the last line (/proc/vmstat counts pages since boot), and the
        page faults that had to wait for it: on a tablet short of memory every page that comes back is unpacked
        on the same cores the Mac's CPUs run on, while one of them stands still. */

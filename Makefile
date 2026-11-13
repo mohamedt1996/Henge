@@ -12,7 +12,7 @@ ENGINE = $(CORE) $(HOST)
 METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc $(B)/test_devices
+        $(B)/test_mmu $(B)/test_xchain $(B)/test_exc $(B)/test_devices
 
 all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref $(B)/hvsparse
 
@@ -83,6 +83,8 @@ $(B)/test_operands: tests/test_operands.c tests/operand_cases.s $(B)/operands.o
 	$(CC) $(CFLAGS) $^ -o $@
 $(B)/test_mmu: tests/test_mmu.c $(ENGINE)
 	$(CC) $(CFLAGS) tests/test_mmu.c $(ENGINE) -o $@
+$(B)/test_xchain: tests/test_xchain.c $(ENGINE)
+	$(CC) $(CFLAGS) tests/test_xchain.c $(ENGINE) -o $@
 
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@
