@@ -596,6 +596,40 @@ runs (768 MB, the default, drops less; memory is what 512 was chosen for); `tlbi
 3 to 5 thousand process switches a second (200 to 460 thousand fills a second); `page end` 50 to 140 thousand
 slow memory accesses a second.
 
+0.3.54 again on the tablet (2026-11-13, a run of forty minutes; JIT cache at its 768 MB, Huge pages off,
+Engine statistics on). The larger cache holds what the Mac runs far better: 2 to 7 thousand blocks translated
+a second from the tenth minute on, against 30 to 90 thousand at 512 MB, and most half-minutes with no drop at
+all. The translation lock's waits still follow the code pages written (20 and 23% of one CPU's time at 106 and
+135 pages a second), which 0.3.55 answers. The Mac's CPU threads ran 84 to 95% of the time and stood ready
+without a core 2.6 to 6.8% of it; the Mac switched address space 16 to 34 thousand times a second; `tlbi
+acks` 2 to 6% of one CPU. A frame: 3.2 ms to draw, 1.2 to read back, 0.2 for the pointer, 1.4 to present; no
+stall, no dropped draw. From the sixth minute the fastest core was held to 2.3 and 1.9 GHz and from the
+fifteenth to 1.7, with the hottest sensor at 67 to 78 C; the frame rate sat near 28 for the second half of the
+run.
+
+0.3.56: the cores, the engine's side and the kernel's.
+
+- **A fast core of its own for each of the Mac's CPUs** (android/runner.c; `HV_CPU_PIN=0` and Settings >
+  Cores for the Mac: Off put it back). The four CPU threads floated over the five fast cores. Now CPU 0 has
+  the fastest core, the others the next ones down, and the lowest-numbered fast core is left over: on the Mi
+  Pad 7, cores 7, 6, 5 and 4, with core 3 left to the app's GPU threads and Android. The Mac spreads its work
+  evenly over its CPUs in the logs, so "the busiest" is CPU 0 for want of a busier one; it also polls the
+  devices. The engine's other threads (disks, network, sound, VNC) are kept to the slow cores; not while
+  installing.
+- **Android's background groups off the fast cores** (root; VmService.coreTuning): `background`,
+  `system-background` and `restricted` are narrowed to the slow cores while the Mac runs. `foreground` (the
+  compositor, touch) and `top-app` (the engine, the app's GPU threads) keep what they have.
+- **Swap**: `vm.page-cluster` 0 where it is more (no read-ahead from swap), the kernel's newer reclaim
+  (`lru_gen`) on where the kernel has it and it is off. The log gets zram's compressor, what it stores and
+  how well it packs, and any swap that is not zram. A compressor cannot be changed while its swap is in use,
+  so that one is the user's to set at boot.
+- **Fast cores awake** (root; its own setting): no idle state that takes more than 100 us to leave on the
+  fast cores (`pm_qos_resume_latency_us`); the log lists core 7's idle states and their latencies.
+- Every one of these is put back when the Mac stops, by the app, and by a root shell that waits for the
+  engine's pid where Android has ended the app; a quick stop and start does not undo the new run's settings.
+- Not measured on a tablet. What the next log shows of it: the engine's "has core N of its own" lines, the
+  app's `cores:` and `swap:` lines, and the heartbeat's "waited ... for a core".
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

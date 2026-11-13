@@ -631,6 +631,27 @@ public class MainActivity extends Activity {
         fnote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(fnote);
         c.addView(hairline());
+        final boolean coresOn = !"off".equals(prefs.getString("coreTuning", "on"));
+        c.addView(choiceRow("Cores for the Mac", new String[]{"On", "Off"}, coresOn ? 0 : 1,
+                i -> { prefs.edit().putString("coreTuning", i == 0 ? "on" : "off").apply(); render(true); }));
+        TextView coreNote = text(coresOn
+                ? "Each of the Mac's CPUs gets a fast core of the tablet's to itself, the fastest for the first, and the engine's "
+                    + "helpers (disk, network, sound) stay on the slow cores. With root, Android's background work is kept off the "
+                    + "Mac's cores too while the Mac runs, and put back after. Other apps are slower in the background meanwhile."
+                : "The Mac's CPUs share the tablet's fast cores with everything else, as before 0.3.56.", 13, DIM, false);
+        coreNote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(coreNote);
+        c.addView(hairline());
+        if (coresOn) {
+            c.addView(choiceRow("Fast cores awake", new String[]{"On", "Off"}, "off".equals(prefs.getString("coreAwake", "on")) ? 1 : 0,
+                    i -> { prefs.edit().putString("coreAwake", i == 0 ? "on" : "off").apply(); render(true); }));
+            TextView awakeNote = text("Needs root. The fast cores do not go into deep sleep while the Mac runs, so work handed between "
+                    + "the Mac's CPUs and the GPU is picked up sooner. Costs a little power and heat: if the tablet slows down "
+                    + "sooner with this on, turn it off.", 13, DIM, false);
+            awakeNote.setPadding(dp(17), 0, dp(17), dp(12));
+            c.addView(awakeNote);
+            c.addView(hairline());
+        }
         if (new java.io.File("/dev/udmabuf").exists()) {
             c.addView(choiceRow("Zero-copy", new String[]{"Off", "On"}, "on".equals(prefs.getString("zerocopy", "off")) ? 1 : 0,
                     i -> { prefs.edit().putString("zerocopy", i == 1 ? "on" : "off").apply(); render(true); }));

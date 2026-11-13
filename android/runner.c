@@ -19,6 +19,7 @@ uint64_t hv_pvg_reims_wait_ns(void);
 
 static void curl_global_init_all(void) { curl_global_init(CURL_GLOBAL_ALL); }
 
+#include <dirent.h>
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
@@ -225,12 +226,45 @@ static int heartbeat_no_cpus; /* Gunyah runs the CPU: its state is not ours to r
 
 /* The Mac's CPUs on the tablet's fast cores. A phone's cores are of two or three speeds (the Mi Pad 7: one
    at 2.8 GHz, four at 2.6, three at 1.9), and nothing kept a guest CPU's thread, which translates and runs
-   the Mac's code flat out, off the slow ones. Each such thread is bound to every core but the slowest kind
-   (by cpuinfo_max_freq). HV_CPU_ANY=1 leaves them where Android puts them. host/vm.c calls this (weak there). */
-static cpu_set_t fast_set;
-static int fast_count, fast_total;
+   the Mac's code flat out, off the slow ones. HV_CPU_ANY=1 leaves them where Android puts them. host/vm.c
+   calls this (weak there).
+
+   0.3.56: each of the Mac's CPUs has a fast core of its own, where there are as many (HV_CPU_PIN=0: any of the
+   fast cores, as before). The four threads floated over the five fast cores: the log's "waited for a core" was
+   3 to 10% of their time, and a thread that moves leaves its core's caches behind. The Mac's CPU 0 takes the
+   fastest core (it is the one that polls the devices too), the others the next ones down, highest core number
+   first, so what is left over is the lowest-numbered fast core: nothing of the engine's runs there, which
+   leaves it to the app's GPU threads (the app keeps Android's other groups off the Mac's cores with root:
+   VmService.coreTuning, which reckons the same cores by the same rule). The engine's other threads (disks,
+   network, sound, VNC, the heartbeat) are kept to the slow cores: they wait more than they work. Not while
+   installing, where the restore tools' threads do the work. */
+static cpu_set_t fast_set, slow_set;
+static int fast_count, fast_total, slow_count;
+static int fast_order[64];              /* the fast cores, fastest first, of one speed the highest number first */
+static long core_khz[64];
 static pid_t fast_tids[HV_MAX_CPUS];
+static cpu_set_t own_set[HV_MAX_CPUS];  /* what each of those threads is bound to */
 static int fast_ntids;
+static int pin_cores, pin_helpers;      /* a core of its own per CPU; the other threads on the slow cores */
+int hv_runner_installing;               /* set by main before any thread is made */
+
+/* The engine's threads that are not the Mac's CPUs, onto the slow cores. New ones are found at the next pass. */
+static void helpers_to_slow(void) {
+    if (!pin_helpers || !slow_count) return;
+    DIR *d = opendir("/proc/self/task");
+    if (!d) return;
+    int n = __atomic_load_n(&fast_ntids, __ATOMIC_ACQUIRE);
+    if (n > HV_MAX_CPUS) n = HV_MAX_CPUS;
+    for (struct dirent *e; (e = readdir(d)) != NULL;) {
+        pid_t tid = (pid_t)atoi(e->d_name);
+        if (tid <= 0) continue;
+        int cpu_thread = 0;
+        for (int k = 0; k < n; k++) cpu_thread |= fast_tids[k] == tid;
+        if (!cpu_thread) sched_setaffinity(tid, sizeof slow_set, &slow_set);
+    }
+    closedir(d);
+}
+
 /* Again, now and then: Android (or the app, moving the engine into the top-app group with root) may move
    the process between scheduling groups, and Linux 6.1 gives every thread the new group's cores when it does. */
 static void *fast_again(void *unused) {
@@ -238,29 +272,45 @@ static void *fast_again(void *unused) {
     for (int i = 0;; i++) {
         sleep(i < 4 ? 3 : 30);
         int n = __atomic_load_n(&fast_ntids, __ATOMIC_ACQUIRE);
-        for (int k = 0; k < n && k < HV_MAX_CPUS; k++) sched_setaffinity(fast_tids[k], sizeof fast_set, &fast_set);
+        for (int k = 0; k < n && k < HV_MAX_CPUS; k++) sched_setaffinity(fast_tids[k], sizeof own_set[k], &own_set[k]);
+        helpers_to_slow();
+        if (i == 1 && pin_helpers && slow_count)
+            fprintf(stderr, "hengevm: the engine's other threads (disks, network, sound) are kept to the %d slow cores\n", slow_count);
     }
     return NULL;
 }
 static pthread_once_t fast_once = PTHREAD_ONCE_INIT;
 static void fast_find(void) {
-    long freq[64], lo = 0, hi = 0;
+    long lo = 0, hi = 0;
     int n = 0;
     for (; n < 64; n++) {
         char path[96];
         snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", n);
         FILE *f = fopen(path, "r");
         if (!f) break;
-        if (fscanf(f, "%ld", &freq[n]) != 1) freq[n] = 0;
+        if (fscanf(f, "%ld", &core_khz[n]) != 1) core_khz[n] = 0;
         fclose(f);
-        if (!n || freq[n] < lo) lo = freq[n];
-        if (freq[n] > hi) hi = freq[n];
+        if (!n || core_khz[n] < lo) lo = core_khz[n];
+        if (core_khz[n] > hi) hi = core_khz[n];
     }
     fast_total = n;
     CPU_ZERO(&fast_set);
+    CPU_ZERO(&slow_set);
     if (!n || lo == hi) return; /* unreadable, or all of one speed: nothing to choose */
-    for (int i = 0; i < n; i++)
-        if (freq[i] > lo) CPU_SET(i, &fast_set), fast_count++;
+    for (int i = 0; i < n; i++) {
+        if (core_khz[i] > lo) CPU_SET(i, &fast_set), fast_order[fast_count++] = i;
+        else CPU_SET(i, &slow_set), slow_count++;
+    }
+    /* Fastest first; of one speed, the highest number first (insertion sort: a handful of cores). */
+    for (int i = 1; i < fast_count; i++)
+        for (int k = i; k > 0; k--) {
+            int a = fast_order[k - 1], b = fast_order[k];
+            if (core_khz[a] > core_khz[b] || (core_khz[a] == core_khz[b] && a > b)) break;
+            fast_order[k - 1] = b, fast_order[k] = a;
+        }
+    const char *pin = getenv("HV_CPU_PIN");
+    pin_cores = !(pin && *pin == '0') && hv_vm_ncpus() <= fast_count;
+    pin_helpers = pin_cores && !hv_runner_installing;
     pthread_t th;
     if (pthread_create(&th, NULL, fast_again, NULL) == 0) pthread_detach(th);
 }
@@ -269,10 +319,34 @@ void hv_host_cpu_thread(void) {
     pthread_once(&fast_once, fast_find);
     if (!fast_count) return;
     static int said;
+    int index = hv_vm_this_cpu();
+    cpu_set_t own = fast_set;
+    int core = -1;
+    if (pin_cores && index >= 0 && index < fast_count) {
+        core = fast_order[index];
+        CPU_ZERO(&own);
+        CPU_SET(core, &own);
+    }
     int slot = __atomic_fetch_add(&fast_ntids, 1, __ATOMIC_ACQ_REL);
-    if (slot < HV_MAX_CPUS) fast_tids[slot] = gettid();
-    int rc = sched_setaffinity(0, sizeof fast_set, &fast_set);
-    if (!__atomic_exchange_n(&said, 1, __ATOMIC_ACQ_REL)) {
+    if (slot < HV_MAX_CPUS) own_set[slot] = own, fast_tids[slot] = gettid();
+    int rc = sched_setaffinity(0, sizeof own, &own);
+    if (rc != 0 && core >= 0) { /* that core is not ours to have (offline, or not in Android's set for us): any fast one */
+        fprintf(stderr, "hengevm: the Mac's CPU %d could not be given core %d (%s); it runs on any fast core\n", index, core, strerror(errno));
+        own = fast_set, core = -1;
+        if (slot < HV_MAX_CPUS) own_set[slot] = own;
+        rc = sched_setaffinity(0, sizeof own, &own);
+    }
+    if (core >= 0) {
+        fprintf(stderr, "hengevm: the Mac's CPU %d has core %d of its own (%.1f GHz)\n", index, core, core_khz[core] / 1e6);
+        if (!__atomic_exchange_n(&said, 1, __ATOMIC_ACQ_REL)) {
+            char left[160] = "";
+            size_t m = 0;
+            for (int k = hv_vm_ncpus(); k < fast_count && m < sizeof left - 8; k++)
+                m += (size_t)snprintf(left + m, sizeof left - m, "%s%d", m ? ", " : "", fast_order[k]);
+            fprintf(stderr, "hengevm: %d fast cores of %d for the Mac's %d CPUs, one each; %s%s\n", hv_vm_ncpus(), fast_total, hv_vm_ncpus(),
+                    left[0] ? "left to the app's GPU threads: core " : "no fast core is left over", left);
+        }
+    } else if (!__atomic_exchange_n(&said, 1, __ATOMIC_ACQ_REL)) {
         if (rc == 0) fprintf(stderr, "hengevm: the Mac's CPUs run on the tablet's %d fast cores of %d\n", fast_count, fast_total);
         else fprintf(stderr, "hengevm: could not keep the Mac's CPUs on the fast cores: %s\n", strerror(errno));
     }
@@ -484,6 +558,7 @@ int main(int argc, char **argv) {
         else usage();
     }
     static char rom_path[1100], ipsw_path[1100], work[1100];
+    hv_runner_installing = install_dir != NULL; /* the restore tools' threads keep every core (hv_host_cpu_thread) */
     if (install_dir) {
         curl_global_init_all();
         const HvRelease *r = hv_release_find(release);
