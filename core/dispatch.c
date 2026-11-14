@@ -510,8 +510,12 @@ void hv_debug_el0_in_kernel(HvCpu *cpu, const char *what) {
 }
 
 /* WFI: sleep until an interrupt is pending (masked or not) or the next timer
-   event, at most 10 ms. WFI may complete early, so the guest just runs again
-   if nothing happened. */
+   event. WFI may complete early, so the guest just runs again if nothing happened.
+   CPU 0 sleeps at most 10 ms: its tick polls the devices (vmapple.c tick_locked), some of which
+   (the network, the RTC) are only looked at there. 0.3.61: the other CPUs look after only their
+   own timer, and anything else for them comes as an interrupt, which wakes them (the GIC's
+   hv_cpu_wake), so they sleep until their timer's deadline, at most 250 ms (a safety net, not a
+   poll). At 10 ms each idle one woke 100 times a second for nothing. HV_WFI_CAP_MS: their cap. */
 static int wait_for_interrupt(HvCpu *cpu) {
     HvMachine *m = cpu->m;
     uint64_t deadline = m->tick ? m->tick(m, cpu) : 0;
@@ -519,8 +523,15 @@ static int wait_for_interrupt(HvCpu *cpu) {
     if (p->irq_line || p->fiq_line) return 0;
     if (!m->tick) return -1; /* nothing could ever wake us */
     uint64_t now = mach_absolute_time();
-    uint64_t wait_ticks = deadline && deadline > now ? deadline - now : 240000; /* the counter runs at 24 MHz */
-    if (wait_ticks > 240000) wait_ticks = 240000;
+    static uint64_t cap_ticks; /* the other CPUs' cap; the counter runs at 24 MHz */
+    if (!cap_ticks) {
+        const char *e = getenv("HV_WFI_CAP_MS");
+        long ms = e && *e ? atol(e) : 250;
+        cap_ticks = (uint64_t)(ms < 10 ? 10 : ms > 1000 ? 1000 : ms) * 24000;
+    }
+    uint64_t cap = cpu->index == 0 ? 240000 : cap_ticks;
+    uint64_t wait_ticks = deadline && deadline > now ? deadline - now : cap;
+    if (wait_ticks > cap) wait_ticks = cap;
     uint64_t t0 = mach_absolute_time();
     /* Sleep until the next timer event or until a device thread has work for us. */
     hv_big_unlock(m); /* let the other CPUs run while this one sleeps */

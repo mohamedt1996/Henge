@@ -61,7 +61,15 @@ int main(void) {
     CHECK(posted < 5000000 && both >= 30000000 && v == 7, "a posted write took %.1f ms, it and a read %.1f ms, read %llu",
           posted / 1e6, both / 1e6, (unsigned long long)v);
 
+    /* The awake part of a wait is learnt (0.3.61): slow answers lengthen it to the most, fast ones shorten it. */
+    CHECK(spin_now_ns() == spin_limit_ns(), "after slow answers the wait stays awake %lld us, not the most", (long long)(spin_now_ns() / 1000));
     app_delay_us = 0;
+    __atomic_store_n(&answer_avg_ns, 2000, __ATOMIC_RELAXED);
+    for (int i = 0; i < 50; i++) answer_took(3000);
+    CHECK(spin_now_ns() >= 30000 && spin_now_ns() < 50000, "after fast answers the wait stays awake %lld us (30 to 50 expected)",
+          (long long)(spin_now_ns() / 1000));
+    for (int i = 0; i < 200; i++) v = gfx_read(NULL, 0x44, 4);
+    CHECK(v == 7, "reads with a learnt wait: %llu", (unsigned long long)v);
     printf("%d checks, %d failures\n", checks, failures);
     app_stop = 1;
     pthread_join(t, NULL);

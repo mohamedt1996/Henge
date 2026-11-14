@@ -670,6 +670,15 @@ public class MainActivity extends Activity {
         c.addView(coreNote);
         c.addView(hairline());
         if (coresOn) {
+            c.addView(choiceRow("Big core", new String[]{"Leave out", "Use"}, "use".equals(prefs.getString("bigCore", "avoid")) ? 1 : 0,
+                    i -> { prefs.edit().putString("bigCore", i == 1 ? "use" : "avoid").apply(); render(true); }));
+            TextView bigNote = text("Where one core is faster than all the others (the Mi Pad 7's 2.8 GHz one), Leave out keeps the "
+                    + "Mac's CPUs on the next ones (2.6 GHz) and leaves it to the GPU side and Android. It heats fastest and the "
+                    + "tablet throttles all its fast cores with it, so a slightly lower clock that holds is usually faster after a few "
+                    + "minutes. Use: the first Mac CPU on it, as before 0.3.61.", 13, DIM, false);
+            bigNote.setPadding(dp(17), 0, dp(17), dp(12));
+            c.addView(bigNote);
+            c.addView(hairline());
             c.addView(choiceRow("Fast cores awake", new String[]{"On", "Off"}, "off".equals(prefs.getString("coreAwake", "on")) ? 1 : 0,
                     i -> { prefs.edit().putString("coreAwake", i == 0 ? "on" : "off").apply(); render(true); }));
             TextView awakeNote = text("Needs root. The fast cores do not go into deep sleep while the Mac runs, so work handed between "

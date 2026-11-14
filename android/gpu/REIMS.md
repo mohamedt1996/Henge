@@ -729,6 +729,20 @@ plug-in have no counterpart here, see the section below):
 - **JIT cache: 1 GB goes back to 768 MB once** (it can be set again): it still dropped five times in twelve
   minutes while the tablet swapped hard. The Mac's memory stays 4 GB.
 
+0.3.61, less heat for the same speed:
+
+- **Idle CPUs sleep until their timer** (`core/dispatch.c` `wait_for_interrupt`): the Mac's CPUs 1 to 3 look after
+  only their own timer, and anything else for them is an interrupt, which wakes them; they slept at most 10 ms, so
+  each idle one woke 100 times a second for nothing. Now until their timer's deadline, at most 250 ms
+  (HV_WFI_CAP_MS). CPU 0 keeps 10 ms: its tick polls the devices. The heartbeat's wfi/s shows it.
+- **GPU register waits in WFE, and as long as answers take** (`android/pvg_reims.c`): the wait before sleeping
+  was a yield loop of up to 150 us at full clock. The core now waits in WFE on the slot (the app's store wakes it
+  at once; a clock-gated core otherwise), and for four times the recent answers' average plus 10 us (30 to 150
+  us; HV_REIMS_SPIN_US fixes it). The heartbeat's "awake up to N us". `tests/test_reims_link.c`: 6 checks.
+- **Settings > Big core: Leave out** (the default, `android/runner.c`, `VmService.cores`): the Mac's CPUs on the
+  four 2.6 GHz cores, the 2.8 GHz X4 left to the GPU side and Android; Fast cores awake keeps only the Mac's cores
+  out of deep idle. Use: as before.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

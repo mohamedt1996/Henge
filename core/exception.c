@@ -144,6 +144,8 @@ static uint64_t psci(HvCpu *cpu, uint64_t fn) {
         for (int i = 0; i < cpu->m->ncpus; i++) /* the whole machine stops */
             if (cpu->m->cpus[i]) cpu->m->cpus[i]->halted = (uint32_t)fn == 0x84000008 ? 1 : 2;
         hv_machine_kick_all(cpu->m);
+        for (int i = 0; i < cpu->m->ncpus; i++) /* those asleep in WFI too: they may sleep 250 ms now (wait_for_interrupt) */
+            if (cpu->m->cpus[i] && cpu->m->cpus[i] != cpu) hv_cpu_wake(cpu->m->cpus[i]);
         return 0;
     case 0x8400000a: {                                       /* PSCI_FEATURES */
         uint32_t q = (uint32_t)cpu->x[1];

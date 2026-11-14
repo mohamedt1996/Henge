@@ -104,30 +104,75 @@ static int posted_writes(void) {
     return on;
 }
 
+static int spin_fixed; /* HV_REIMS_SPIN_US was given: that limit, not one learnt */
+
 static int64_t spin_limit_ns(void) {
     /* Most answers take microseconds, and a CPU thread that sleeps here pays the scheduler twice (the app's
        thread woken, then this one: on the tablet an access cost a millisecond on average, 0.3.24). So it
-       stays awake for the first 150 us, by the clock (2000 loads were a few microseconds), and sleeps
-       only for an answer that takes longer. HV_REIMS_SPIN_US changes it (0: sleep at once). */
+       stays awake for at most the first 150 us, by the clock, and sleeps only for an answer that takes
+       longer. HV_REIMS_SPIN_US changes it (0: sleep at once) and turns off the learning (spin_now_ns). */
     static int64_t spin_ns = -1;
     if (spin_ns < 0) {
         const char *us = getenv("HV_REIMS_SPIN_US");
-        spin_ns = (us && *us ? atoll(us) : 150) * 1000;
+        spin_fixed = us && *us;
+        spin_ns = (spin_fixed ? atoll(us) : 150) * 1000;
     }
     return spin_ns;
+}
+
+/* 0.3.61: how long answers caught awake took, on average (1/8 the newest; ns). The wait stays awake for four
+   times that and 10 us more, at least 30 us, at most spin_limit_ns: answers of a few microseconds no longer
+   keep a core awake 150 us when the app's thread is slow, and a slow spell lengthens it again. */
+static uint32_t answer_avg_ns = 20000;
+
+static int64_t spin_now_ns(void) {
+    int64_t most = spin_limit_ns();
+    if (spin_fixed || most <= 30000) return most;
+    int64_t t = 4 * (int64_t)__atomic_load_n(&answer_avg_ns, __ATOMIC_RELAXED) + 10000;
+    return t < 30000 ? 30000 : t > most ? most : t;
+}
+
+static void answer_took(int64_t ns) {
+    if (ns < 0) return;
+    if (ns > 1000000) ns = 1000000;
+    uint32_t a = __atomic_load_n(&answer_avg_ns, __ATOMIC_RELAXED); /* racy between CPUs: an average, no more */
+    __atomic_store_n(&answer_avg_ns, (uint32_t)((int64_t)a + (ns - (int64_t)a) / 8), __ATOMIC_RELAXED);
 }
 
 /* Waits until the slot's request is no longer REQUEST (answered: REPLY, or IDLE for a write); 0, or -1
    when the app died with it (the slot is then IDLE and the access counts as lost). */
 static int wait_answer(HvReimsSlot *s, uint64_t began) {
-    int64_t spin_ns = spin_limit_ns();
+    int64_t spin_ns = spin_now_ns();
+    uint64_t from = now_ns();
+#if defined(__aarch64__) && !defined(HV_REIMS_NO_WFE)
+    /* 0.3.61: awake in the core's WFE, not a yield loop. LDAXR arms the exclusive monitor on the slot's state;
+       the app's store to it clears the monitor, which wakes the WFE at once; otherwise the kernel's event
+       stream (10 kHz on arm64 Linux) wakes it to look at the clock. A core in WFE is clock-gated: the wait
+       costs a fraction of a spinning core's power, and the answer is seen as soon. */
+    if (spin_ns > 0)
+        for (;;) {
+            uint32_t v;
+            __asm__ volatile("ldaxr %w0, [%1]" : "=r"(v) : "r"(&s->state) : "memory");
+            if (v != HV_REIMS_REQUEST) {
+                __asm__ volatile("clrex" ::: "memory");
+                answer_took((int64_t)(now_ns() - from));
+                return 0;
+            }
+            if ((int64_t)(now_ns() - began) >= spin_ns) break;
+            __asm__ volatile("wfe" ::: "memory");
+        }
+    __asm__ volatile("clrex" ::: "memory");
+#else
     for (unsigned spin = 0;; spin++) {
-        if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != HV_REIMS_REQUEST) return 0;
+        if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != HV_REIMS_REQUEST) {
+            answer_took((int64_t)(now_ns() - from));
+            return 0;
+        }
         if ((spin & 63) == 63 && (int64_t)(now_ns() - began) >= spin_ns) break;
-#if defined(__aarch64__)
-        __asm__ volatile("yield");
-#endif
     }
+#endif
+    if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != HV_REIMS_REQUEST) return 0;
+    answer_took(spin_limit_ns()); /* not answered awake: the next waits stay awake longer */
     for (;;) {
         struct timespec t = {0, 100 * 1000000};
         futex(&s->state, FUTEX_WAIT, HV_REIMS_REQUEST, &t);
@@ -310,6 +355,8 @@ int hv_pvg_external_pointer(int *x, int *y) {
 }
 
 uint64_t hv_pvg_reims_wait_ns(void) { return __atomic_load_n(&R.wait_ns, __ATOMIC_RELAXED); }
+/* The awake part of a wait now (us), as learnt (spin_now_ns). */
+int hv_pvg_reims_spin_us(void) { return (int)(spin_now_ns() / 1000); }
 
 void hv_pvg_reims_activity(uint64_t *requests, uint64_t *irqs) {
     *requests = R.h ? R.h->requests : 0, *irqs = R.h ? R.h->irqs : 0;

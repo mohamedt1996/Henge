@@ -16,6 +16,7 @@
 /* Graphics: reims (pvg_reims.c): what crossed to the app's GPU device. */
 void hv_pvg_reims_activity(uint64_t *requests, uint64_t *irqs);
 uint64_t hv_pvg_reims_wait_ns(void);
+int hv_pvg_reims_spin_us(void);
 
 static void curl_global_init_all(void) { curl_global_init(CURL_GLOBAL_ALL); }
 
@@ -237,7 +238,13 @@ static int heartbeat_no_cpus; /* Gunyah runs the CPU: its state is not ours to r
    leaves it to the app's GPU threads (the app keeps Android's other groups off the Mac's cores with root:
    VmService.coreTuning, which reckons the same cores by the same rule). The engine's other threads (disks,
    network, sound, VNC, the heartbeat) are kept to the slow cores: they wait more than they work. Not while
-   installing, where the restore tools' threads do the work. */
+   installing, where the restore tools' threads do the work.
+
+   0.3.61: the big core left out. Where one core is faster than all the others (the Mi Pad 7's 2.8 GHz X4) and
+   the next ones are enough for the Mac's CPUs, it goes to the end of the order: the Mac's CPUs take the next
+   speed down (2.6 GHz) and the big core is left to the app's GPU threads and Android. It heats fastest and
+   the whole cluster throttles with it (the 0.3.59 log: 95-99 C in five minutes, 2.7 GHz down to 1.7), so a
+   7% lower clock that holds beats one that falls. HV_CPU_PRIME=1 (Settings > Big core: Use): as before. */
 static cpu_set_t fast_set, slow_set;
 static int fast_count, fast_total, slow_count;
 static int fast_order[64];              /* the fast cores, fastest first, of one speed the highest number first */
@@ -308,6 +315,15 @@ static void fast_find(void) {
             if (core_khz[a] > core_khz[b] || (core_khz[a] == core_khz[b] && a > b)) break;
             fast_order[k - 1] = b, fast_order[k] = a;
         }
+    const char *prime = getenv("HV_CPU_PRIME");
+    if (!(prime && *prime == '1') && fast_count >= 2 && core_khz[fast_order[0]] > core_khz[fast_order[1]] &&
+        fast_count - 1 >= hv_vm_ncpus()) {
+        int big = fast_order[0];
+        memmove(fast_order, fast_order + 1, (size_t)(fast_count - 1) * sizeof fast_order[0]);
+        fast_order[fast_count - 1] = big;
+        CPU_CLR(big, &fast_set); /* not for the Mac's CPUs even where they are not bound one by one */
+        fprintf(stderr, "hengevm: the big core %d (%.1f GHz) is left out of the Mac's CPUs (Settings > Big core)\n", big, core_khz[big] / 1e6);
+    }
     const char *pin = getenv("HV_CPU_PIN");
     pin_cores = !(pin && *pin == '0') && hv_vm_ncpus() <= fast_count;
     pin_helpers = pin_cores && !hv_runner_installing;
@@ -425,9 +441,9 @@ static void *install_heartbeat(void *arg) {
             /* How long the Mac's CPUs stood waiting for the app's GPU to answer a register, of this
                interval's 30 s per CPU: what the GPU costs the Mac, apart from the CPU's own slowness. */
             uint64_t wait = hv_pvg_reims_wait_ns();
-            fprintf(stderr, " | disk +%llu | gpu (reims) +%llu register accesses, %llu interrupts, CPUs waited %.1f s on it",
+            fprintf(stderr, " | disk +%llu | gpu (reims) +%llu register accesses, %llu interrupts, CPUs waited %.1f s on it (awake up to %d us)",
                     (unsigned long long)(disk - last_disk), (unsigned long long)(cmds - last_gpu), (unsigned long long)swaps,
-                    (wait - last_wait) / 1e9);
+                    (wait - last_wait) / 1e9, hv_pvg_reims_spin_us());
             last_wait = wait;
         }
         if (disk != last_disk || cmds != last_gpu) moved = 1;

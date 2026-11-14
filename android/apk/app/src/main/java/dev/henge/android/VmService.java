@@ -391,6 +391,8 @@ public class VmService extends Service {
             boolean coresOn = !install && !gunyah() && !"off".equals(prefs.getString("coreTuning", "on"));
             boolean awakeOn = coresOn && !"off".equals(prefs.getString("coreAwake", "on"));
             pb.environment().put("HV_CPU_PIN", coresOn ? "1" : "0");
+            // Settings > Big core: Leave out (the default) keeps the Mac's CPUs off a core faster than all the others.
+            pb.environment().put("HV_CPU_PRIME", "use".equals(prefs.getString("bigCore", "avoid")) ? "1" : "0");
             String coreKept = "";
             try { coreKept = install ? "" : coreTuning(log, coresOn, awakeOn, cpus); }
             catch (Exception e) { appendLog(log, "henge app: cores: left as they are: " + e); }
@@ -555,7 +557,7 @@ public class VmService extends Service {
     }
 
     /** null where the cores' speeds cannot be read, are all one speed, or there are fewer fast cores than Mac CPUs. */
-    private static Cores cores(int macCpus) {
+    private static Cores cores(int macCpus, boolean leaveBig) {
         java.util.List<long[]> all = new ArrayList<>(); // {core, kHz}
         for (int i = 0; i < 64; i++) {
             try {
@@ -574,6 +576,8 @@ public class VmService extends Service {
         final java.util.Comparator<long[]> order = (a, b) -> a[1] != b[1] ? Long.compare(b[1], a[1]) : Long.compare(b[0], a[0]);
         java.util.Collections.sort(fast, order);
         if (macCpus < 1 || macCpus > fast.size()) return null;
+        // As the engine: a core faster than all the others goes last where the rest are enough (Settings > Big core).
+        if (leaveBig && fast.size() >= 2 && fast.get(0)[1] > fast.get(1)[1] && fast.size() - 1 >= macCpus) fast.add(fast.remove(0));
         for (int i = 0; i < fast.size(); i++) {
             int core = (int) fast.get(i)[0];
             k.fast.add(core);
@@ -649,7 +653,7 @@ public class VmService extends Service {
         android.content.SharedPreferences p = getSharedPreferences("henge", MODE_PRIVATE);
         coreTuningBack(log, p);
         if (!groups && !awake) return "";
-        Cores k = cores(macCpus);
+        Cores k = cores(macCpus, !"use".equals(p.getString("bigCore", "avoid")));
         if (k == null) {
             appendLog(log, "henge app: cores: the tablet's cores are of one speed, or fewer fast ones than the Mac has CPUs: nothing is set");
             return "";
@@ -662,7 +666,8 @@ public class VmService extends Service {
             files.add("/proc/sys/vm/page-cluster");
             files.add("/sys/kernel/mm/lru_gen/enabled");
         }
-        if (awake) for (int c : k.fast) files.add("/sys/devices/system/cpu/cpu" + c + "/power/pm_qos_resume_latency_us");
+        // Kept out of deep idle: the Mac's cores only (0.3.61); a spare core sleeps as deep as it likes.
+        if (awake) for (int c : k.mac) files.add("/sys/devices/system/cpu/cpu" + c + "/power/pm_qos_resume_latency_us");
         for (String f : files) read.append("echo \"").append(f).append("=$(cat ").append(f).append(" 2>/dev/null)\"; ");
         java.util.Map<String, String> now = new java.util.LinkedHashMap<>();
         for (String line : DeviceCheck.sh(true, read + "true").split("\n")) {
@@ -699,7 +704,7 @@ public class VmService extends Service {
         }
         int woken = 0;
         if (awake) {
-            for (int c : k.fast) {
+            for (int c : k.mac) {
                 String f = "/sys/devices/system/cpu/cpu" + c + "/power/pm_qos_resume_latency_us";
                 String was = now.get(f);
                 // "0" is the kernel's "any latency"; a limit already at or under ours is left alone.
@@ -707,7 +712,7 @@ public class VmService extends Service {
                 want.put(f, "100");
                 woken++;
             }
-            if (woken > 0) said.append(said.length() > 0 ? ", " : "").append("idle states over 100 us off on cores ").append(list(k.fast));
+            if (woken > 0) said.append(said.length() > 0 ? ", " : "").append("idle states over 100 us off on cores ").append(list(k.mac));
         }
         StringBuilder keep = new StringBuilder(), write = new StringBuilder();
         for (java.util.Map.Entry<String, String> e : want.entrySet()) {
