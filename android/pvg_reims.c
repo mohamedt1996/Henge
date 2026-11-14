@@ -121,15 +121,15 @@ static int64_t spin_limit_ns(void) {
 }
 
 /* 0.3.61: how long answers caught awake took, on average (1/8 the newest; ns). The wait stays awake for four
-   times that and 10 us more, at least 30 us, at most spin_limit_ns: answers of a few microseconds no longer
+   times that and 10 us more, at least 60 us (0.3.63; 30 let waits of up to 6 s in 30 build up), at most spin_limit_ns: answers of a few microseconds no longer
    keep a core awake 150 us when the app's thread is slow, and a slow spell lengthens it again. */
 static uint32_t answer_avg_ns = 20000;
 
 static int64_t spin_now_ns(void) {
     int64_t most = spin_limit_ns();
-    if (spin_fixed || most <= 30000) return most;
+    if (spin_fixed || most <= 60000) return most;
     int64_t t = 4 * (int64_t)__atomic_load_n(&answer_avg_ns, __ATOMIC_RELAXED) + 10000;
-    return t < 30000 ? 30000 : t > most ? most : t;
+    return t < 60000 ? 60000 : t > most ? most : t;
 }
 
 static void answer_took(int64_t ns) {

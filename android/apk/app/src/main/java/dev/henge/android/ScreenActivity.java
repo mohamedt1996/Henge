@@ -64,7 +64,10 @@ public class ScreenActivity extends Activity {
         view.nativePointer = view.macPointer
                 && !"capture".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("mouse", "android"));
         if (view.macPointer) {
-            try { GpuView.nativeReimsNativePointer(view.nativePointer); } catch (Throwable ignored) { }
+            // Settings > The Mac's own pointer: Shown too: the Mac's stays in the frames beside Android's.
+            boolean hideMacs = view.nativePointer
+                    && !"on".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("macPointerShow", "off"));
+            try { GpuView.nativeReimsNativePointer(hideMacs); } catch (Throwable ignored) { }
         }
         if (vulkan) view.setPointerIcon(android.view.PointerIcon.getSystemIcon(this,
                 view.nativePointer ? android.view.PointerIcon.TYPE_ARROW : android.view.PointerIcon.TYPE_NULL));

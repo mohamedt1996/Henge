@@ -623,6 +623,16 @@ public class MainActivity extends Activity {
         mousenote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(mousenote);
         c.addView(hairline());
+        if (!captured) {
+            c.addView(choiceRow("The Mac's own pointer", new String[]{"Hidden", "Shown too"}, "on".equals(prefs.getString("macPointerShow", "off")) ? 1 : 0,
+                    i -> { prefs.edit().putString("macPointerShow", i == 1 ? "on" : "off").apply(); render(true); }));
+            TextView shownote = text("Shown too: the Mac draws its pointer as well as Android's, to see whether it follows (it should sit "
+                    + "under Android's; if it stays behind or elsewhere, clicks land where the Mac's is). Takes effect at the next start.",
+                    13, DIM, false);
+            shownote.setPadding(dp(17), 0, dp(17), dp(12));
+            c.addView(shownote);
+            c.addView(hairline());
+        }
         if ("reims".equals(prefs.getString("gpu", "on"))) {
             final java.io.File copyAll = new java.io.File(VmService.reimsHomeDir(this), "copy-in-all");
             c.addView(choiceRow("GPU memory checks", new String[]{"Used", "Everything"}, copyAll.exists() ? 1 : 0,
@@ -741,18 +751,36 @@ public class MainActivity extends Activity {
                 }
             }
         }
-        final int[] jitSizes = {1024, 768, 0, 384, 256};
-        int jitNow = 2;
+        final int[] jitSizes = {1024, 0, 512, 384, 256};
+        int jitNow = 1;
         for (int i = 0; i < jitSizes.length; i++) if (jitSizes[i] == prefs.getInt("jitMb", 0)) jitNow = i;
-        c.addView(choiceRow("JIT cache", new String[]{"1 GB", "768 MB", "512 MB", "384", "256"}, jitNow,
+        c.addView(choiceRow("JIT cache", new String[]{"1 GB", "768 MB", "512", "384", "256"}, jitNow,
                 i -> { prefs.edit().putInt("jitMb", jitSizes[i]).apply(); render(true); }));
-        TextView jnote = text("Room for the Mac's code as the CPU engine translates it. Since 0.3.62 it is kept in four parts: "
-                + "when it fills, only the oldest part is dropped and its memory given back, so three quarters of what was "
-                + "translated stays and the cache stays nearly full. 512 MB (the default) then holds about what 768 did on "
-                + "average before. Bigger re-translates less and leaves the tablet less memory (the log's \"memory available\" "
-                + "and swap); smaller the other way round.", 13, DIM, false);
+        TextView jnote = text("Room for the Mac's code as the CPU engine translates it. When it fills, it is dropped and its "
+                + "memory given back to Android, then code is translated again as it runs. Bigger re-translates less and leaves "
+                + "the tablet less memory (the log's \"memory available\" and swap); smaller the other way round. On the Mi Pad 7 "
+                + "the Mac makes about 15 MB of it a second.", 13, DIM, false);
         jnote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(jnote);
+        c.addView(hairline());
+        final boolean jitParts = "parts".equals(prefs.getString("jitParts", "whole"));
+        c.addView(choiceRow("JIT drops", new String[]{"Whole", "In parts"}, jitParts ? 1 : 0,
+                i -> { prefs.edit().putString("jitParts", i == 1 ? "parts" : "whole").apply(); render(true); }));
+        TextView pnote = text("Whole: a full cache is dropped all at once (one longer hitch, then everything is translated again). "
+                + "In parts: only its oldest quarter goes each time (four short hitches where there was one; the cache stays nearly "
+                + "full, so it uses more memory on average). The same amount is translated either way at the same size: try both.",
+                13, DIM, false);
+        pnote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(pnote);
+        c.addView(hairline());
+        c.addView(choiceRow("Longer blocks", new String[]{"Off", "On"}, "on".equals(prefs.getString("longBlocks", "off")) ? 1 : 0,
+                i -> { prefs.edit().putString("longBlocks", i == 1 ? "on" : "off").apply(); render(true); }));
+        TextView lbnote = text("Experimental. Translated code goes on past a conditional branch instead of ending there, which leaves "
+                + "out one exit per branch: the translation of each Mac instruction may come out smaller (the log's \"a block is N "
+                + "instructions, M bytes\": M divided by N, 54 without), so the cache holds more. Some code is then translated "
+                + "twice, so it may not; and it has run on the tests only. If the Mac misbehaves, turn it off.", 13, DIM, false);
+        lbnote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(lbnote);
         c.addView(hairline());
         c.addView(choiceRow("JIT cache memory", new String[]{"Give back", "Keep"}, "keep".equals(prefs.getString("jitMemory", "give")) ? 1 : 0,
                 i -> { prefs.edit().putString("jitMemory", i == 1 ? "keep" : "give").apply(); render(true); }));

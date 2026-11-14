@@ -359,19 +359,28 @@ static void absolute_event(Client *c, int mask, int x, int y) {
     pthread_mutex_lock(&P.mu);
     P.have = 0, P.settled = 1;
     pthread_mutex_unlock(&P.mu);
-    if ((mask ^ c->buttons) & 7) {
-        /* macOS misses a press let go at once, as for the mouse (buttons_event). */
-        uint64_t held = now_ms() - c->pressed_at;
-        if ((c->buttons & 7 & ~mask) && held < 60) usleep((useconds_t)(60 - held) * 1000);
-        if (mask & 7 & ~c->buttons) c->pressed_at = now_ms();
+    /* 0.3.63: the tablet says where, the mouse's own buttons click (as the wheel always did): the tablet's button
+       bits did nothing on macOS in the 0.3.62 run. macOS clicks where its pointer is, whichever device pressed.
+       HV_TABLET_BUTTONS=1: the tablet's bits, as before. */
+    static int tb = -1;
+    if (tb < 0) tb = getenv("HV_TABLET_BUTTONS") != NULL;
+    if (tb) {
+        int b = (mask & 1) | (mask & 4 ? 2 : 0) | (mask & 2 ? 4 : 0); /* RFB 1 left, 2 middle, 4 right -> HID */
+        hv_vm_tablet(x, y, b);
+        if (mask & 8) hv_vm_mouse_wheel(1);
+        if (mask & 16) hv_vm_mouse_wheel(-1);
+        if (mask & 32) hv_vm_mouse_hwheel(-1);
+        if (mask & 64) hv_vm_mouse_hwheel(1);
+        c->buttons = mask & 7;
+        return;
     }
-    int b = (mask & 1) | (mask & 4 ? 2 : 0) | (mask & 2 ? 4 : 0); /* RFB 1 left, 2 middle, 4 right -> HID */
-    hv_vm_tablet(x, y, b);
-    if (mask & 8) hv_vm_mouse_wheel(1);
-    if (mask & 16) hv_vm_mouse_wheel(-1);
-    if (mask & 32) hv_vm_mouse_hwheel(-1);
-    if (mask & 64) hv_vm_mouse_hwheel(1);
-    c->buttons = mask & 7;
+    hv_vm_tablet(x, y, 0);
+    if ((mask ^ c->buttons) & 7) {
+        static int said;
+        if (!said++) fprintf(stderr, "hengevm: pointer: buttons go through the mouse, the place through the USB tablet\n");
+        usleep(20000); /* the place first: macOS has the pointer there before the button changes */
+    }
+    buttons_event(c, mask); /* its buttons and wheel; holds a short press, keeps c->buttons */
 }
 
 static void pointer_event(Client *c, int mask, int x, int y) {
@@ -468,7 +477,12 @@ static void serve(Client *c) {
                 break;
             case 5: /* PointerEvent */
                 if (recv_all(c->fd, b, 5)) return;
-                pointer_event(c, b[0], get16(b + 1), get16(b + 3));
+                /* A finger's tap or drag, a place on the Mac's screen: through the tablet where macOS reads it
+                   (0.3.63), not by steering the mouse there, which fought the tablet's place in the 0.3.62 run. */
+                if (hv_vm_has_tablet() && c->w > 0 && c->h > 0)
+                    absolute_event(c, b[0], (int)(((int64_t)get16(b + 1) * 32768 + 16384) / c->w), (int)(((int64_t)get16(b + 3) * 32768 + 16384) / c->h));
+                else
+                    pointer_event(c, b[0], get16(b + 1), get16(b + 3));
                 break;
             case 250: /* Henge's app: a captured mouse's movement (relative_event) */
                 if (recv_all(c->fd, b, 5)) return;

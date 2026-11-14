@@ -67,6 +67,7 @@ typedef struct HvXhci {
     int ptr_plugged;       /* 0.3.62: port 2 is connected only once macOS's driver is up (hv_xhci_poll) */
     uint64_t ptr_plug_at;  /* when to connect it (CLOCK_MONOTONIC ns), 0: not yet known */
     int ptr_said;          /* lines of the tablet's setting up logged */
+    uint32_t ptr_resets;   /* resets of port 2 since it was plugged in */
     uint8_t preports[HV_XHCI_REPORTS][6];
     uint32_t phead, ptail;
     uint8_t pstate[6];

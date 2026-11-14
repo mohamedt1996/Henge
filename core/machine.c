@@ -59,6 +59,9 @@ static int init_rest(HvMachine *m) {
        and the Android app's own HV_FLUSH means something else there). */
     hv_knob[HV_K_NOPAGEEND] = getenv("HV_NO_PAGEEND") ? atoi(getenv("HV_NO_PAGEEND")) : 0;
     hv_knob[HV_K_NOREMOTEASID] = getenv("HV_NO_REMOTE_ASID") ? atoi(getenv("HV_NO_REMOTE_ASID")) : 0;
+    /* 0.3.63: longer blocks from the environment on this path too (Settings > Longer blocks): a conditional branch
+       does not end its block, which saves its fall-through exit (11 to 26 words of a block's 67 on the tablet). */
+    if (getenv("HV_SUPERBLOCKS")) hv_knob[HV_K_SUPERBLOCKS] = atoi(getenv("HV_SUPERBLOCKS"));
     /* As many blocks as the region holds (a block is at least ~160 bytes of
        code), so the region filling, not this table, is what flushes; two
        chainable exits each at most. Untouched entries cost nothing. */

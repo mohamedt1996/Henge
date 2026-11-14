@@ -66,7 +66,7 @@ int main(void) {
     app_delay_us = 0;
     __atomic_store_n(&answer_avg_ns, 2000, __ATOMIC_RELAXED);
     for (int i = 0; i < 50; i++) answer_took(3000);
-    CHECK(spin_now_ns() >= 30000 && spin_now_ns() < 50000, "after fast answers the wait stays awake %lld us (30 to 50 expected)",
+    CHECK(spin_now_ns() >= 60000 && spin_now_ns() < 80000, "after fast answers the wait stays awake %lld us (60 to 80 expected)",
           (long long)(spin_now_ns() / 1000));
     for (int i = 0; i < 200; i++) v = gfx_read(NULL, 0x44, 4);
     CHECK(v == 7, "reads with a learnt wait: %llu", (unsigned long long)v);

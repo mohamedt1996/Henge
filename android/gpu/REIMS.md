@@ -761,6 +761,23 @@ plug-in have no counterpart here, see the section below):
 - **Smaller bookkeeping**: a block is 64 bytes (80), a chainable exit 44 (56): about 40 bytes less per block.
 - **JIT cache: 512 MB by default**: in parts it stays nearly full, so 512 holds what 768 did on average.
 
+0.3.63, from the 0.3.62 log and run (2026-11-15: no clicks, the Mac slower, Safari reloading a tab):
+
+- **Clicks through the mouse's buttons** (`android/vnc.c` `absolute_event`): the tablet gives the place, the virtio
+  mouse the buttons (HV_TABLET_BUTTONS=1: the tablet's bits). The tablet was live in the log (after 39+ port resets)
+  but its button bits did nothing. A finger's taps go through the tablet too where it is live, not by steering.
+  **Settings > The Mac's own pointer: Shown too** keeps the Mac's pointer in the frames, to see whether it follows.
+  The tablet's log: milestones always ("address device", "configuration set", report counts with the number of
+  resets), resets counted, the rest capped.
+- **JIT cache 768 MB, dropped whole, again by default**; Settings > JIT drops: In parts is 0.3.62's way. 512 MB in
+  parts kept code 25-33 s where 768 whole kept it 42 on average (the Mac makes ~15 MB of translations a second), so
+  1.7 million blocks were translated every 30 s where 1.0 were, and a drop came 2-5 times per 30 s. Parts smooth
+  the drops; at one size they translate as much. "In the cache before its last drop" counts rightly with parts.
+- **GPU register waits stay awake at least 60 us** (30: waits of up to 6.1 s per 30 in the log, 3.7 before).
+- **Settings > Longer blocks** (HV_SUPERBLOCKS, off): a first measure toward smaller translations (54 bytes per Mac
+  instruction now: a block of 5 instructions is 26 words inline, 33 of exits and slow paths, 9 of literals). The
+  real work, shared slow paths and smaller exits, is not done.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

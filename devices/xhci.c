@@ -100,7 +100,13 @@ static const char *const strings[] = {NULL, "HengeVM", "HengeVM USB Keyboard", "
 /* The tablet's setting up, as it happens: the log says whether macOS takes it, and where it stops (at most 80
    lines, the report counts apart). */
 static void tlog(HvXhci *x, int d, const char *what) {
-    if (d == TAB && x->ptr_said++ < 80) fprintf(stderr, "hengevm: usb tablet: %s\n", what);
+    if (d == TAB && x->ptr_said++ < 60) fprintf(stderr, "hengevm: usb tablet: %s\n", what);
+}
+
+/* The steps that say how far macOS got: always logged (0.3.62's 80 lines went on port resets). */
+static void tmile(HvXhci *x, int d, const char *what) {
+    (void)x;
+    if (d == TAB) fprintf(stderr, "hengevm: usb tablet: %s\n", what);
 }
 
 static uint64_t mono_ns(void) {
@@ -270,7 +276,7 @@ static int control(HvXhci *x, int d, const uint8_t setup[8], uint8_t *out, int m
     } else if (type == 0x81 && req == 6) { /* GET_DESCRIPTOR (interface): HID, report; wIndex: the interface */
         if ((value >> 8) == 0x22) {
             src = tab ? ptr_report_desc : report_desc, len = tab ? (int)sizeof ptr_report_desc : (int)sizeof report_desc;
-            if (tab) tlog(x, d, "macOS read the report descriptor");
+            if (tab) tmile(x, d, "macOS read the report descriptor");
         } else if ((value >> 8) == 0x21) src = tab ? ptr_config_desc + 18 : config_desc + 18, len = 9;
         else return -1;
     } else if (type == 0x80 && req == 0) { /* GET_STATUS */
@@ -288,7 +294,7 @@ static int control(HvXhci *x, int d, const uint8_t setup[8], uint8_t *out, int m
         if (tab) {
             char msg[64];
             snprintf(msg, sizeof msg, "configuration %d set", dv->configured);
-            tlog(x, d, msg);
+            tmile(x, d, msg);
         }
         return 0;
     } else if (type == 0x81 && req == 10) { /* GET_INTERFACE */
@@ -406,8 +412,8 @@ static void run_ptr_in(HvXhci *x) {
         uint64_t nd = ++x->pdelivered;
         if (nd == 1 || nd == 100 || nd == 1000 || nd == 10000 || nd == 100000) {
             char msg[64];
-            snprintf(msg, sizeof msg, "%llu reports read by macOS", (unsigned long long)nd);
-            tlog(x, TAB, msg);
+            snprintf(msg, sizeof msg, "%llu reports read by macOS (after %u port resets)", (unsigned long long)nd, x->ptr_resets);
+            tmile(x, TAB, msg);
         }
         transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, PTR_DCI_IN);
     }
@@ -441,7 +447,7 @@ static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
         char msg[96];
         snprintf(msg, sizeof msg, "address device (slot %d, port %d, %s)%s", slot, port, bsr ? "no SET_ADDRESS yet" : "addressed",
                  port < 1 || port > x->nports ? ": no such port" : "");
-        tlog(x, TAB, msg);
+        tmile(x, TAB, msg);
     }
     if (port < 1 || port > x->nports || slot < 1 || slot > HV_XHCI_SLOTS) return CC_TRB_ERROR;
     int d = port - 1;
@@ -469,7 +475,7 @@ static int configure_endpoints(HvXhci *x, int slot, uint64_t input, int deconfig
     uint64_t out = out_ctx(x, slot);
     if (deconfigure) {
         for (int dci = 2; dci < HV_XHCI_EPS; dci++) dv->ep_running[dci] = 0;
-        tlog(x, d, "endpoints deconfigured");
+        tmile(x, d, "endpoints deconfigured");
         return CC_SUCCESS;
     }
     uint32_t drop = rd32(x, input), add = rd32(x, input + 4);
@@ -493,7 +499,7 @@ static int configure_endpoints(HvXhci *x, int slot, uint64_t input, int deconfig
             memcpy(ep, &e0, 4);
             wr(x, out + 32ull * dci, ep, 32);
             init_ring_from_ctx(x, dv, dci);
-            if (dci == PTR_DCI_IN) tlog(x, d, "report endpoint configured");
+            if (dci == PTR_DCI_IN) tmile(x, d, "report endpoint configured");
         }
     }
     if (add & 1) { /* slot context: context entries and friends */
@@ -534,7 +540,7 @@ static void run_commands(HvXhci *x) {
         case TRB_DISABLE_SLOT:
             if (slot_dev(x, slot)) {
                 HvXhciDev *dv = slot_dev(x, slot);
-                tlog(x, (int)(dv - x->dev), "slot disabled");
+                tmile(x, (int)(dv - x->dev), "slot disabled");
                 dv->slot = 0;
                 memset(dv->ep_running, 0, sizeof dv->ep_running);
                 x->slot_dev[slot] = 0;
@@ -620,10 +626,18 @@ static void port_connect(HvXhci *x) {
 
 static void port_write(HvXhci *x, int p, uint32_t v) {
     if (xlog()) fprintf(stderr, "xhci: portsc write %08x (was %08x)\n", v, x->portsc[p]);
-    if (p == 1 && x->ptr_plugged) {
+    if (p == 1 && x->ptr_plugged) { /* resets counted, said at the 1st, 2nd, 3rd, 10th, 100th...; other writes among the capped lines */
         char msg[80];
-        snprintf(msg, sizeof msg, "port 2: write %08x (was %08x)%s", v, x->portsc[p], v & PORT_PR ? ": reset" : "");
-        tlog(x, TAB, msg);
+        if (v & PORT_PR) {
+            uint32_t n = ++x->ptr_resets;
+            if (n <= 3 || n == 10 || n == 100 || n == 1000) {
+                snprintf(msg, sizeof msg, "port 2: reset number %u", n);
+                tmile(x, TAB, msg);
+            }
+        } else if (x->ptr_resets < 3) {
+            snprintf(msg, sizeof msg, "port 2: write %08x (was %08x)", v, x->portsc[p]);
+            tlog(x, TAB, msg);
+        }
     }
     uint32_t s = x->portsc[p];
     s &= ~(v & PORT_CHANGES); /* write 1 to clear */
@@ -835,7 +849,7 @@ static void bar_write(HvPciDev *d, int bar, uint64_t off, uint64_t v, unsigned s
             else if (d == TAB && dci == PTR_DCI_IN) {
                 if (!x->ptr_posted) {
                     x->ptr_posted = 1;
-                    tlog(x, d, "macOS is reading reports: the Android pointer drives it");
+                    tmile(x, d, "macOS is reading reports: the Android pointer drives it");
                 }
                 run_ptr_in(x);
             }
@@ -925,7 +939,7 @@ void hv_xhci_poll(HvXhci *x) {
     if (x->tablet && !x->ptr_plugged && x->ptr_plug_at && (x->usbcmd & 1) && mono_ns() >= x->ptr_plug_at) {
         x->ptr_plugged = 1;
         x->portsc[1] = PORT_CONNECTED;
-        tlog(x, TAB, "plugged in on port 2");
+        tmile(x, TAB, "plugged in on port 2");
         port_event(x, 1);
     }
     if (x->rhead != x->rtail) run_ep_in(x);

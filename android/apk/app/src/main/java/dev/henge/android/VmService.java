@@ -299,7 +299,7 @@ public class VmService extends Service {
         // parts now and only the oldest is dropped when it fills, so it stays nearly full: 512 holds about what 768
         // did on average, and keeps three quarters of it at each drop.
         int jitMb = prefs.getInt("jitMb", 0);
-        if (jitMb == 0) jitMb = 512;
+        if (jitMb == 0) jitMb = 768; // 0.3.63: 768 again (0.3.62's 512 in parts kept code a shorter time and translated more)
         if (!install && !gunyah() && jitMb >= 64) { cmd.add("--jit-mb"); cmd.add(Integer.toString(jitMb)); }
         // Settings > JIT cache memory: Keep. The cache's pages stay the engine's when it drops its translations
         // (host/jit_region.c gives them back otherwise): to compare, with the heartbeat's swap figures.
@@ -384,6 +384,10 @@ public class VmService extends Service {
                     && !build.equals(prefs.getString("ramFileBuild", ""));
             if (ramInMemory) pb.environment().put("HV_RAM_MEMFD", "1");
             if (jitKeep) pb.environment().put("HV_JIT_KEEP", "1");
+            // Settings > JIT drops: Whole (the default, as up to 0.3.61) or In parts (0.3.62's four parts).
+            pb.environment().put("HV_JIT_PARTS", "parts".equals(prefs.getString("jitParts", "whole")) ? "4" : "1");
+            // Settings > Longer blocks: a conditional branch does not end a translated block (the engine's HV_SUPERBLOCKS).
+            if ("on".equals(prefs.getString("longBlocks", "off"))) pb.environment().put("HV_SUPERBLOCKS", "1");
             // Huge pages: On asks for them as the Mac touches its memory; Eager also touches all of it at the start,
             // while the tablet still has 2 MB runs of free memory to give (devices/vmapple.c).
             String huge = prefs.getString("hugepages", "off");

@@ -123,8 +123,17 @@ static void evict_part(HvMachine *m) {
     m->stats.block_flushes++; /* the exit a CPU last left through may be in the part that goes (run_loop's pending chain) */
     m->stats.part_drops++;
     sample_dead(m, (uint32_t)nx * B, m->part_nb[nx]);
-    seen_now = !seen_now;
-    memset(seen_va[seen_now], 0, sizeof seen_va[0]), memset(seen_vapa[seen_now], 0, sizeof seen_vapa[0]);
+    /* "In the cache before its last drop" (lookup's count): with parts, what the last round of drops took. The
+       blocks of the part that goes are marked; the marks start over once every part has gone once. (0.3.62 swapped
+       the sets as a whole drop does, so it counted against the part just filled: 3% where it was 50.) */
+    if (m->stats.part_drops % (uint64_t)np == 1) memset(seen_va[!seen_now], 0, sizeof seen_va[0]), memset(seen_vapa[!seen_now], 0, sizeof seen_vapa[0]);
+    for (uint32_t i = (uint32_t)nx * B, end = i + m->part_nb[nx]; i < end; i++) {
+        const HvBlock *b = &m->blocks[i];
+        uint32_t hv = (uint32_t)(((b->va >> 2) ^ b->flags) * 0x9e3779b97f4a7c15ull >> 40);
+        uint32_t hp = (uint32_t)((((b->va >> 2) ^ b->flags) * 0x9e3779b97f4a7c15ull ^ b->pa * 0xc2b2ae3d27d4eb4full) >> 40);
+        seen_va[!seen_now][hv >> 6] |= 1ull << (hv & 63);
+        seen_vapa[!seen_now][hp >> 6] |= 1ull << (hp & 63);
+    }
     caches_drop(m);
     /* Exits of the parts kept: back to their stubs where chained into the part that goes; the list of those chained to
        other pages made again from the rest (hv_invalidate_code walks it). */
