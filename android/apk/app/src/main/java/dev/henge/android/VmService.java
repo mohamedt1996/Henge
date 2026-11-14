@@ -40,6 +40,20 @@ public class VmService extends Service {
     }
     public static File logFile(Context c) { return new File(c.getFilesDir(), "henge.log"); }
     /** Graphics: reims: HOME for reims-vgpu in this process; its shader cache is $HOME/.cache/reims-vgpu-vulkan. */
+    /** Settings > Mac screen: Half. The panel's own resolution halved, landscape, each side even: 1600x1068 on the
+     *  Mi Pad 7's 3200x2136, so the Mac's pixels are exactly 2x2 of the tablet's (Screen scaling: Sharp). */
+    public static String halfScreen(Context c) {
+        int w = 0, h = 0;
+        try {
+            android.hardware.display.DisplayManager dm = c.getSystemService(android.hardware.display.DisplayManager.class);
+            android.view.Display.Mode m = dm.getDisplay(android.view.Display.DEFAULT_DISPLAY).getMode();
+            w = Math.max(m.getPhysicalWidth(), m.getPhysicalHeight());
+            h = Math.min(m.getPhysicalWidth(), m.getPhysicalHeight());
+        } catch (Exception ignored) { }
+        if (w < 1280 || h < 960) return "1600x1000";   // no panel size, or too small to halve: the nearest fixed mode
+        return (w / 2 & ~1) + "x" + (h / 2 & ~1);
+    }
+
     public static File reimsHomeDir(Context c) {
         File d = new File(c.getFilesDir(), "reims-home");
         d.mkdirs();
@@ -378,7 +392,10 @@ public class VmService extends Service {
             // The Mac's disk: the data is flushed at each of macOS's flushes (fdatasync), not the file's times too.
             pb.environment().put("HV_FLUSH", "2");
             // Graphics: reims: the Mac's screen size (Settings), every pixel of which is copied on this driver.
-            if (reims) pb.environment().put("HV_REIMS_MODE", getSharedPreferences("henge", MODE_PRIVATE).getString("reimsMode", "1280x800"));
+            if (reims) {
+                String mode = getSharedPreferences("henge", MODE_PRIVATE).getString("reimsMode", "1280x800");
+                pb.environment().put("HV_REIMS_MODE", "half".equals(mode) ? halfScreen(this) : mode);
+            }
             pb.redirectErrorStream(true);
             pb.redirectOutput(ProcessBuilder.Redirect.appendTo(log));
             try (FileOutputStream o = new FileOutputStream(log, true)) {

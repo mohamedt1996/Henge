@@ -543,10 +543,16 @@ public class MainActivity extends Activity {
         c.addView(gnote);
         if ("reims".equals(gpuMode()) || "vulkan".equals(gpuMode())) {
             c.addView(hairline());
-            final boolean blit = "blit".equals(prefs.getString("screenScale", "compositor"));
-            c.addView(choiceRow("Screen scaling", new String[]{"Compositor", "Blit"}, blit ? 1 : 0,
-                    i -> { prefs.edit().putString("screenScale", i == 1 ? "blit" : "compositor").apply(); render(true); }));
-            TextView snote = text(blit
+            final String scale = prefs.getString("screenScale", "compositor");
+            final String[] scales = {"compositor", "blit", "sharp"};
+            c.addView(choiceRow("Screen scaling", new String[]{"Compositor", "Blit", "Sharp"},
+                    Math.max(0, java.util.Arrays.asList(scales).indexOf(scale)),
+                    i -> { prefs.edit().putString("screenScale", scales[i]).apply(); render(true); }));
+            TextView snote = text("sharp".equals(scale)
+                    ? "Each of the Mac's pixels is drawn as exactly 2x2 of the tablet's (or 3x3...) by the GPU, with no "
+                        + "blur, where the Mac's screen fits the tablet's a whole number of times: pick Mac screen: Half. "
+                        + "Any other size is stretched smoothly, as Blit. Costs the GPU a full-resolution copy each frame."
+                    : "blit".equals(scale)
                     ? "As before 0.3.53: every frame is stretched to the tablet's full resolution by the GPU before it is shown."
                     : "The Mac's picture is handed to Android at its own size and Android's compositor stretches it to the "
                         + "screen: much less work for the GPU at every frame, and less memory. If the picture is missing, "
@@ -558,8 +564,11 @@ public class MainActivity extends Activity {
             c.addView(hairline());
             c.addView(choiceRow("Mac screen", REIMS_MODE_LABELS, Math.max(0, java.util.Arrays.asList(REIMS_MODES).indexOf(reimsMode())),
                     i -> { prefs.edit().putString("reimsMode", REIMS_MODES[i]).apply(); render(true); }));
-            TextView rnote = text("Every pixel of every surface is copied and compared on the CPU on this GPU driver, so a smaller "
-                    + "screen is much faster. Takes effect at the next start.", 13, DIM, false);
+            TextView rnote = text("half".equals(reimsMode())
+                    ? "Half the tablet's own resolution (" + VmService.halfScreen(this) + "), so each of the Mac's pixels is "
+                        + "exactly 2x2 of the tablet's: with Screen scaling: Sharp, crisp. Takes effect at the next start."
+                    : "Every pixel of every surface is copied and compared on the CPU on this GPU driver, so a smaller "
+                        + "screen is much faster. Takes effect at the next start.", 13, DIM, false);
             rnote.setPadding(dp(17), 0, dp(17), dp(12));
             c.addView(rnote);
             c.addView(hairline());
@@ -1202,8 +1211,8 @@ public class MainActivity extends Activity {
                     + "not drive the screen yet, so the picture stays on Graphics: GPU. Pick reims for the working GPU."};
 
     private String gpuMode() { return prefs.getString("gpu", "on"); }
-    static final String[] REIMS_MODES = {"1024x768", "1280x800", "1600x1000", "1920x1080"};
-    static final String[] REIMS_MODE_LABELS = {"1024", "1280", "1600", "1920"};
+    static final String[] REIMS_MODES = {"1024x768", "1280x800", "1600x1000", "half", "1920x1080"};
+    static final String[] REIMS_MODE_LABELS = {"1024", "1280", "1600", "Half", "1920"};
     private String reimsMode() { return prefs.getString("reimsMode", "1280x800"); }
     static final String[] DRIVERS = {"turnip", "system"};
     static final String[] DRIVER_LABELS = {"Turnip", "System"};

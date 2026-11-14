@@ -816,6 +816,20 @@ static int bring_up(Host *h) {
         mkdir(h->home, 0700);
         setenv("HOME", h->home, 1);
         setenv("XDG_CACHE_HOME", h->home, 0);
+        /* m2v_cache_optional.py: a cache folder that cannot be made tries the app's cache folder instead
+           (.../files/reims-home -> .../cache/reims-home), and one that takes no write (storage full) is
+           kept for what it holds, instead of refusing the device and ending the app. */
+        {
+            char fallback[1100];
+            const char *tail = "/files/reims-home";
+            size_t n = strlen(h->home), t = strlen(tail);
+            if (n > t && !strcmp(h->home + n - t, tail))
+                snprintf(fallback, sizeof fallback, "%.*s/cache/reims-home", (int)(n - t), h->home);
+            else
+                snprintf(fallback, sizeof fallback, "%s-fallback", h->home);
+            setenv("METAL2VULKAN_SHADER_CACHE_OPTIONAL", "1", 1);
+            setenv("METAL2VULKAN_SHADER_CACHE_FALLBACK", fallback, 1);
+        }
         /* What the last boots left: a cache that is found again is why the second boot is quicker than the first. */
         cache_files = 0, cache_bytes = 0;
         nftw(h->home, cache_count, 16, FTW_PHYS);

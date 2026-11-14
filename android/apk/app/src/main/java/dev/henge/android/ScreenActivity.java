@@ -43,9 +43,11 @@ public class ScreenActivity extends Activity {
         boolean vulkan = ("vulkan".equals(gpuMode) || "reims".equals(gpuMode)) && GpuView.loaded;
         // Settings > Screen scaling: the native screen reads this each time it makes a swapchain's screen
         // (android/gpu/replay/screen_vk.c): "0" keeps the window-sized swapchain and the GPU's scaling blit.
+        // "sharp" is the blit too, repeating each pixel where the scale is a whole number (HENGE_SCREEN_SHARP).
         try {
-            android.system.Os.setenv("HENGE_SCREEN_DIRECT",
-                    "blit".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("screenScale", "compositor")) ? "0" : "1", true);
+            String scale = getSharedPreferences("henge", MODE_PRIVATE).getString("screenScale", "compositor");
+            android.system.Os.setenv("HENGE_SCREEN_DIRECT", "blit".equals(scale) || "sharp".equals(scale) ? "0" : "1", true);
+            android.system.Os.setenv("HENGE_SCREEN_SHARP", "sharp".equals(scale) ? "1" : "0", true);
         } catch (Exception ignored) { }
         if (vulkan) {
             gpu = new GpuView(this);

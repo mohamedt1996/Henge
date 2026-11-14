@@ -47,6 +47,9 @@ struct Screen {
     VkExtent2D window_extent;   /* the window's */
     int direct;                 /* the swapchain is at the frame's scale: presents copy, nothing scales */
     int no_direct;              /* never: the direct form misbehaved here, or HENGE_SCREEN_DIRECT=0 */
+    int sharp;                  /* HENGE_SCREEN_SHARP=1: a whole-number blit scale takes each pixel as it is */
+    int sharp_now;              /* the last blit was such a one */
+    const char *off_by;         /* the setting that turned the direct form off, where one did */
     const char *why_not;        /* why the swapchain is the window's size, where it is */
     uint32_t made_w, made_h;    /* the frame size the swapchain was made for */
     uint32_t bar_x, bar_y;      /* direct: where the frame lies in it */
@@ -150,7 +153,7 @@ static int make_swapchain(Screen *s, uint32_t w, uint32_t h) {
     /* The frame's scale where the surface takes such a swapchain: not rotated (a rotated one is drawn turned,
        which only the blit's form was ever asked to do here), RGBA8, and a size within the surface's limits. */
     VkExtent2D at_frame = {0, 0};
-    s->why_not = s->no_direct ? "that form is off here"
+    s->why_not = s->no_direct ? (s->off_by ? s->off_by : "that form is off here")
                : !w || !h ? "no frame yet"
                : s->format != VK_FORMAT_R8G8B8A8_UNORM ? "the surface has no RGBA8 format"
                : caps.currentTransform != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR ? "the surface is rotated"
@@ -231,6 +234,14 @@ static Screen *create(void *window, uint32_t off_w, uint32_t off_h, int off_dire
     /* HENGE_SCREEN_DIRECT=0: the window-sized swapchain and the blit, as before 0.3.53. */
     const char *direct = getenv("HENGE_SCREEN_DIRECT");
     s->no_direct = (direct && *direct == '0') || (!window && !off_direct);
+    /* HENGE_SCREEN_SHARP=1 (Settings > Screen scaling: Sharp): where the window is a whole number of
+       frames across or down (the Mac's screen at half the panel, 1600x1068 on the Mi Pad 7's 3200x2136),
+       the blit repeats each pixel 2x2 (nearest) instead of blending neighbours, as macOS-uke's scanout
+       shader does (gpu/plugin/scanout_x2.ll). Any other scale stays linear, with the same geometry, so
+       touches map as before. */
+    const char *sharp = getenv("HENGE_SCREEN_SHARP");
+    s->sharp = sharp && *sharp == '1';
+    if (direct && *direct == '0') s->why_not = s->off_by = s->sharp ? "Screen scaling: Sharp" : "Screen scaling: Blit";
     const char *exts[2];
     uint32_t next = 0;
 #ifdef __ANDROID__
@@ -417,16 +428,26 @@ int screen_present(Screen *s, uint32_t w, uint32_t h) {
         vkCmdCopyBufferToImage(s->cb, s->staging, s->frame, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
         barrier(s->cb, s->frame, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         s->frame_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        vkCmdClearColorImage(s->cb, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
         /* letterbox: the Mac's aspect kept */
         uint32_t tw = s->extent.width, th = s->extent.height;
         double scale = (double)tw / w < (double)th / h ? (double)tw / w : (double)th / h;
         int32_t dw = (int32_t)(w * scale), dh = (int32_t)(h * scale), dx = ((int32_t)tw - dw) / 2, dy = ((int32_t)th - dh) / 2;
+        /* Sharp: only where the fit is itself a whole number (one side filled exactly), so the picture lies
+           exactly where the linear blit puts it. */
+        uint32_t k = (uint32_t)(scale + 1e-9);
+        s->sharp_now = s->sharp && k >= 1 && (w * k == tw || h * k == th);
+        if (s->sharp_now)
+            dw = (int32_t)(w * k), dh = (int32_t)(h * k), dx = ((int32_t)tw - dw) / 2, dy = ((int32_t)th - dh) / 2;
+        /* The bars only: a picture that covers the whole window is not cleared under it first (a window-sized
+           write saved at every frame). */
+        if (dw != (int32_t)tw || dh != (int32_t)th)
+            vkCmdClearColorImage(s->cb, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
         VkImageBlit blit = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
                             {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
         vkCmdPipelineBarrier(s->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-        vkCmdBlitImage(s->cb, s->frame, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+        vkCmdBlitImage(s->cb, s->frame, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                       s->sharp_now ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
     }
     VkImageLayout final = s->swapchain ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     barrier(s->cb, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, final, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT);
@@ -470,8 +491,8 @@ void screen_words(Screen *s, char *out, size_t n) {
         snprintf(out, n, "a %ux%u swapchain at the frame's scale in a %ux%u window, scaled by the compositor", s->extent.width,
                  s->extent.height, s->window_extent.width, s->window_extent.height);
     else
-        snprintf(out, n, "a %ux%u swapchain the frame is scaled into by a blit (%s)", s->extent.width, s->extent.height,
-                 s->why_not ? s->why_not : "?");
+        snprintf(out, n, "a %ux%u swapchain the frame is scaled into by a blit%s (%s)", s->extent.width, s->extent.height,
+                 s->sharp_now ? ", sharp: each pixel repeated, a whole number of times" : "", s->why_not ? s->why_not : "?");
 }
 
 const uint8_t *screen_frame_now(Screen *s, uint32_t *w, uint32_t *h) {

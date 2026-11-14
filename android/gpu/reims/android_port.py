@@ -232,6 +232,8 @@ def main() -> None:
     # The process's mappings are asked of the kernel for a no-copy object's pages alone, not read from
     # /proc/self/maps, on a kernel without PROCMAP_QUERY (m2v_map_asks.py).
     subprocess.run([sys.executable, '-I', str(HERE / 'm2v_map_asks.py'), str(m2v)], check=True)
+    # A shader cache folder that cannot be made or written costs speed, not the app (m2v_cache_optional.py).
+    subprocess.run([sys.executable, '-I', str(HERE / 'm2v_cache_optional.py'), str(m2v)], check=True)
     print(f'android_port: {total} Linux-only places now take Android')
 
 

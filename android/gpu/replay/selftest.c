@@ -213,6 +213,49 @@ int main(void) {
         fail |= !ok;
         free(rb), rb = NULL;
 
+        /* Screen scaling: Sharp. Half the Mi Pad 7's panel (1600x1068) in its 3200x2136 window by the blit: every
+           window pixel is the frame's pixel at (x/2, y/2), exactly, and nothing is left as bars. Then 1280x800,
+           not a whole-number fit: blended as before, in the same place. */
+        {
+            setenv("HENGE_SCREEN_DIRECT", "0", 1), setenv("HENGE_SCREEN_SHARP", "1", 1);
+            Screen *ss = screen_create_offscreen(3200, 2136);
+            unsetenv("HENGE_SCREEN_DIRECT"), unsetenv("HENGE_SCREEN_SHARP");
+            uint8_t *sp = ss ? screen_frame(ss, 1600, 1068, NULL) : NULL;
+            int sok = sp != NULL;
+            for (uint32_t y = 0; sok && y < 1068; y++)
+                for (uint32_t x = 0; x < 1600; x++) {
+                    uint8_t *q = sp + ((size_t)y * 1600 + x) * 4;
+                    q[0] = (uint8_t)(x * 7), q[1] = (uint8_t)(y * 13), q[2] = (uint8_t)((x ^ y) & 1 ? 255 : 0), q[3] = 255;
+                }
+            uint8_t *sb = NULL;
+            uint32_t sw = 0, sh = 0;
+            sok = sok && screen_present(ss, 1600, 1068) == 0 && screen_readback(ss, &sb, &sw, &sh) == 0 && sw == 3200 && sh == 2136;
+            size_t wrong = 0;
+            for (uint32_t y = 0; sok && y < sh; y++)
+                for (uint32_t x = 0; x < sw; x++) {
+                    const uint8_t *o = sb + ((size_t)y * sw + x) * 4, *i = sp + ((size_t)(y / 2) * 1600 + x / 2) * 4;
+                    wrong += o[0] != i[0] || o[1] != i[1] || o[2] != i[2];
+                }
+            char words[256];
+            screen_words(ss, words, sizeof words);
+            sok = sok && wrong == 0 && strstr(words, "sharp");
+            printf("%s sharp: 1600x1068 in 3200x2136, each pixel repeated 2x2 (%zu pixels differ; %s)\n", sok ? "ok  " : "FAIL", wrong, words);
+            fail |= !sok;
+            free(sb), sb = NULL;
+            /* 1280x800 in the same window: a fit of 2.5, so linear, letterboxed: 3200x2000 with 68-row bars. */
+            sp = sok ? screen_frame(ss, 1280, 800, NULL) : NULL;
+            sok = sp != NULL;
+            if (sok) memset(sp, 0xc0, (size_t)1280 * 800 * 4);
+            sok = sok && screen_present(ss, 1280, 800) == 0 && screen_readback(ss, &sb, &sw, &sh) == 0;
+            screen_words(ss, words, sizeof words);
+            sok = sok && !strstr(words, "sharp") && sb[((size_t)67 * sw + 100) * 4] == 0 && sb[((size_t)68 * sw + 100) * 4] == 0xc0 &&
+                  sb[((size_t)2067 * sw + 100) * 4] == 0xc0 && sb[((size_t)2068 * sw + 100) * 4] == 0;
+            printf("%s sharp: 1280x800 (a fit of 2.5) stays linear, letterboxed as before\n", sok ? "ok  " : "FAIL");
+            fail |= !sok;
+            free(sb);
+            if (ss) screen_destroy(ss);
+        }
+
         /* Graphics: reims's frames through the replay, written in place: the first begin's pixels are new, the
            next still hold the frame, and the presenter shows them from the screen's memory. */
         Replay *er = replay_for_test(&g, sc);

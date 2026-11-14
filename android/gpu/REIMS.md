@@ -630,6 +630,22 @@ run.
 - Not measured on a tablet. What the next log shows of it: the engine's "has core N of its own" lines, the
   app's `cores:` and `swap:` lines, and the heartbeat's "waited ... for a core".
 
+0.3.57, from macOS-uke's `gpu/` folder (surveyed 2026-11-14; its kernel driver, Darwin Turnip and in-guest Metal
+plug-in have no counterpart here, see the section below):
+
+- **Mac screen: Half and Screen scaling: Sharp.** macOS-uke draws the desktop at half the panel and doubles each
+  pixel (`gpu/plugin/scanout_x2.ll`). Half is the panel's own size halved (`VmService.halfScreen`: 1600x1068 on the
+  Mi Pad 7); Sharp is the blit's form with a nearest filter where the fit is a whole number of times
+  (`replay/screen_vk.c`), linear with the same geometry otherwise, so touches map as before. A blit that covers the
+  whole window no longer clears it first. Compositor still shows Half through the display's own scaler (an even 2x,
+  but blended). Tested on lavapipe (`replay/selftest.c`: every one of the 6.8 million pixels the frame's at (x/2, y/2));
+  not run on a tablet. 1600x1068's rows are not whole 16 KiB pages (6,835,200 bytes a frame), which nothing here
+  is known to need; if the Mac's screen fails at Half only, that is the first suspect.
+- **METAL2VULKAN_SHADER_CACHE_OPTIONAL** (`reims/m2v_cache_optional.py`, macOS-uke's switch, which upstream does not
+  have): a cache folder that cannot be made tries the app's cache folder, and one that takes no write (storage full)
+  is kept for what it holds, instead of refusing the device and ending the app. Type-checked against the pinned
+  metal2vulkan; not run on a tablet.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
