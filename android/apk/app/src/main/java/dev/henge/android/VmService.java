@@ -393,8 +393,8 @@ public class VmService extends Service {
             pb.environment().put("HV_FLUSH", "2");
             // Graphics: reims: the Mac's screen size (Settings), every pixel of which is copied on this driver.
             if (reims) {
-                String mode = getSharedPreferences("henge", MODE_PRIVATE).getString("reimsMode", "1280x800");
-                pb.environment().put("HV_REIMS_MODE", "half".equals(mode) ? halfScreen(this) : mode);
+                String macScreen = getSharedPreferences("henge", MODE_PRIVATE).getString("reimsMode", "1280x800");
+                pb.environment().put("HV_REIMS_MODE", "half".equals(macScreen) ? halfScreen(this) : macScreen);
             }
             pb.redirectErrorStream(true);
             pb.redirectOutput(ProcessBuilder.Redirect.appendTo(log));

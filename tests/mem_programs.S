@@ -317,6 +317,35 @@ PROGRAM pageend
     ldr x13, [x1, #64]
 END pageend
 
+PROGRAM pageend_regs
+    // Page-end accesses the light refill does itself (0.3.58): every kind of plain integer load and store,
+    // into and out of x19..x30 and xzr, sign-extending, pairs, register offset, unscaled and misaligned.
+    add x1, x0, #3, lsl #12
+    add x1, x1, #4032
+    mov x2, #56
+    ldr x19, [x1, #56]
+    ldrsw x20, [x1, #60]
+    ldrsh w21, [x1, #62]
+    ldrsb x22, [x1, #63]
+    ldrh w23, [x1, #62]
+    ldp w24, w25, [x1, #56]
+    ldpsw x26, x27, [x1, #56]
+    ldnp w29, w30, [x1, #56]
+    ldr x3, [x1, x2]
+    ldur w4, [x1, #59]
+    ldr xzr, [x1, #56]
+    str x23, [x1, #56]
+    strh w27, [x1, #62]
+    stp w29, w30, [x1, #56]
+    stur w26, [x1, #59]
+    str wzr, [x1, #60]
+    stp wzr, w20, [x1, #56]
+    ldr x5, [x1, #56]
+    strb w22, [x1, #63]
+    ldrsh x8, [x1, #61]
+    ldr x9, [x1, #56]
+END pageend_regs
+
 PROGRAM groups
     // Accesses grouped on one base (one TLB check for all): SP with writeback,
     // negative and unscaled offsets, sign-extending, pairs of q registers.

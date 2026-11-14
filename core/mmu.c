@@ -717,6 +717,35 @@ int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
     return ok;
 }
 
+/* Another CPU's TLBI by ASID (ASIDE1IS), done to target from here when target is not running that address
+   space: its live TLB then holds none of that ASID's entries (a process switch puts the user entries aside,
+   hv_tlb_switch_user), so what is left is the stash and the cached branch targets kept under the ASID, and
+   the ASID's id is dropped (the next switch to it starts over, as hv_ijc_drop_asid does). The target is
+   neither stopped nor waited for. A switch of target's that races this changes walk_seq (or, before its
+   walk_begin, lets its hv_ijc_switch see the dropped id: the seq_cst fence below against its walk_begin);
+   then 0, and the caller tries again or posts the TLBI as before. -1: target must do it itself (it runs that
+   ASID, or has no ASIDs). 1: done. */
+int hv_tlbi_drop_remote_asid(HvCpu *target, int asid) {
+    HvPerCpu *p = target->pc_state;
+    if (!p || asid < 0 || asid > 0xffff) return -1;
+    uint32_t s1 = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST);
+    if (s1 & 1) return 0;
+    uint32_t c1 = __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST);
+    if (c1 & 1) return 0;
+    uint64_t tcr = __atomic_load_n(&target->tcr_el1, __ATOMIC_RELAXED), ttbr0 = __atomic_load_n(&target->ttbr0_el1, __ATOMIC_RELAXED);
+    if ((tcr >> 22) & 1) return -1;                    /* TCR.A1: the ASID is TTBR1's; not tracked by process */
+    uint32_t mask = (tcr >> 36) & 1 ? 0xffffu : 0xffu; /* TCR.AS: 16- or 8-bit ASIDs */
+    if (((uint32_t)(ttbr0 >> 48) & mask) == ((uint32_t)asid & mask)) return -1;
+    stash_drop(p, asid);
+    __atomic_store_n(&target->asid_cid[asid], 0, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST) != s1 || __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST) != c1) return 0;
+    /* Read again after the fence: a switch to it begun since would be seen in walk_seq above. */
+    ttbr0 = __atomic_load_n(&target->ttbr0_el1, __ATOMIC_SEQ_CST);
+    if (((uint32_t)(ttbr0 >> 48) & mask) == ((uint32_t)asid & mask)) return -1;
+    return 1;
+}
+
 const uint32_t *hv_mmu_fetch(HvCpu *cpu, uint64_t va, uint64_t *pa, uint32_t *avail) {
     if (va & 3) {
         hv_raise_sync(cpu, HV_EC_PC_ALIGN, 0, va, va);
@@ -765,25 +794,111 @@ const uint32_t *hv_mmu_fetch(HvCpu *cpu, uint64_t va, uint64_t *pa, uint32_t *av
    the page). Called by hv_helper_thunk with the guest's SIMD registers live,
    so nothing here may use them (see read_desc). flags: bit 0 write, bits 2..1
    the TLB table (0 EL0 or unprivileged, 1 EL1, 2 EL1 with PAN), bits 8..3 bytes - 1. */
-int hv_tlb_refill(HvCpu *cpu, uint64_t va, uint32_t flags) {
+/* A page-end access (in the page, where the fast check cannot pass) done here on the page's host copy, so it
+   costs the light refill's trip and not the full helper's as well (the engine's statistics: 50 to 140
+   thousand a second of "page end" on the tablet). Only plain integer loads and stores with no writeback,
+   single or pair, whose registers the thunk has in the HvCpu (all of x0..x30 there; host x6, x7 and x15 are
+   scratch, guest x6, x7, x15, x18 and x28 live there anyway): anything else (SIMD, atomics, acquire/release,
+   exclusive) is the helper's, as before. Aligned elements are single loads and stores, as on the CPU;
+   misaligned ones go byte by byte, as the helper's copy does. No libc (see the top of the file). 1: done. */
+static uint64_t pe_load(const volatile uint8_t *p, uint32_t n) {
+    if (!((uintptr_t)p & (n - 1))) switch (n) {
+        case 1: return *p;
+        case 2: return *(const volatile uint16_t *)p;
+        case 4: return *(const volatile uint32_t *)p;
+        case 8: return *(const volatile uint64_t *)p;
+        }
+    uint64_t v = 0;
+    for (uint32_t i = 0; i < n; i++) v |= (uint64_t)p[i] << (8 * i);
+    return v;
+}
+
+static void pe_store(volatile uint8_t *p, uint32_t n, uint64_t v) {
+    if (!((uintptr_t)p & (n - 1))) switch (n) {
+        case 1: *p = (uint8_t)v; return;
+        case 2: *(volatile uint16_t *)p = (uint16_t)v; return;
+        case 4: *(volatile uint32_t *)p = (uint32_t)v; return;
+        case 8: *(volatile uint64_t *)p = v; return;
+        }
+    for (uint32_t i = 0; i < n; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+/* What a load of n bytes leaves in a register: zero-extended, or sign-extended to 32 (then zero above) or 64 bits. */
+static uint64_t pe_extend(uint64_t v, uint32_t n, int sign) {
+    if (!sign || n == 8) return v;
+    uint64_t s = (uint64_t)((int64_t)(v << (64 - 8 * n)) >> (64 - 8 * n));
+    return sign == 32 ? (uint32_t)s : s;
+}
+
+static int pageend_access(HvCpu *cpu, uint64_t va, uint32_t bytes, int write, int64_t addend, uint32_t insn) {
+    volatile uint8_t *h = (volatile uint8_t *)(uintptr_t)(va + (uint64_t)addend);
+    uint32_t rt = insn & 31, rt2 = (insn >> 10) & 31;
+    if ((insn & 0x3f000000u) == 0x39000000u ||                                    /* LDR/STR (unsigned offset), integer */
+        ((insn & 0x3f200000u) == 0x38000000u && !(insn & 0x400)) ||              /* LDUR/STUR, LDTR/STTR */
+        (insn & 0x3f200c00u) == 0x38200800u) {                                   /* LDR/STR (register) */
+        uint32_t size = insn >> 30, opc = (insn >> 22) & 3, n = 1u << size;
+        if (n != bytes || (opc == 2 && size == 3) || (opc == 3 && size >= 2)) return 0; /* PRFM, unallocated */
+        if (opc == 0) {
+            if (!write) return 0;
+            pe_store(h, n, rt == 31 ? 0 : cpu->x[rt]);
+        } else {
+            if (write) return 0;
+            uint64_t v = pe_extend(pe_load(h, n), n, opc == 1 ? 0 : opc == 2 ? 64 : 32);
+            if (rt != 31) cpu->x[rt] = v;
+        }
+        return 1;
+    }
+    if ((insn & 0x3e000000u) == 0x28000000u && !((insn >> 23) & 1)) {          /* LDP/STP (offset), LDNP/STNP, integer */
+        uint32_t opc = insn >> 30, load = (insn >> 22) & 1, n = opc == 2 ? 8 : 4;
+        if (opc == 3 || (opc == 1 && !load) || 2 * n != bytes || write == (int)load) return 0; /* STGP, unallocated */
+        if (load) {
+            uint64_t a = pe_extend(pe_load(h, n), n, opc == 1 ? 64 : 0), b = pe_extend(pe_load(h + n, n), n, opc == 1 ? 64 : 0);
+            if (rt != 31) cpu->x[rt] = a;
+            if (rt2 != 31) cpu->x[rt2] = b;
+        } else {
+            uint64_t a = rt == 31 ? 0 : cpu->x[rt], b = rt2 == 31 ? 0 : cpu->x[rt2];
+            pe_store(h, n, a);
+            pe_store(h + n, n, b);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* Returns 0: the TLB now passes the access (run it again); 1: the helper must do it; 2: done here (a page-end
+   access, see pageend_access; the thunk then resumes where the helper would). insn is the access. */
+int hv_tlb_refill(HvCpu *cpu, uint64_t va, uint32_t flags, uint32_t insn) {
     int write = flags & 1, table = (flags >> 1) & 3;
     uint32_t bytes = ((flags >> 3) & 63) + 1;
     int el = table ? 1 : 0;
     uint64_t off = va & PAGE_MASK;
     if (off + bytes > PAGE_MASK + 1) return 1; /* crosses into the next page: the helper */
     /* In the page, but where the fast check cannot pass (it allows HV_TLB_ADJ bytes of every access, so a small one in a
-       page's last HV_TLB_ADJ bytes misses): a refill would come straight back here. */
-    if (bytes <= HV_TLB_ADJ + 1 && off + HV_TLB_ADJ > PAGE_MASK) return 1;
+       page's last HV_TLB_ADJ bytes misses): a refill would come straight back here, so it is done here instead. */
+    int page_end = bytes <= HV_TLB_ADJ + 1 && off + HV_TLB_ADJ > PAGE_MASK;
+    if (page_end && hv_knob[HV_K_NOPAGEEND]) return 1; /* HV_NO_PAGEEND=1: those go to the helper, as before 0.3.58 */
+    HvTlbEntry *e = hv_tlb_ent(cpu, (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), table);
+    uint64_t page = va & ~(uint64_t)PAGE_MASK;
+    uint64_t tag = write ? e->write_tag : e->read_tag;
+    if (page_end && tag != HV_TLB_INVALID && tag + HV_TLB_ADJ == page) { /* mapped already, as hv_mmu_access trusts it */
+        int64_t addend = __atomic_load_n(&e->addend, __ATOMIC_RELAXED);
+        if (!pageend_access(cpu, va, bytes, write, addend, insn)) return 1;
+        if (cpu->m->stats_interval) cpu->m->stats.pageend_light++;
+        return 2;
+    }
     HvWalk w;
     walk_begin(cpu);
     hv_mmu_walk(cpu, va, write ? HV_ACC_WRITE : HV_ACC_READ, el, &w);
     if (!w.fsc) tlb_fill(cpu, va, el, &w);
     walk_end(cpu);
     if (w.fsc) return 1;
-    HvTlbEntry *e = hv_tlb_ent(cpu, (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), table);
-    uint64_t tag = write ? e->write_tag : e->read_tag;
+    tag = write ? e->write_tag : e->read_tag;
     if (cpu->m->stats_interval) cpu->m->stats.refills++;
-    return tag != HV_TLB_INVALID && tag + HV_TLB_ADJ == (va & ~(uint64_t)PAGE_MASK) ? 0 : 1;
+    if (tag == HV_TLB_INVALID || tag + HV_TLB_ADJ != page) return 1; /* device memory, a code page written, ... */
+    if (!page_end) return 0;
+    if (!pageend_access(cpu, va, bytes, write, __atomic_load_n(&e->addend, __ATOMIC_RELAXED), insn)) return 1;
+    if (cpu->m->stats_interval) cpu->m->stats.pageend_light++;
+    return 2;
 }
 
 /* Put block b in this CPU's indirect-branch cache under its VA (b->va must be in

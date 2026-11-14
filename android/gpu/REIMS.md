@@ -646,6 +646,34 @@ plug-in have no counterpart here, see the section below):
   is kept for what it holds, instead of refusing the device and ending the app. Type-checked against the pinned
   metal2vulkan; not run on a tablet.
 
+0.3.58, the engine's CPU side, from the statistics of 0.3.54 and 0.3.55 (the list above: `page end`, `tlbi acks`):
+
+- **Page-end loads and stores without the full helper** (`core/mmu.c`, `pageend_access`; `host/enter.S`). The
+  inline TLB check refuses any access in a page's last 15 bytes (it allows 15 bytes of every access), so an 8-byte
+  load of a page's last word went to the light refill, which sent it on to the full helper: every register and the
+  SIMD file saved, the instruction decoded, the access done in C. Plain integer loads and stores with no writeback,
+  single or pair (LDR/STR in every addressing form the fast path has, sign-extending, LDP/STP, LDNP/STNP, LDPSW),
+  are now done by the light refill itself on the page's host copy when the TLB maps the page (or the refill's own
+  walk does); the thunk saves x19..x29 for it. Accesses that really cross into the next page, SIMD, atomics and the
+  rest go to the helper as before. `tests/mem_programs.S` `pageend_regs`: 21 such accesses into and out of x19..x30
+  and xzr, matched against the CPU running them natively; `pageend` went from 9 helper calls to 4 (the 4 that cross).
+  HV_NO_PAGEEND=1 is the old way. Stats: "page-end accesses done light".
+- **A TLBI by ASID no longer stops the other CPUs** (`hv_tlbi_drop_remote_asid`, `core/sysreg.c`). It was posted to
+  each CPU and waited for (the `tlbi acks`). A CPU not running that address space has none of its entries in its
+  live TLB (a switch puts them aside), so the TLBI's own CPU drops that ASID's stash and branch-cache id for it,
+  under the same walk-sequence check the TLBIs by page use; one running it, or that raced a switch, is posted to as
+  before. And a CPU applying a TLBI by ASID for a process it is not running keeps the running one's TLB, which it
+  emptied before. `tests/test_mmu.c` checks both answers, the 8-bit ASID compare and the guards. HV_NO_REMOTE_ASID=1
+  is the old way. Stats: "TLBIs by ASID/s".
+- **A translation cache kept across boots: looked at, not built.** The tablet's own figures (0.3.54) put translating
+  at 2 to 4% of the four CPUs' time, about a microsecond a block. The Mac's kernel and shared libraries are slid to a
+  new address every boot, so a kept translation needs every guest address in it moved, and reading a block back from
+  storage takes longer than translating it again. What costs is the cache dropping whole while 60 to 76% of what it
+  translates again was in it before the drop, which a cache that evicts by parts would answer.
+- Checked off the tablet: the engine's tests under qemu-aarch64 (test_mmu 75 checks, test_mem with the new program,
+  test_jit, test_exc, test_xchain; test_devices' timer checks fail the same way with and without these changes under
+  qemu's timing, as dczva does). Not run on a tablet; the next log's statistics lines say what each changed.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

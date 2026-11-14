@@ -59,7 +59,8 @@ void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid); /* asid -1: every 
 void hv_tlb_flush_va_page(HvCpu *cpu, uint64_t va, int asid); /* one page: stashes lose only its entries */
 void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid);
 /* Translated code's TLB miss: walk and fill without the full helper (see mmu.c). */
-int hv_tlb_refill(HvCpu *cpu, uint64_t va, uint32_t flags);
+/* 0: filled, run the access again; 1: the helper; 2: a page-end access done here (insn is the access). */
+int hv_tlb_refill(HvCpu *cpu, uint64_t va, uint32_t flags, uint32_t insn);
 struct HvBlock;
 void hv_ijc_fill(HvCpu *cpu, struct HvBlock *b);
 int hv_ijc_fill_checked(HvCpu *cpu, struct HvBlock *b); /* only if the TLB still maps it (0: not cached) */
@@ -70,6 +71,8 @@ void *hv_ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags);
 /* asid -1: all. 1: done; 0: raced the target's own page walk or cache fill
    (try again); -1: the target has to do it itself. */
 int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid);       /* just the cached branch targets in the page */
+/* The same for a TLBI by ASID, where target is not running it (see mmu.c). 1 done, 0 raced (try again), -1 post it. */
+int hv_tlbi_drop_remote_asid(HvCpu *target, int asid);
 void hv_ijc_drop_range(HvCpu *cpu, uint64_t va, uint64_t len, int asid);
 void hv_ucode_add(HvCpu *cpu, uint64_t va); /* a user target was cached in this page (current address space) */
 void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page);

@@ -695,6 +695,7 @@ static void print_stats(HvCpu *cpu, int force) {
                 RATE(tlb_range_flushes), RATE(range_spared), RATE(kernel_ranges));
         fprintf(stderr, "  TLBIs left to other CPUs/s: raced %.0f, every address space's cached targets %.0f, big range %.0f, ASID or all %.0f\n",
                 RATE(posted_kind[0]), RATE(posted_kind[3]), RATE(posted_kind[1]), RATE(posted_kind[2]));
+        fprintf(stderr, "  TLBIs by ASID/s: done to other CPUs from here %.0f, the running process's TLB kept %.0f\n", RATE(asid_remote), RATE(asid_kept));
         fprintf(stderr, "  remote drop races/s: walking %.0f, filling %.0f, during %.0f\n", RATE(race_kind[0]), RATE(race_kind[1]), RATE(race_kind[2]));
         {
             static const char *kn[16] = {"copy", "pcrel", "branch", "branch-reg", "eret", "literal", "memory", "prefetch",
@@ -719,8 +720,8 @@ static void print_stats(HvCpu *cpu, int force) {
                 RATE(chained_early), RATE(fast_resumes));
         fprintf(stderr, "  exit requests/s: TLBI posts %.0f, wakes %.0f (of them device work %.0f), kick all %.0f, own %.0f\n",
                 RATE(kick_src[0]), RATE(kick_src[1]), RATE(kick_src[3]), RATE(kick_src[2]), RATE(kick_src[4]));
-        fprintf(stderr, "  light refills %.0fK/s, light branch-cache fills %.0fK/s, chained to other pages %.0f/s\n", RATE(refills) / 1e3,
-                RATE(ijc_light) / 1e3, RATE(xchained));
+        fprintf(stderr, "  light refills %.0fK/s, light branch-cache fills %.0fK/s, chained to other pages %.0f/s, page-end accesses done light %.0fK/s\n",
+                RATE(refills) / 1e3, RATE(ijc_light) / 1e3, RATE(xchained), RATE(pageend_light) / 1e3);
         fprintf(stderr, "  process switches: %.0f/s saved, %.0f/s restored, %.0f/s dropped by a TLBI (%.0f entries each)\n", RATE(stash_saves), RATE(stash_hits), RATE(stash_stale),
                 s->stash_hits - last.stash_hits ? (double)(s->stash_entries - last.stash_entries) / (s->stash_hits - last.stash_hits) : 0.0);
         fprintf(stderr, "  tlb misses K/s: el0 empty %.0f el0 conflict %.0f el1 empty %.0f el1 conflict %.0f\n",

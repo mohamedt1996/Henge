@@ -283,6 +283,54 @@ int main(void) {
         }
     }
 
+    /* Another CPU's TLBI by ASID, done from here (0.3.58): only for an address space the target is not
+       running; it drops that ASID's stash and branch-cache id and nothing else. */
+    {
+        static HvCpu c2;
+        hv_cpu_reset_index(&c2, &m, 1);
+        HvPerCpu *p = c2.pc_state;
+        c2.tcr_el1 = 1ull << 36; /* 16-bit ASIDs */
+        c2.ttbr0_el1 = 9ull << 48;
+        hv_ijc_switch(&c2);
+        uint16_t cid9 = c2.asid_cid[9];
+        c2.ttbr0_el1 = 7ull << 48;
+        hv_ijc_switch(&c2);
+        uint16_t cid7 = c2.asid_cid[7];
+        p->stash[0].ttbr0 = 9ull << 48 | 0x4000, p->stash[1].ttbr0 = 7ull << 48 | 0x8000;
+        uint32_t g0 = p->stash[0].gen, g1 = p->stash[1].gen;
+        int r_running = hv_tlbi_drop_remote_asid(&c2, 7);
+        int r_other = hv_tlbi_drop_remote_asid(&c2, 9);
+        checks++;
+        if (!cid9 || !cid7 || r_running != -1 || r_other != 1 || c2.asid_cid[9] != 0 || c2.asid_cid[7] != cid7 ||
+            p->stash[0].gen == g0 || p->stash[1].gen != g1) {
+            printf("  FAIL remote ASID drop: running %d, other %d, ids 9 %u->%u 7 %u->%u, stash gens %u->%u %u->%u\n", r_running,
+                   r_other, cid9, c2.asid_cid[9], cid7, c2.asid_cid[7], g0, p->stash[0].gen, g1, p->stash[1].gen);
+            failures++;
+        }
+        /* Switching to the dropped address space gives it a new id: nothing cached under the old one is found. */
+        c2.ttbr0_el1 = 9ull << 48;
+        hv_ijc_switch(&c2);
+        checks++;
+        if (!c2.asid_cid[9] || c2.asid_cid[9] == cid9) {
+            printf("  FAIL after a remote ASID drop the switch kept id %u\n", c2.asid_cid[9]);
+            failures++;
+        }
+        /* 8-bit ASIDs compare by their low byte; a page walk under way, or TCR.A1, leaves it to the target. */
+        c2.tcr_el1 = 0;
+        c2.ttbr0_el1 = 0x0105ull << 48;
+        int r8 = hv_tlbi_drop_remote_asid(&c2, 5);
+        p->walk_seq |= 1;
+        int rw = hv_tlbi_drop_remote_asid(&c2, 3);
+        p->walk_seq++;
+        c2.tcr_el1 = 1ull << 22;
+        int ra1 = hv_tlbi_drop_remote_asid(&c2, 3);
+        checks++;
+        if (r8 != -1 || rw != 0 || ra1 != -1) {
+            printf("  FAIL remote ASID drop guards: 8-bit %d, mid-walk %d, A1 %d\n", r8, rw, ra1);
+            failures++;
+        }
+    }
+
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;
 }

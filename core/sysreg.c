@@ -377,7 +377,14 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
         int all_asids = op2 == 3 || op2 == 7; /* VAAE1, VAALE1 */
         hv_tlb_flush_va_page(cpu, va, all_asids ? -1 : (int)(xt >> 48));
     } else if (by_asid) {
-        hv_tlb_flush_user(cpu);
+        /* The live TLB holds user entries of the running address space only (a switch puts them aside), and
+           global ones, which a TLBI by ASID leaves: another ASID's needs none of them dropped (0.3.58; macOS
+           drops ASIDs of processes not running here all the time, and each emptied the running one's TLB). */
+        uint32_t amask = (cpu->tcr_el1 >> 36) & 1 ? 0xffffu : 0xffu;
+        int other = !((cpu->tcr_el1 >> 22) & 1) && !hv_knob[HV_K_NOREMOTEASID] &&
+                    ((uint32_t)(cpu->ttbr0_el1 >> 48) & amask) != ((uint32_t)(xt >> 48) & amask);
+        if (other) cpu->m->stats.asid_kept++;
+        else hv_tlb_flush_user(cpu);
         hv_tlb_stash_drop(cpu, (int)(xt >> 48));
         cpu->m->stats.reset_why[1]++;
         hv_ijc_drop_asid(cpu, (uint16_t)(xt >> 48));
@@ -482,10 +489,22 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
             } else if (by_va) {
                 npages = 1;
             }
+            /* A TLBI by ASID (ASIDE1IS): from here too, for every CPU not running that address space
+               (hv_tlbi_drop_remote_asid). HV_NO_REMOTE_ASID=1: posted, as before 0.3.58. */
+            int by_asid = crn == 8 && op1 == 0 && (crm == 1 || crm == 3) && op2 == 2 && !hv_knob[HV_K_NOREMOTEASID];
             uint64_t seq[HV_MAX_CPUS] = {0};
             for (int i = 0; i < m->ncpus; i++) {
                 HvCpu *c = m->cpus[i];
                 if (!c || c == cpu) continue;
+                if (by_asid) {
+                    int r = 0;
+                    for (int t = 0; t < 4 && (r = hv_tlbi_drop_remote_asid(c, (int)(xt >> 48))) == 0; t++)
+                        for (int s = 0; s < 64; s++) __asm__ volatile("yield");
+                    if (r == 1) {
+                        if (m->stats_interval) m->stats.asid_remote++;
+                        continue;
+                    }
+                }
                 /* Done from here entirely if it can be; else c does it, and we wait.
                    A drop that raced a page walk or cache fill of c's (they are
                    short) is tried again a few times first. */

@@ -234,7 +234,16 @@ _hv_helper_thunk:
     stp x12, x13, [x28, #96]
     str x14, [x28, #112]
     stp x16, x17, [x28, #128]
+    // x19..x27 and x29 too: a page-end load or store hv_tlb_refill does itself reads or writes
+    // the guest's registers in the HvCpu (x30 is there already, x18 and x28 always are).
+    stp x19, x20, [x28, #152]
+    stp x21, x22, [x28, #168]
+    stp x23, x24, [x28, #184]
+    stp x25, x26, [x28, #200]
+    str x27, [x28, #216]
+    str x29, [x28, #232]
     mov w2, w15
+    ldr w3, [x6, #8]              // the access itself (HvHelperInfo.insn)
     mrs x15, nzcv
     str x15, [x28, #CPU_NZCV]
     mov x15, sp
@@ -259,7 +268,8 @@ _hv_helper_thunk:
     ldp x16, x17, [x28, #128]
     ldr x30, [x28, #CPU_REFILL_RET]
     ldr x6, [x28, #0x130]
-    cbnz x7, 3f
+    tbnz x7, #1, 4f               // 2: done here
+    cbnz x7, 3f                   // 1: the helper
     // Filled: back to the start of the access, (op >> 19) words before where the helper would resume.
     ldr w15, [x6, #12]
     lsr w15, w15, #19
@@ -269,6 +279,17 @@ _hv_helper_thunk:
 3:  stp x0, x1, [x28]
     mov x0, x6
     b _hv_helper_entry
+    // A page-end access done by hv_tlb_refill: the rest of the guest's registers back (a load may have
+    // written any of them), then on where the helper would have gone back to (x30 = that place).
+4:  ldp x19, x20, [x28, #152]
+    ldp x21, x22, [x28, #168]
+    ldp x23, x24, [x28, #184]
+    ldp x25, x26, [x28, #200]
+    ldr x27, [x28, #216]
+    ldr x29, [x28, #232]
+    mov x15, x30
+    ldr x30, [x28, #240]
+    ret x15
 
 // hv_chain_thunk: a chainable exit's slow side. The site did `str x30, [x28, #x30]`
 // and `blr`; x30 points at {slot address, target VA}. Follows the slot when

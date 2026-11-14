@@ -10,7 +10,8 @@ struct HvMachine;
    VA of the 16 KB page. The read and write tags are that minus HV_TLB_ADJ, so
    translated code checks "same page, and the access ends in it" for any access
    of up to 16 bytes with one subtract and shift: VA - tag = offset + 15 must
-   be below 16 KB. (An access in a page's last 15 bytes takes the slow path.)
+   be below 16 KB. (An access in a page's last 15 bytes takes the slow path, where the
+   light refill does a plain one itself: pageend_access in mmu.c.)
    Invalid tags are HV_TLB_INVALID, which no address minus it brings near 0. */
 typedef struct HvTlbEntry {
     uint64_t read_tag;
