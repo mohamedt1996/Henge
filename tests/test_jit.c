@@ -90,6 +90,34 @@ int main(void) {
         }
         printf("with a 1 KB JIT region: %llu flushes\n", (unsigned long long)small.stats.block_flushes);
     }
+    /* 0.3.62: the cache in four parts, one dropped after every third translation, chains into it undone while
+       blocks of the other parts keep theirs. */
+    {
+        static HvMachine parts;
+        setenv("HV_JIT_PARTS", "4", 1), setenv("HV_JIT_PART_MIN", "64", 1), setenv("HV_JIT_EVICT_EVERY", "7", 1);
+        if (hv_machine_init(&parts, 4 << 20) != 0) return 1;
+        unsetenv("HV_JIT_PART_MIN"), unsetenv("HV_JIT_EVICT_EVERY");
+        hv_machine_add_ram(&parts, (uint64_t)(uintptr_t)jit_programs_begin, jit_programs_finish - jit_programs_begin,
+                           (void *)jit_programs_begin, 1);
+        hv_machine_add_ram(&parts, (uint64_t)(uintptr_t)stack, 65536, stack, 0);
+        int pbad = parts.parts != 4;
+        if (pbad) printf("the cache is not in parts (%d)\n", parts.parts);
+        for (int round = 0; round < 3 && !pbad; round++)
+            for (size_t i = 0; i < count; i++) {
+                static HvCpu init, native, jit;
+                memset(&init, 0, sizeof init);
+                seed_cpu(&init, i * 2 + 1 + round, sp);
+                run_native(&programs[i], &init, &native, NULL);
+                int bad = run_jit(&parts, &programs[i], &init, &jit, NULL);
+                if (!bad) bad = compare_cpus(programs[i].name, &native, &jit);
+                if (bad) printf("%-12s with the cache in parts: FAIL\n", programs[i].name);
+                pbad += bad != 0;
+            }
+        printf("with the cache in 4 parts: %llu parts dropped, %llu exits chained into them undone, %u blocks held\n",
+               (unsigned long long)parts.stats.part_drops, (unsigned long long)parts.stats.part_unchained, hv_jit_live_blocks(&parts));
+        if (!parts.stats.part_drops) printf("FAIL no part was dropped\n"), pbad++;
+        failed += pbad;
+    }
     printf("%zu programs x 2 seeds, %d failures, %d blocks translated\n", count, failed, m.nblocks);
     return failed != 0;
 }

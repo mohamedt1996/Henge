@@ -295,8 +295,11 @@ public class VmService extends Service {
         cmd.add("--sound"); cmd.add(sound ? "1" : "0");
         cmd.add("--ram"); cmd.add(Integer.toString(gunyah() ? Math.min(ram, 3072) : ram));
         cmd.add("--cpus"); cmd.add(Integer.toString(cpus));
-        // Settings > JIT cache: the translated code's room, 768 MB where nothing is set (host/vm.c).
+        // Settings > JIT cache: the translated code's room; 0.3.62: 512 MB where nothing is set. The cache is in four
+        // parts now and only the oldest is dropped when it fills, so it stays nearly full: 512 holds about what 768
+        // did on average, and keeps three quarters of it at each drop.
         int jitMb = prefs.getInt("jitMb", 0);
+        if (jitMb == 0) jitMb = 512;
         if (!install && !gunyah() && jitMb >= 64) { cmd.add("--jit-mb"); cmd.add(Integer.toString(jitMb)); }
         // Settings > JIT cache memory: Keep. The cache's pages stay the engine's when it drops its translations
         // (host/jit_region.c gives them back otherwise): to compare, with the heartbeat's swap figures.

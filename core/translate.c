@@ -373,7 +373,7 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
     uint64_t xa = same_page ? 0 : cross_addend(e, target);
     if (same_page || xa) {
         slot_index = __atomic_fetch_add(&e->m->nslots, 1, __ATOMIC_RELAXED); /* translations run in parallel */
-        if (slot_index >= e->m->max_slots) slot_index = ~0u; /* out of slots until the next flush: no chaining */
+        if (slot_index >= e->m->slot_end) slot_index = ~0u; /* out of slots until the next flush (or part): no chaining */
     }
     if (slot_index == ~0u) {
         /* Another page may be remapped under us, so look it up by VA instead of chaining. */
@@ -386,8 +386,8 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
     }
     uint64_t *slot = &e->m->slots[slot_index];
     *slot = 0;
-    e->m->slot_site[slot_index] = NULL; /* until placed: what it held is a dropped block's */
-    e->m->slot_cond[slot_index] = NULL;
+    e->m->slot_site[slot_index] = 0; /* until placed: what it held is a dropped block's */
+    e->m->slot_cond[slot_index] = 0;
     e->m->slot_xa[slot_index] = xa;
     e->m->slot_xpa[slot_index] = 0;
     uint32_t to_exit = ~0u;
@@ -2044,9 +2044,9 @@ int hv_translate_place(HvMachine *m, HvBlock *b) {
     hv_jit_finish(&m->jit, dst, e->nhot);
     b->code = dst;
     for (uint32_t k = 0; k < e->nsite; k++) {
-        m->slot_site[e->site[k].slot] = (e->site[k].cold ? cold : dst) + e->site[k].at;
-        m->slot_stub[e->site[k].slot] = (e->site[k].stub_cold ? cold : dst) + e->site[k].stub;
-        m->slot_cond[e->site[k].slot] = e->site[k].has_cond ? dst + e->site[k].cond_at : NULL;
+        m->slot_site[e->site[k].slot] = hv_slot_at(m, (e->site[k].cold ? cold : dst) + e->site[k].at);
+        m->slot_stub[e->site[k].slot] = hv_slot_at(m, (e->site[k].stub_cold ? cold : dst) + e->site[k].stub);
+        m->slot_cond[e->site[k].slot] = e->site[k].has_cond ? hv_slot_at(m, dst + e->site[k].cond_at) : 0;
     }
     return 0;
 }

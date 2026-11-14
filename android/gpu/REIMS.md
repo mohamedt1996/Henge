@@ -743,6 +743,24 @@ plug-in have no counterpart here, see the section below):
   four 2.6 GHz cores, the 2.8 GHz X4 left to the GPU side and Android; Fast cores awake keeps only the Mac's cores
   out of deep idle. Use: as before.
 
+0.3.62, from the 0.3.61 log (2026-11-15, 13 minutes of Safari and video):
+
+- **The USB tablet plugged in after boot** (`devices/xhci.c`): the 0.3.61 log had no "usb tablet" line at all: macOS
+  never addressed the device that was on port 2 from the reset. Port 2 is now empty at the reset and connected 2 s
+  after macOS configures the keyboard (15 s after its driver starts at the latest), as a device plugged into a
+  running Mac. Every step on port 2 is logged ("hengevm: usb tablet: plugged in on port 2", "port 2: write ...:
+  reset", "address device ...", each request, "configure endpoints ...", at most 80 lines). `tests/test_xhci.c`: 32.
+- **Stale blocks taken off the hash** (`core/dispatch.c` lookup): a new block goes in with the stale ones of its
+  bucket unlinked. Safari's JavaScript compiler rewrote one page 207 times and every version stayed: 426 thousand
+  stale blocks, chains of 58. The stats line's "stale blocks (N/s taken off)".
+- **The JIT cache in four parts** (`evict_part`, HV_JIT_PARTS, 1: whole): when it fills, only the oldest part is
+  dropped: exits chained into it go back to their stubs, the hash is made again from the other three, its code and
+  tables go back to the kernel. Full drops came every 80-90 s and 45-88% of what followed was translated again.
+  `tests/test_jitparts.c` lays the chains out by hand (14 checks); `tests/test_jit.c` runs every program with a part
+  dropped after every few translations. The heartbeat: "N drops (N of one part of 4)".
+- **Smaller bookkeeping**: a block is 64 bytes (80), a chainable exit 44 (56): about 40 bytes less per block.
+- **JIT cache: 512 MB by default**: in parts it stays nearly full, so 512 holds what 768 did on average.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

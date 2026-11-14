@@ -363,7 +363,8 @@ void hv_host_cpu_thread(void) {
                     left[0] ? "left to the app's GPU threads: core " : "no fast core is left over", left);
         }
     } else if (!__atomic_exchange_n(&said, 1, __ATOMIC_ACQ_REL)) {
-        if (rc == 0) fprintf(stderr, "hengevm: the Mac's CPUs run on the tablet's %d fast cores of %d\n", fast_count, fast_total);
+        if (rc == 0) fprintf(stderr, "hengevm: the Mac's CPUs run on the tablet's %d fast cores of %d, not one each (Settings > Cores for the Mac)\n",
+                             CPU_COUNT(&fast_set), fast_total);
         else fprintf(stderr, "hengevm: could not keep the Mac's CPUs on the fast cores: %s\n", strerror(errno));
     }
 }
@@ -410,7 +411,7 @@ static void *install_heartbeat(void *arg) {
     (void)arg;
     uint64_t last[HV_MAX_CPUS] = {0}, last_pc[HV_MAX_CPUS] = {0};
     uint64_t last_disk = 0, last_gpu = 0, last_wait = 0;
-    uint64_t last_busy = 0, last_fl = 0, last_flus = 0, last_spared = 0, last_tr = 0, last_full = 0, last_drop = 0;
+    uint64_t last_busy = 0, last_fl = 0, last_flus = 0, last_spared = 0, last_tr = 0, last_full = 0, last_drop = 0, last_part = 0;
     int still = 0, reported = 0;
     for (int t = 30; install_done == -2; t += 30) {
         sleep(30);
@@ -461,11 +462,11 @@ static void *install_heartbeat(void *arg) {
                 spared += __atomic_load_n(&bl[i]->disk->flushes_spared, __ATOMIC_RELAXED);
             }
             HvMachine *m = hv_vm_machine();
-            fprintf(stderr, " | disk time %.1f s, %llu flushes (%.1f s, %llu spared) | jit +%llu blocks, %llu drops (%llu full), %.0f MB in use (%.0f MB given back at flushes, %.0f MB of tables)",
+            fprintf(stderr, " | disk time %.1f s, %llu flushes (%.1f s, %llu spared) | jit +%llu blocks, %llu drops (%llu of one part of %d), %.0f MB in use (%.0f MB given back at flushes, %.0f MB of tables)",
                     (busy - last_busy) / 1e6, (unsigned long long)(fl - last_fl), (flus - last_flus) / 1e6,
                     (unsigned long long)(spared - last_spared), (unsigned long long)(m->stats.translations - last_tr),
-                    (unsigned long long)(m->stats.block_flushes - last_drop), (unsigned long long)(m->stats.flush_full - last_full),
-                    (double)m->jit.used * 4 / (1 << 20), (double)m->jit.released / (1 << 20), (double)m->stats.tables_released / (1 << 20));
+                    (unsigned long long)(m->stats.block_flushes - last_drop), (unsigned long long)(m->stats.part_drops - last_part),
+                    m->parts >= 2 ? m->parts : 1, (double)hv_jit_live_words(m) * 4 / (1 << 20), (double)m->jit.released / (1 << 20), (double)m->stats.tables_released / (1 << 20));
             /* What the translating costs and what it translates (0.3.54; the counters are core/dispatch.c's): the
                time in the translator of all CPUs together; how many of the blocks were in the cache before its
                last drop (the same code again: the cache is smaller than what the Mac runs) and how many of those
@@ -488,7 +489,7 @@ static void *install_heartbeat(void *arg) {
             if (sampled) fprintf(stderr, "; %.0f%% of what was dropped was dead already", 100.0 * (now.drop_stale - was.drop_stale) / sampled);
             was = now;
             last_busy = busy, last_fl = fl, last_flus = flus, last_spared = spared;
-            last_tr = m->stats.translations, last_full = m->stats.flush_full, last_drop = m->stats.block_flushes;
+            last_tr = m->stats.translations, last_full = m->stats.flush_full, last_drop = m->stats.block_flushes, last_part = m->stats.part_drops;
         }
         cpu_threads_state(stderr);
         host_state(stderr);

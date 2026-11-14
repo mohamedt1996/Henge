@@ -36,5 +36,8 @@ void hv_jit_finish(HvJitRegion *region, uint32_t *start, size_t words);
 /* Space for `words` instructions, or NULL when the region is full. */
 uint32_t *hv_jit_reserve(HvJitRegion *region, size_t words);
 void hv_jit_reset(HvJitRegion *region);
+/* Linux: the pages wholly inside words [from, from + words) given back to the kernel (they read as zeros again);
+   elsewhere nothing. Every CPU must be parked. */
+void hv_jit_release(HvJitRegion *region, size_t from, size_t words);
 
 #endif

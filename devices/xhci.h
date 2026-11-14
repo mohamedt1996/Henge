@@ -64,6 +64,9 @@ typedef struct HvXhci {
     /* the absolute pointer (port 2, endpoint 1 IN), when HV_USB_TABLET=1: buttons, x, y (0..32767), wheel */
     int tablet;
     int ptr_posted;        /* the guest has posted a transfer for reports: it is reading them */
+    int ptr_plugged;       /* 0.3.62: port 2 is connected only once macOS's driver is up (hv_xhci_poll) */
+    uint64_t ptr_plug_at;  /* when to connect it (CLOCK_MONOTONIC ns), 0: not yet known */
+    int ptr_said;          /* lines of the tablet's setting up logged */
     uint8_t preports[HV_XHCI_REPORTS][6];
     uint32_t phead, ptail;
     uint8_t pstate[6];

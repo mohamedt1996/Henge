@@ -741,18 +741,16 @@ public class MainActivity extends Activity {
                 }
             }
         }
-        final int[] jitSizes = {1024, 0, 512, 384, 256};
-        int jitNow = 1;
+        final int[] jitSizes = {1024, 768, 0, 384, 256};
+        int jitNow = 2;
         for (int i = 0; i < jitSizes.length; i++) if (jitSizes[i] == prefs.getInt("jitMb", 0)) jitNow = i;
-        c.addView(choiceRow("JIT cache", new String[]{"1 GB", "768 MB", "512", "384", "256"}, jitNow,
+        c.addView(choiceRow("JIT cache", new String[]{"1 GB", "768 MB", "512 MB", "384", "256"}, jitNow,
                 i -> { prefs.edit().putInt("jitMb", jitSizes[i]).apply(); render(true); }));
-        TextView jnote = text("Room for the Mac's code as the CPU engine translates it. When it fills, all of it is dropped and its "
-                + "memory given back to Android, then code is translated again as it runs. Smaller leaves the tablet more memory "
-                + "and re-translates more often: at 384 the Mi Pad 7 dropped it one to three times every 30 seconds with four "
-                + "Mac apps open. If the tablet is short of memory (the log's \"memory available\"), try 512 first. "
-                + "1 GB drops it less often for about 350 MB more of the tablet's memory, but on the Mi Pad 7 with 4 GB for the Mac "
-                + "it still dropped it five times in twelve minutes while the tablet swapped hard: 768 MB is the better trade there. "
-                + "Since 0.3.60 a drop also gives back the cache's bookkeeping (the log's \"MB of tables\").", 13, DIM, false);
+        TextView jnote = text("Room for the Mac's code as the CPU engine translates it. Since 0.3.62 it is kept in four parts: "
+                + "when it fills, only the oldest part is dropped and its memory given back, so three quarters of what was "
+                + "translated stays and the cache stays nearly full. 512 MB (the default) then holds about what 768 did on "
+                + "average before. Bigger re-translates less and leaves the tablet less memory (the log's \"memory available\" "
+                + "and swap); smaller the other way round.", 13, DIM, false);
         jnote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(jnote);
         c.addView(hairline());

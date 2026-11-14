@@ -32,16 +32,17 @@ typedef struct HvMmio {
     int self_locked;     /* the device takes its own lock (the GIC): no device lock around it */
 } HvMmio;
 
+/* 64 bytes (0.3.62: the pointers first and the page index in 32 bits; it was 80 with the padding). */
 typedef struct HvBlock {
-    uint32_t jit_gen; /* full flushes when it was made */
     uint64_t va, pa;
+    struct HvRam *ram;   /* where its page lives, for a quick staleness check */
+    uint32_t *code;
+    struct HvBlock *next;
+    uint32_t jit_gen;    /* full flushes when it was made */
     uint32_t flags;      /* HV_BLOCK_* state the translation depends on */
     uint32_t ninsns;
     uint32_t gen;        /* page_gen of its page when translated */
-    struct HvRam *ram;   /* where its page lives, for a quick staleness check */
-    uint64_t pg;
-    uint32_t *code;
-    struct HvBlock *next;
+    uint32_t pg;         /* its page's index in ram (16 KB pages: 64 TB of RAM) */
     uint32_t maker;      /* the CPU that translated it (index + 1; 0: not a CPU, as in tests) */
 } HvBlock;
 
@@ -54,6 +55,7 @@ typedef struct HvBlock {
 #define HV_MAX_MMIO 48
 #define HV_XHASH_BITS 16 /* buckets of exits chained to another page, by that page (HvMachine.xhead) */
 #define HV_BLOCK_HASH (1 << 21) /* one bucket per block: chains are walked on every front-cache miss */
+#define HV_JIT_PARTS 4 /* the JIT cache's parts, the oldest dropped when it fills (HvMachine.parts) */
 #define HV_JC_BITS 16
 #define HV_MAX_BLOCKS (3 << 20) /* a macOS boot runs well over a million distinct blocks; a full flush retranslates them all */
 #define HV_PROF_RING (1 << 16)
@@ -113,6 +115,9 @@ typedef struct HvStats {
     uint64_t translate_ticks, translated_insns, translated_words; /* time spent translating, guest and host code size */
     uint64_t retrans_va, retrans_vapa; /* translations of a VA (and VA+PA) translated before: diagnostics */
     uint64_t tables_released; /* bytes of the block and slot tables given back to the kernel at drops (Linux) */
+    uint64_t part_drops;      /* drops of one part of the JIT cache (HvMachine.parts) */
+    uint64_t part_unchained;  /* exits of the parts kept that were chained into the part dropped */
+    uint64_t stale_unlinked;  /* stale blocks taken off the hash as a new one went into their bucket */
     uint64_t drop_sampled, drop_stale; /* at each drop of every translation: blocks looked at (one in 8), and those of
                                           them whose code page had been written since (dead before the drop) */
     uint64_t dup_translations;         /* blocks two CPUs translated at once: one copy is never run */
@@ -238,9 +243,11 @@ typedef struct HvMachine {
     HvStats stats;
     int chain;               /* block chaining and the indirect-branch cache are enabled */
     uint64_t *slots;         /* chainable exits' targets (0: not chained) */
-    uint32_t **slot_site;    /* the B in each exit's stub that chaining rewrites to jump to the target */
-    uint32_t **slot_stub;    /* what that B goes to while it isn't chained */
-    uint32_t **slot_cond;    /* a conditional branch in a block's hot part that chaining may send straight to the target too */
+    /* These three are code addresses as word offsets from jit.base + 1, 0 for none (hv_slot_code; 0.3.62: 4 bytes
+       each, not 8). */
+    uint32_t *slot_site;     /* the B in each exit's stub that chaining rewrites to jump to the target */
+    uint32_t *slot_stub;     /* what that B goes to while it isn't chained */
+    uint32_t *slot_cond;     /* a conditional branch in a block's hot part that chaining may send straight to the target too */
     /* Exits to another page (see put_branch_exit): the host addend the target
        page's TLB entry must hold for the exit to go straight to the chained
        block (0: a same-page exit), and once chained, the target's physical page
@@ -256,6 +263,19 @@ typedef struct HvMachine {
     uint32_t *xchained, nxchained;
     uint32_t *xlink, *xhead;
     uint32_t nslots;
+    /* 0.3.62: the JIT cache in parts (HV_JIT_PARTS, 4; HV_JIT_PARTS=1: whole, as before). Code, blocks and slots
+       are each cut in as many ranges; the current part takes new translations, and when it is full the next one,
+       the oldest, is dropped alone and becomes the current one (dispatch.c evict_part): exits chained into it go
+       back to their stubs, the block hash is made again from the parts kept. The cache was dropped whole every
+       80-90 s on the tablet, and 45-88% of what was translated after was code it had held. */
+    int parts;                       /* 0: one part, dropped whole */
+    int part_cur;
+    size_t part_words;               /* code words per part */
+    size_t part_used[HV_JIT_PARTS];  /* code words of each part in use (the current one's: jit.used) */
+    uint32_t part_nb[HV_JIT_PARTS], part_ns[HV_JIT_PARTS]; /* blocks and slots each part holds */
+    uint32_t block_end, slot_end;    /* where the current part's blocks and slots end (all of them: max_blocks, max_slots) */
+    int flush_why;                   /* flush_pending as the flush took it: 2 alone is a lack of room */
+    uint32_t evict_every;            /* tests (HV_JIT_EVICT_EVERY): a part dropped after every so many translations */
     HvCpu *cpu;              /* CPU 0: the one that polls devices */
     HvCpu *cpus[HV_MAX_CPUS]; /* every CPU, so device and invalidation code can ask them to leave */
     int ncpus;
@@ -285,7 +305,27 @@ static inline uint32_t hv_block_hash(uint64_t va, uint64_t pa, uint32_t flags) {
     return (uint32_t)(h ^ (h >> 29)) & (HV_BLOCK_HASH - 1);
 }
 
-/* Lock-free: blocks are only added (release store) until a flush, which stops every CPU. */
+static inline uint32_t *hv_slot_code(const HvMachine *m, uint32_t at) { return at ? m->jit.base + (at - 1) : NULL; }
+static inline uint32_t hv_slot_at(const HvMachine *m, const uint32_t *p) { return p ? (uint32_t)(p - m->jit.base) + 1 : 0; }
+
+/* Code words of the JIT cache in use (all its parts). */
+static inline size_t hv_jit_live_words(const HvMachine *m) {
+    if (m->parts < 2) return m->jit.used < m->jit.capacity ? m->jit.used : m->jit.capacity;
+    size_t n = 0, start = (size_t)m->part_cur * m->part_words, cur = m->jit.used > start ? m->jit.used - start : 0;
+    for (int p = 0; p < m->parts; p++) n += p == m->part_cur ? (cur < m->part_words ? cur : m->part_words) : m->part_used[p];
+    return n;
+}
+
+/* Blocks held (all its parts). */
+static inline uint32_t hv_jit_live_blocks(const HvMachine *m) {
+    if (m->parts < 2) return (uint32_t)m->nblocks;
+    uint32_t n = 0, cur = (uint32_t)m->nblocks - (uint32_t)m->part_cur * (m->max_blocks / (uint32_t)m->parts);
+    for (int p = 0; p < m->parts; p++) n += p == m->part_cur ? cur : m->part_nb[p];
+    return n;
+}
+
+/* Lock-free: blocks are only added (release store) until a flush, which stops every CPU; a stale one may be unlinked
+   (its next stays, so a walk that is on it goes on), under the translation lock. */
 static inline HvBlock *hv_block_find(HvMachine *m, uint32_t h, uint64_t va, uint64_t pa, uint32_t flags, uint32_t gen) {
     for (HvBlock *b = __atomic_load_n(&m->hash[h], __ATOMIC_ACQUIRE); b; b = __atomic_load_n(&b->next, __ATOMIC_ACQUIRE))
         if (b->va == va && b->pa == pa && b->flags == flags && b->gen == gen) return b;
@@ -298,6 +338,8 @@ static inline uint32_t hv_xhash(uint64_t page_pa) {
 }
 
 int hv_machine_init(HvMachine *m, size_t jit_bytes);
+void hv_jit_parts_init(HvMachine *m);
+void hv_jit_part_take(HvMachine *m, int p);
 /* The same with JIT memory the host provides (iOS: the region a debugger granted and its writable alias). */
 int hv_machine_init_jit(HvMachine *m, void *rx, void *rw, size_t jit_bytes);
 void hv_machine_free(HvMachine *m);

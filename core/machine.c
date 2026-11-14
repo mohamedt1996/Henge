@@ -81,6 +81,7 @@ static int init_rest(HvMachine *m) {
     m->xhead = calloc((size_t)1 << HV_XHASH_BITS, sizeof *m->xhead);
     if (!m->slots || !m->slot_site || !m->slot_stub || !m->slot_cond || !m->slot_xa || !m->slot_xpa || !m->xchained || !m->xlink || !m->xhead)
         return -1;
+    hv_jit_parts_init(m);
     pthread_mutex_init(&m->big_mu, NULL);
     pthread_cond_init(&m->big_cv, NULL);
     pthread_mutexattr_t ra;
@@ -274,6 +275,43 @@ void hv_ret_clear(HvCpu *cpu) {
     cpu->ret_salt[0] = cpu->ret_salt[1] = 1ull << 48;
 }
 
+/* The JIT cache in parts (HvMachine.parts): HV_JIT_PARTS of them (1: whole), where each part holds at least
+   2 MB of code (two of the translator's 1 MB chunks) and nothing asks for a smaller cache (HV_JIT_CAP) or for
+   dropped code to fault (HV_JIT_POISON, whose checks count whole drops). */
+void hv_jit_parts_init(HvMachine *m) {
+    m->parts = 0;
+    m->block_end = m->max_blocks;
+    m->slot_end = m->max_slots;
+    const char *e = getenv("HV_JIT_PARTS");
+    int parts = e && *e ? atoi(e) : HV_JIT_PARTS;
+    if (parts > HV_JIT_PARTS) parts = HV_JIT_PARTS;
+    if (parts < 2 || getenv("HV_JIT_POISON") || hv_knob[HV_K_JITCAP] > 0) return;
+    size_t words = (m->jit.capacity / (size_t)parts) & ~(size_t)1;
+    const char *least = getenv("HV_JIT_PART_MIN"); /* tests: smaller parts */
+    if (words < (least && *least ? (size_t)atol(least) : (size_t)512 * 1024) || words < 64) return;
+    const char *every = getenv("HV_JIT_EVICT_EVERY");
+    m->evict_every = every && *every ? (uint32_t)atol(every) : 0;
+    m->parts = parts;
+    m->part_words = words;
+    memset(m->part_used, 0, sizeof m->part_used);
+    memset(m->part_nb, 0, sizeof m->part_nb);
+    memset(m->part_ns, 0, sizeof m->part_ns);
+    hv_jit_part_take(m, 0);
+}
+
+/* Part p becomes the current one, empty: new code, blocks and slots go there. */
+void hv_jit_part_take(HvMachine *m, int p) {
+    uint32_t nb = m->max_blocks / (uint32_t)m->parts, ns = m->max_slots / (uint32_t)m->parts;
+    m->part_cur = p;
+    m->jit.used = (size_t)p * m->part_words;
+    m->jit.limit = (size_t)(p + 1) * m->part_words;
+    m->nblocks = (int)((uint32_t)p * nb);
+    m->block_end = (uint32_t)(p + 1) * nb;
+    m->nslots = (uint32_t)p * ns;
+    m->slot_end = (uint32_t)(p + 1) * ns;
+    m->part_used[p] = 0, m->part_nb[p] = 0, m->part_ns[p] = 0;
+}
+
 void hv_cpu_wake(HvCpu *cpu) {
     __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_SEQ_CST);
     __asm__ volatile("sev" ::: "memory");
@@ -391,9 +429,9 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
         }
         m->slot_xpa[idx] = 0;
         __atomic_store_n(&m->slots[idx], 0, __ATOMIC_RELEASE);
-        uint32_t *site = m->slot_site[idx];
+        uint32_t *site = hv_slot_code(m, m->slot_site[idx]);
         if (site) {
-            uint32_t insn = 0x14000000u | (uint32_t)((m->slot_stub[idx] - site) & 0x3ffffff); /* back to its stub */
+            uint32_t insn = 0x14000000u | (uint32_t)((hv_slot_code(m, m->slot_stub[idx]) - site) & 0x3ffffff); /* back to its stub */
             hv_jit_write(&m->jit, site, &insn, 4);
             hv_jit_finish(&m->jit, site, 1);
         }

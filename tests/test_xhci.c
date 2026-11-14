@@ -147,8 +147,16 @@ int main(void) {
     HvXhci *x = hv_xhci_create(&m, bus);
     cn = en = 0;
     controller_up(x);
-    CHECK((rd_bar(x, 4) >> 24) == 2 && (rd_bar(x, 0x440 + 16) & 1), "tablet: %u ports, port 2 connected %u", rd_bar(x, 4) >> 24,
+    CHECK((rd_bar(x, 4) >> 24) == 2 && !(rd_bar(x, 0x440 + 16) & 1), "tablet: %u ports, port 2 connected at once %u", rd_bar(x, 4) >> 24,
           rd_bar(x, 0x440 + 16) & 1);
+    CHECK(x->ptr_plug_at != 0, "tablet: no time set to plug it in once the controller runs");
+    x->ptr_plug_at = 1; /* due: plugged in at the next poll, as the driver would see a device plugged in */
+    hv_xhci_poll(x);
+    uint32_t pev[4];
+    int pt, port2 = 0;
+    while ((pt = next_event(pev)) >= 0)
+        if (pt == 34 && (pev[0] >> 24) == 2) port2 = 1;
+    CHECK((rd_bar(x, 0x440 + 16) & 1) && port2, "tablet: port 2 plugged in (connected %u, its change event %d)", rd_bar(x, 0x440 + 16) & 1, port2);
     int ks = bring_up(x, 1, OUTCTX, EP0RING, &cn);
     n = control_in(x, ks, &en, 0x80, 6, 0x0200, 0, 255);
     CHECK(n == 34 && at(BUF)[4] == 1, "tablet: the keyboard's configuration unchanged (%d bytes)", n);

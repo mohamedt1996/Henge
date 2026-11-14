@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 
 #include "machine.h"
 
@@ -96,10 +97,23 @@ static const uint8_t ptr_config_desc[34] = {
 
 static const char *const strings[] = {NULL, "HengeVM", "HengeVM USB Keyboard", "1", "QEMU", "QEMU USB Tablet", "28754"};
 
-/* The tablet's setting up, as it happens: the log says whether macOS takes it. */
+/* The tablet's setting up, as it happens: the log says whether macOS takes it, and where it stops (at most 80
+   lines, the report counts apart). */
 static void tlog(HvXhci *x, int d, const char *what) {
-    (void)x;
-    if (d == TAB) fprintf(stderr, "hengevm: usb tablet: %s\n", what);
+    if (d == TAB && x->ptr_said++ < 80) fprintf(stderr, "hengevm: usb tablet: %s\n", what);
+}
+
+static uint64_t mono_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
+/* Connect the tablet no sooner than `ns` from now (an earlier time already set stands). */
+static void plug_after(HvXhci *x, uint64_t ns) {
+    if (!x->tablet || x->ptr_plugged) return;
+    uint64_t at = mono_ns() + ns;
+    if (!x->ptr_plug_at || at < x->ptr_plug_at) x->ptr_plug_at = at;
 }
 
 static int xlog(void) {
@@ -226,6 +240,12 @@ static int control(HvXhci *x, int d, const uint8_t setup[8], uint8_t *out, int m
     uint8_t type = setup[0], req = setup[1];
     uint16_t value = (uint16_t)(setup[2] | setup[3] << 8);
     if (xlog()) fprintf(stderr, "xhci: request %02x %02x value %04x len %u\n", type, req, value, setup[6] | setup[7] << 8);
+    if (tab) {
+        char msg[96];
+        snprintf(msg, sizeof msg, "request %02x %02x value %04x index %u length %u", type, req, value, setup[4] | setup[5] << 8,
+                 setup[6] | setup[7] << 8);
+        tlog(x, d, msg);
+    }
     const uint8_t *src = NULL;
     int len = 0;
     uint8_t tmp[64];
@@ -264,6 +284,7 @@ static int control(HvXhci *x, int d, const uint8_t setup[8], uint8_t *out, int m
         src = tmp, len = 1;
     } else if (type == 0x00 && req == 9) { /* SET_CONFIGURATION */
         dv->configured = value & 0xff;
+        if (!tab && dv->configured) plug_after(x, 2000000000ull); /* the keyboard is set up: the driver is ready for another */
         if (tab) {
             char msg[64];
             snprintf(msg, sizeof msg, "configuration %d set", dv->configured);
@@ -416,6 +437,12 @@ static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
     rd(x, input + 32, slot_ctx, 32);
     rd(x, input + 64, ep0, 32);
     int port = slot_ctx[6]; /* root hub port number, dword 1 bits 23:16 */
+    if (port == 2 || port < 1 || port > x->nports) {
+        char msg[96];
+        snprintf(msg, sizeof msg, "address device (slot %d, port %d, %s)%s", slot, port, bsr ? "no SET_ADDRESS yet" : "addressed",
+                 port < 1 || port > x->nports ? ": no such port" : "");
+        tlog(x, TAB, msg);
+    }
     if (port < 1 || port > x->nports || slot < 1 || slot > HV_XHCI_SLOTS) return CC_TRB_ERROR;
     int d = port - 1;
     HvXhciDev *dv = &x->dev[d];
@@ -431,11 +458,7 @@ static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
     dv->slot = slot;
     x->slot_dev[slot] = d + 1;
     init_ring_from_ctx(x, dv, 1);
-    if (!bsr) {
-        char msg[64];
-        snprintf(msg, sizeof msg, "addressed in slot %d", slot);
-        tlog(x, d, msg);
-    }
+
     return CC_SUCCESS;
 }
 
@@ -450,6 +473,11 @@ static int configure_endpoints(HvXhci *x, int slot, uint64_t input, int deconfig
         return CC_SUCCESS;
     }
     uint32_t drop = rd32(x, input), add = rd32(x, input + 4);
+    if (d == TAB) {
+        char msg[80];
+        snprintf(msg, sizeof msg, "configure endpoints: drop %08x add %08x", drop, add);
+        tlog(x, d, msg);
+    }
     for (int dci = 2; dci < HV_XHCI_EPS; dci++) {
         if (drop & (1u << dci)) {
             dv->ep_running[dci] = 0;
@@ -584,15 +612,19 @@ static void run_commands(HvXhci *x) {
 
 #define PORT_CONNECTED (PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)SPEED_FULL << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT)
 
+/* At reset the keyboard's port is connected; the tablet's waits for hv_xhci_poll (ptr_plug_at). */
 static void port_connect(HvXhci *x) {
-    for (int p = 0; p < x->nports; p++) {
-        x->portsc[p] = PORT_CONNECTED;
-        port_event(x, p);
-    }
+    x->portsc[0] = PORT_CONNECTED;
+    port_event(x, 0);
 }
 
 static void port_write(HvXhci *x, int p, uint32_t v) {
     if (xlog()) fprintf(stderr, "xhci: portsc write %08x (was %08x)\n", v, x->portsc[p]);
+    if (p == 1 && x->ptr_plugged) {
+        char msg[80];
+        snprintf(msg, sizeof msg, "port 2: write %08x (was %08x)%s", v, x->portsc[p], v & PORT_PR ? ": reset" : "");
+        tlog(x, TAB, msg);
+    }
     uint32_t s = x->portsc[p];
     s &= ~(v & PORT_CHANGES); /* write 1 to clear */
     if (v & PORT_PED) s &= ~PORT_PED;
@@ -630,7 +662,8 @@ static void reset(HvXhci *x) {
     memset(x->slot_dev, 0, sizeof x->slot_dev);
     memset(x->dev, 0, sizeof x->dev);
     x->ptr_posted = 0;
-    for (int p = 0; p < HV_XHCI_PORTS; p++) x->portsc[p] = p < x->nports ? PORT_CONNECTED : PORT_PP;
+    x->ptr_plugged = 0, x->ptr_plug_at = 0; /* plugged in again once the driver runs (hv_xhci_poll) */
+    for (int p = 0; p < HV_XHCI_PORTS; p++) x->portsc[p] = p == 0 ? PORT_CONNECTED : PORT_PP;
     update_irq(x);
 }
 
@@ -721,6 +754,7 @@ static void bar_write(HvPciDev *d, int bar, uint64_t off, uint64_t v, unsigned s
                 x->usbsts &= ~1u;
                 for (int p = 0; p < x->nports; p++)
                     if (x->portsc[p] & PORT_CSC) port_event(x, p);
+                plug_after(x, 15000000000ull); /* at the latest; the keyboard's configuration brings it forward */
             } else if (!(v & 1)) {
                 x->usbcmd = (uint32_t)v;
                 x->usbsts |= 1;
@@ -886,6 +920,14 @@ int hv_xhci_pointer_live(HvXhci *x) {
 
 void hv_xhci_poll(HvXhci *x) {
     if (!x) return;
+    /* 0.3.62: the tablet plugged in after the driver is up, as a device is plugged into a running Mac. In 0.3.61 it
+       was there from the reset and macOS never so much as addressed it. */
+    if (x->tablet && !x->ptr_plugged && x->ptr_plug_at && (x->usbcmd & 1) && mono_ns() >= x->ptr_plug_at) {
+        x->ptr_plugged = 1;
+        x->portsc[1] = PORT_CONNECTED;
+        tlog(x, TAB, "plugged in on port 2");
+        port_event(x, 1);
+    }
     if (x->rhead != x->rtail) run_ep_in(x);
     if (x->phead != x->ptail) run_ptr_in(x);
 }

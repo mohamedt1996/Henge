@@ -131,6 +131,23 @@ uint32_t *hv_jit_reserve(HvJitRegion *region, size_t words) {
     return region->base + at;
 }
 
+void hv_jit_release(HvJitRegion *region, size_t from, size_t words) {
+#ifdef __linux__
+    static int keep = -1;
+    if (keep < 0) keep = getenv("HV_JIT_KEEP") != NULL;
+    if (keep || !region->owned || !region->rw_diff || !region->base) return;
+    if (from >= region->capacity) return;
+    if (words > region->capacity - from) words = region->capacity - from;
+    size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+    uintptr_t lo = ((uintptr_t)(region->base + from) + pg - 1) & ~(uintptr_t)(pg - 1);
+    uintptr_t hi = (uintptr_t)(region->base + from + words) & ~(uintptr_t)(pg - 1);
+    if (hi <= lo) return;
+    if (madvise((void *)(lo + (uintptr_t)region->rw_diff), hi - lo, MADV_REMOVE) == 0) region->released += hi - lo;
+#else
+    (void)region, (void)from, (void)words;
+#endif
+}
+
 void hv_jit_reset(HvJitRegion *region) {
 #ifdef __linux__
     /* Android/Linux: give the code just dropped back to the kernel. The region is a memfd mapped twice
