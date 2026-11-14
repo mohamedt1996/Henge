@@ -72,6 +72,14 @@ public class MainActivity extends Activity {
         if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
         prefs = getSharedPreferences("henge", MODE_PRIVATE);
+        // 0.3.60: a JIT cache of 1 GB goes back to 768 MB once. The 0.3.59 log: the tablet 0.5-0.8 GB free with
+        // 4-5.5 GB in swap, the Mac waiting on swap-ins hundreds of thousands of times every 30 s; 1 GB still
+        // dropped five times in twelve minutes, so the extra 256 MB bought little. It can be set again.
+        if (!prefs.getBoolean("jit768once", false)) {
+            SharedPreferences.Editor e = prefs.edit().putBoolean("jit768once", true);
+            if (prefs.getInt("jitMb", 0) == 1024) e.putInt("jitMb", 0);
+            e.apply();
+        }
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -733,8 +741,9 @@ public class MainActivity extends Activity {
                 + "memory given back to Android, then code is translated again as it runs. Smaller leaves the tablet more memory "
                 + "and re-translates more often: at 384 the Mi Pad 7 dropped it one to three times every 30 seconds with four "
                 + "Mac apps open. If the tablet is short of memory (the log's \"memory available\"), try 512 first. "
-                + "1 GB: at 768 the Mi Pad 7 still dropped it every minute and a half, and over half of what it then translated "
-                + "was code it had before; 1 GB drops it less often for about 350 MB more of the tablet's memory.", 13, DIM, false);
+                + "1 GB drops it less often for about 350 MB more of the tablet's memory, but on the Mi Pad 7 with 4 GB for the Mac "
+                + "it still dropped it five times in twelve minutes while the tablet swapped hard: 768 MB is the better trade there. "
+                + "Since 0.3.60 a drop also gives back the cache's bookkeeping (the log's \"MB of tables\").", 13, DIM, false);
         jnote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(jnote);
         c.addView(hairline());

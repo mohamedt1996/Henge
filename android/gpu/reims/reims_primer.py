@@ -15,7 +15,7 @@ runtime drops the draws).
 
   - the hook appends each new record (length, bytes) to $HOME/.cache/henge-pipelines.bin, at most
     32 MiB, skipping records it holds already;
-  - the first device reims-vgpu opens is handed the file's records in a warm pass, with a 256 MiB
+  - the first device reims-vgpu adopts is handed the file's records in a warm pass, with a 256 MiB
     budget of driver cache data; HENGE_PRIMER=0 turns both off;
   - the warm pass's counts go to the log after 60 s ("metal2vulkan: (Henge) primer: ...").
 
@@ -162,17 +162,18 @@ EDITS = {
     &OPTIONS
 }
 ''' + PRIMER_MOD),
-        ('''                made_devices(OPEN_DEVICE, || {
-                    let default = rt::Device::system_default_with(device_options());
-                    Ok(default.ok().into_iter().collect())
-                })''',
-         '''                made_devices(OPEN_DEVICE, || {
-                    let default = rt::Device::system_default_with(device_options());
-                    if let Ok(device) = &default {
-                        henge_primer::warm(device); // Henge (reims_primer.py)
-                    }
-                    Ok(default.ok().into_iter().collect())
-                })'''),
+    ],
+    # 0.3.60: warmed where every device the platform keeps is adopted (gpu/device.rs `adopt`). 0.3.59 warmed in
+    # open_device's making of the default device, which never ran: a device adopted earlier answered the open.
+    'crates/reims-vgpu-vulkan/src/gpu/device.rs': [
+        ('''    devices.push((id, made.clone_ref()));
+    made
+}''',
+         '''    devices.push((id, made.clone_ref()));
+    drop(devices);
+    crate::platform::henge_primer::warm(&made.raw); // Henge (reims_primer.py): the first device adopted
+    made
+}'''),
     ],
 }
 

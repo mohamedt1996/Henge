@@ -3,6 +3,7 @@
 #include <mach/mach.h>
 #ifdef __linux__
 #include "plat_linux.h"
+#include <sys/mman.h>
 #endif
 #include <mach/mach_time.h>
 #include <sched.h>
@@ -22,6 +23,46 @@
    address and by address and memory (lookup, under the translation lock; swapped here with every CPU parked). */
 static uint64_t seen_va[2][1 << 18], seen_vapa[2][1 << 18];
 static int seen_now;
+
+#ifdef __linux__
+/* The whole pages of a table's first `used` bytes given back to the kernel: they read as zeros again, as calloc
+   left them. Only pages wholly inside the table (base..base+cap), so nothing else on the heap is touched. */
+static uint64_t give_back(void *base, size_t used, size_t cap) {
+    size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+    if (!base || cap < 16 * pg) return 0;
+    uintptr_t lo = ((uintptr_t)base + pg - 1) & ~(uintptr_t)(pg - 1);
+    uintptr_t hi = ((uintptr_t)base + (used < cap ? used : cap)) & ~(uintptr_t)(pg - 1);
+    uintptr_t end = ((uintptr_t)base + cap) & ~(uintptr_t)(pg - 1);
+    if (hi > end) hi = end;
+    if (hi <= lo) return 0;
+    return madvise((void *)lo, hi - lo, MADV_DONTNEED) == 0 ? hi - lo : 0;
+}
+#endif
+
+/* 0.3.60: the bookkeeping of the translations just dropped (blocks, slots, chains: 136 bytes per block, all of it
+   dead now) given back with the code, unless HV_JIT_KEEP. Written once, it stayed resident for the run, a few
+   hundred MB the tablet swapped out and back in as the next fill wrote it again. */
+static void release_tables(HvMachine *m, uint32_t nblocks, uint32_t nslots) {
+#ifdef __linux__
+    static int keep = -1;
+    if (keep < 0) keep = getenv("HV_JIT_KEEP") != NULL;
+    if (keep) return;
+    uint64_t n = give_back(m->blocks, (size_t)nblocks * sizeof(HvBlock), (size_t)m->max_blocks * sizeof(HvBlock));
+#define SLOTS(a) n += give_back(m->a, (size_t)nslots * sizeof *m->a, (size_t)m->max_slots * sizeof *m->a)
+    SLOTS(slots);
+    SLOTS(slot_site);
+    SLOTS(slot_stub);
+    SLOTS(slot_cond);
+    SLOTS(slot_xa);
+    SLOTS(slot_xpa);
+    SLOTS(xchained);
+    SLOTS(xlink);
+#undef SLOTS
+    m->stats.tables_released += n;
+#else
+    (void)m, (void)nblocks, (void)nslots;
+#endif
+}
 
 void hv_flush_blocks(HvMachine *m) {
     /* Every other CPU is parked (stop_the_world): the one moment the TLB layout can change. */
@@ -53,6 +94,7 @@ void hv_flush_blocks(HvMachine *m) {
             memset(m->percpu[i].jc, 0, sizeof m->percpu[i].jc);
         }
     memset(m->hash, 0, sizeof m->hash);
+    release_tables(m, (uint32_t)m->nblocks, (uint32_t)m->nslots);
     m->nblocks = 0;
     m->nslots = 0;
     m->nxchained = 0;

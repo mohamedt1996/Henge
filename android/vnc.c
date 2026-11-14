@@ -346,7 +346,13 @@ static void relative_event(Client *c, int mask, int dx, int dy) {
    it goes there as it is, buttons with it, so a click lands exactly where Android drew the pointer; the
    wheel stays the relative mouse's. Without it, the steering of message 5. */
 static void absolute_event(Client *c, int mask, int x, int y) {
-    if (!hv_vm_has_tablet()) {
+    static int was_live = -1;
+    int live = hv_vm_has_tablet();
+    if (live != was_live) {
+        fprintf(stderr, "hengevm: pointer: %s\n", live ? "the USB tablet puts the Mac's pointer where Android's is" : "the USB tablet is not read by macOS (yet): steering the mouse");
+        was_live = live;
+    }
+    if (!live) {
         pointer_event(c, mask, (int)((int64_t)x * c->w / 32768), (int)((int64_t)y * c->h / 32768));
         return;
     }

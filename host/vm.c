@@ -415,7 +415,7 @@ void hv_vm_tablet(int x, int y, int buttons) {
 }
 
 int hv_vm_has_tablet(void) {
-    return board.usb && board.usb->tablet;
+    return hv_xhci_pointer_live(board.usb); /* there and read by macOS; until then the mouse is steered */
 }
 
 void hv_vm_mouse_button(int button, int down) {

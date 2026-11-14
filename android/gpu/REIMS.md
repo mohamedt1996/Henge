@@ -709,6 +709,26 @@ plug-in have no counterpart here, see the section below):
   parts would answer it properly; not done yet. Nor is presenting reims's frame without reading it back (it needs
   an export from reims-vgpu's frame target and an image shared between two Vulkan devices).
 
+0.3.60, from the 0.3.59 log (2026-11-14, Safari with three tabs, windows moved while videos played):
+
+- **The USB tablet is its own device on port 2** (`devices/xhci.c`): QEMU's usb-tablet whole (vendor 0x0627,
+  product 0x0001, its descriptors and report), as macOS guests under QEMU drive it. In 0.3.59 it was interface 1
+  of the Apple keyboard, which macOS left alone: the log has no sign it was read, the Mac's pointer stayed where
+  it was (Android's pointer "far" from it) and clicks went nowhere. The controller now has a slot per device and
+  reports two ports with the tablet (one without, as before). The log says how far macOS takes it ("hengevm: usb
+  tablet: addressed", "configuration 1 set", "report endpoint configured", "macOS is reading reports", report
+  counts). Until macOS reads it, Android's pointer steers the relative mouse as before, clicks included
+  (`hv_xhci_pointer_live`, "hengevm: pointer: ..." says which). `tests/test_xhci.c`: 30 checks.
+- **The primer warms where reims-vgpu adopts its device** (`gpu/device.rs` `adopt`): 0.3.59 hooked open_device's
+  making of the default device, which never ran (a device adopted earlier answered the open), so the log had no
+  primer line. Type-checked against the pinned reims-vgpu and metal2vulkan.
+- **A drop of the JIT cache gives back its bookkeeping** (`core/dispatch.c` `release_tables`): the block and slot
+  tables (136 bytes per block, hundreds of MB written by a full cache) stayed resident after every drop, and the
+  tablet, 0.5-0.8 GB free with 4-5.5 GB in swap, swapped them out and in again. Their pages go back with the
+  code's (MADV_DONTNEED; HV_JIT_KEEP=1 keeps both). The heartbeat's "MB of tables".
+- **JIT cache: 1 GB goes back to 768 MB once** (it can be set again): it still dropped five times in twelve
+  minutes while the tablet swapped hard. The Mac's memory stays 4 GB.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

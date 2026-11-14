@@ -445,11 +445,11 @@ static void *install_heartbeat(void *arg) {
                 spared += __atomic_load_n(&bl[i]->disk->flushes_spared, __ATOMIC_RELAXED);
             }
             HvMachine *m = hv_vm_machine();
-            fprintf(stderr, " | disk time %.1f s, %llu flushes (%.1f s, %llu spared) | jit +%llu blocks, %llu drops (%llu full), %.0f MB in use (%.0f MB given back at flushes)",
+            fprintf(stderr, " | disk time %.1f s, %llu flushes (%.1f s, %llu spared) | jit +%llu blocks, %llu drops (%llu full), %.0f MB in use (%.0f MB given back at flushes, %.0f MB of tables)",
                     (busy - last_busy) / 1e6, (unsigned long long)(fl - last_fl), (flus - last_flus) / 1e6,
                     (unsigned long long)(spared - last_spared), (unsigned long long)(m->stats.translations - last_tr),
                     (unsigned long long)(m->stats.block_flushes - last_drop), (unsigned long long)(m->stats.flush_full - last_full),
-                    (double)m->jit.used * 4 / (1 << 20), (double)m->jit.released / (1 << 20));
+                    (double)m->jit.used * 4 / (1 << 20), (double)m->jit.released / (1 << 20), (double)m->stats.tables_released / (1 << 20));
             /* What the translating costs and what it translates (0.3.54; the counters are core/dispatch.c's): the
                time in the translator of all CPUs together; how many of the blocks were in the cache before its
                last drop (the same code again: the cache is smaller than what the Mac runs) and how many of those

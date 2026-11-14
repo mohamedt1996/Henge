@@ -112,6 +112,7 @@ typedef struct HvStats {
     uint64_t nrecent;
     uint64_t translate_ticks, translated_insns, translated_words; /* time spent translating, guest and host code size */
     uint64_t retrans_va, retrans_vapa; /* translations of a VA (and VA+PA) translated before: diagnostics */
+    uint64_t tables_released; /* bytes of the block and slot tables given back to the kernel at drops (Linux) */
     uint64_t drop_sampled, drop_stale; /* at each drop of every translation: blocks looked at (one in 8), and those of
                                           them whose code page had been written since (dead before the drop) */
     uint64_t dup_translations;         /* blocks two CPUs translated at once: one copy is never run */

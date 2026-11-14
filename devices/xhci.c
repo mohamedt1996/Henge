@@ -44,7 +44,9 @@ enum { CC_SUCCESS = 1, CC_TRB_ERROR = 5, CC_STALL = 6, CC_SLOTS_FULL = 9, CC_SHO
 #define SPEED_FULL 1
 
 #define KBD_DCI_IN 3 /* endpoint 1 IN */
-#define PTR_DCI_IN 5 /* endpoint 2 IN: the absolute pointer (HV_USB_TABLET=1) */
+#define PTR_DCI_IN 3 /* the tablet's endpoint 1 IN, on its own slot */
+#define KBD 0        /* dev[]: the keyboard, port 1 */
+#define TAB 1        /* the tablet, port 2 */
 
 /* ---- the keyboard's descriptors (USB HID 1.11 boot keyboard) ---- */
 
@@ -68,8 +70,9 @@ static const uint8_t config_desc[34] = {
     7, 5, 0x81, 3, 8, 0, 10,                  /* EP1 IN, interrupt, 8 bytes, every 10 ms */
 };
 
-/* HV_USB_TABLET=1: interface 1, an absolute pointer. QEMU's usb-tablet report (three buttons, X and Y
-   0..32767, a wheel), which macOS guests drive with the generic HID pointer driver. */
+/* HV_USB_TABLET=1: port 2, an absolute pointer. QEMU's usb-tablet as a full-speed device (IDs, descriptors,
+   report: three buttons, X and Y 0..32767, a wheel), which macOS guests drive with the generic HID pointer
+   driver. */
 static const uint8_t ptr_report_desc[] = {
     0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x03,
     0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x05, 0x81, 0x01,
@@ -78,17 +81,26 @@ static const uint8_t ptr_report_desc[] = {
     0x45, 0x00, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06, 0xc0, 0xc0,
 };
 
-static const uint8_t config_desc_tablet[59] = {
-    9, 2, 59, 0, 2, 1, 0, 0xa0, 50,           /* two interfaces, remote wakeup, 100 mA */
-    9, 4, 0, 0, 1, 3, 1, 1, 0,                /* interface 0: HID, boot, keyboard */
-    9, 0x21, 0x11, 0x01, 0, 1, 0x22, sizeof report_desc, 0,
-    7, 5, 0x81, 3, 8, 0, 10,                  /* EP1 IN, interrupt, 8 bytes, every 10 ms */
-    9, 4, 1, 0, 1, 3, 0, 0, 0,                /* interface 1: HID, no boot protocol (an absolute pointer) */
-    9, 0x21, 0x11, 0x01, 0, 1, 0x22, sizeof ptr_report_desc, 0,
-    7, 5, 0x82, 3, 8, 0, 1,                   /* EP2 IN, interrupt, 8 bytes, every 1 ms: the pointer as it moves */
+static const uint8_t ptr_device_desc[18] = {
+    18, 1, 0x00, 0x02, 0, 0, 0, 64, /* USB 2.0, class per interface, EP0 64 bytes */
+    0x27, 0x06, 0x01, 0x00,         /* QEMU's tablet: vendor 0x0627, product 0x0001 */
+    0x00, 0x00, 4, 5, 6, 1,         /* bcdDevice 0.00, strings 4-6, one configuration */
 };
 
-static const char *const strings[] = {NULL, "HengeVM", "HengeVM USB Keyboard", "1"};
+static const uint8_t ptr_config_desc[34] = {
+    9, 2, 34, 0, 1, 1, 0, 0xa0, 50,           /* one interface, remote wakeup, 100 mA */
+    9, 4, 0, 0, 1, 3, 0, 0, 0,                /* interface 0: HID, no boot protocol */
+    9, 0x21, 0x01, 0x00, 0, 1, 0x22, sizeof ptr_report_desc, 0, /* HID 0.01 as QEMU's, one report descriptor */
+    7, 5, 0x81, 3, 8, 0, 10,                  /* EP1 IN, interrupt, 8 bytes, every 10 ms */
+};
+
+static const char *const strings[] = {NULL, "HengeVM", "HengeVM USB Keyboard", "1", "QEMU", "QEMU USB Tablet", "28754"};
+
+/* The tablet's setting up, as it happens: the log says whether macOS takes it. */
+static void tlog(HvXhci *x, int d, const char *what) {
+    (void)x;
+    if (d == TAB) fprintf(stderr, "hengevm: usb tablet: %s\n", what);
+}
 
 static int xlog(void) {
     static int on = -1;
@@ -208,7 +220,9 @@ static void set_ep_state(HvXhci *x, int slot, int dci, uint32_t state) {
 
 /* Answer a SETUP on endpoint 0. Returns the reply length (data to send for IN
    requests), or -1 to stall. */
-static int control(HvXhci *x, const uint8_t setup[8], uint8_t *out, int max) {
+static int control(HvXhci *x, int d, const uint8_t setup[8], uint8_t *out, int max) {
+    HvXhciDev *dv = &x->dev[d];
+    int tab = d == TAB;
     uint8_t type = setup[0], req = setup[1];
     uint16_t value = (uint16_t)(setup[2] | setup[3] << 8);
     if (xlog()) fprintf(stderr, "xhci: request %02x %02x value %04x len %u\n", type, req, value, setup[6] | setup[7] << 8);
@@ -217,9 +231,8 @@ static int control(HvXhci *x, const uint8_t setup[8], uint8_t *out, int max) {
     uint8_t tmp[64];
     if (type == 0x80 && req == 6) { /* GET_DESCRIPTOR (device) */
         uint8_t dt = value >> 8, idx = value & 0xff;
-        if (dt == 1) src = device_desc, len = sizeof device_desc;
-        else if (dt == 2 && x->tablet) src = config_desc_tablet, len = sizeof config_desc_tablet;
-        else if (dt == 2) src = config_desc, len = sizeof config_desc;
+        if (dt == 1) src = tab ? ptr_device_desc : device_desc, len = 18;
+        else if (dt == 2) src = tab ? ptr_config_desc : config_desc, len = 34;
         else if (dt == 3) {
             if (idx == 0) {
                 tmp[0] = 4, tmp[1] = 3, tmp[2] = 0x09, tmp[3] = 0x04; /* English (US) */
@@ -235,9 +248,10 @@ static int control(HvXhci *x, const uint8_t setup[8], uint8_t *out, int max) {
         } else
             return -1; /* no device qualifier: full speed only */
     } else if (type == 0x81 && req == 6) { /* GET_DESCRIPTOR (interface): HID, report; wIndex: the interface */
-        int pi = x->tablet && setup[4] == 1;
-        if ((value >> 8) == 0x22) src = pi ? ptr_report_desc : report_desc, len = pi ? (int)sizeof ptr_report_desc : (int)sizeof report_desc;
-        else if ((value >> 8) == 0x21) src = pi ? config_desc_tablet + 43 : config_desc + 18, len = 9;
+        if ((value >> 8) == 0x22) {
+            src = tab ? ptr_report_desc : report_desc, len = tab ? (int)sizeof ptr_report_desc : (int)sizeof report_desc;
+            if (tab) tlog(x, d, "macOS read the report descriptor");
+        } else if ((value >> 8) == 0x21) src = tab ? ptr_config_desc + 18 : config_desc + 18, len = 9;
         else return -1;
     } else if (type == 0x80 && req == 0) { /* GET_STATUS */
         tmp[0] = 0, tmp[1] = 0;
@@ -246,19 +260,24 @@ static int control(HvXhci *x, const uint8_t setup[8], uint8_t *out, int max) {
         tmp[0] = 0, tmp[1] = 0;
         src = tmp, len = 2;
     } else if (type == 0x80 && req == 8) { /* GET_CONFIGURATION */
-        tmp[0] = (uint8_t)x->configured;
+        tmp[0] = (uint8_t)dv->configured;
         src = tmp, len = 1;
     } else if (type == 0x00 && req == 9) { /* SET_CONFIGURATION */
-        x->configured = value & 0xff;
+        dv->configured = value & 0xff;
+        if (tab) {
+            char msg[64];
+            snprintf(msg, sizeof msg, "configuration %d set", dv->configured);
+            tlog(x, d, msg);
+        }
         return 0;
     } else if (type == 0x81 && req == 10) { /* GET_INTERFACE */
         tmp[0] = 0;
         src = tmp, len = 1;
     } else if (type == 0xa1 && req == 1) { /* GET_REPORT */
-        if (x->tablet && setup[4] == 1) src = x->pstate, len = 6;
+        if (tab) src = x->pstate, len = 6;
         else src = x->state, len = 8;
     } else if (type == 0xa1 && (req == 2 || req == 3)) { /* GET_IDLE, GET_PROTOCOL */
-        tmp[0] = req == 3 ? 1 : 0;
+        tmp[0] = req == 3 && !tab ? 1 : 0;
         src = tmp, len = 1;
     } else if ((type & 0x60) == 0x20 || (type == 0x00 && (req == 1 || req == 3)) || (type == 0x01 && req == 11) ||
                (type == 0x02 && (req == 1 || req == 3))) {
@@ -272,9 +291,11 @@ static int control(HvXhci *x, const uint8_t setup[8], uint8_t *out, int max) {
     return len;
 }
 
-/* Run the control transfers queued on the keyboard's endpoint 0. */
-static void run_ep0(HvXhci *x, int slot) {
-    HvXhciRing *r = &x->ep[1];
+/* Run the control transfers queued on a device's endpoint 0. */
+static void run_ep0(HvXhci *x, int d) {
+    HvXhciDev *dv = &x->dev[d];
+    int slot = dv->slot;
+    HvXhciRing *r = &dv->ep[1];
     uint32_t trb[4];
     uint64_t at;
     uint8_t setup[8], reply[256];
@@ -285,13 +306,13 @@ static void run_ep0(HvXhci *x, int slot) {
         if (type == TRB_SETUP) {
             memcpy(setup, trb, 8);
             uint16_t wlen = (uint16_t)(setup[6] | setup[7] << 8);
-            reply_len = control(x, setup, reply, wlen < sizeof reply ? wlen : (int)sizeof reply);
+            reply_len = control(x, d, setup, reply, wlen < sizeof reply ? wlen : (int)sizeof reply);
             stalled = reply_len < 0;
             ring_advance(r);
             if (stalled) {
                 transfer_event(x, at, CC_STALL, 0, slot, 1);
                 set_ep_state(x, slot, 1, 2); /* halted */
-                x->ep_running[1] = 0;
+                dv->ep_running[1] = 0;
                 return;
             }
             if (ioc) transfer_event(x, at, CC_SUCCESS, 0, slot, 1);
@@ -321,9 +342,10 @@ static void run_ep0(HvXhci *x, int slot) {
 
 /* Give waiting key reports to the interrupt IN endpoint's posted transfers. */
 static void run_ep_in(HvXhci *x) {
-    int slot = x->kbd_slot;
-    if (!slot || !x->ep_running[KBD_DCI_IN]) return;
-    HvXhciRing *r = &x->ep[KBD_DCI_IN];
+    HvXhciDev *dv = &x->dev[KBD];
+    int slot = dv->slot;
+    if (!slot || !dv->ep_running[KBD_DCI_IN]) return;
+    HvXhciRing *r = &dv->ep[KBD_DCI_IN];
     uint32_t trb[4];
     uint64_t at;
     pthread_mutex_lock(&x->mu);
@@ -344,9 +366,10 @@ static void run_ep_in(HvXhci *x) {
 
 /* The same for the absolute pointer's reports (HV_USB_TABLET=1). */
 static void run_ptr_in(HvXhci *x) {
-    int slot = x->kbd_slot;
-    if (!slot || !x->tablet || !x->ep_running[PTR_DCI_IN]) return;
-    HvXhciRing *r = &x->ep[PTR_DCI_IN];
+    HvXhciDev *dv = &x->dev[TAB];
+    int slot = dv->slot;
+    if (!slot || !x->tablet || !dv->ep_running[PTR_DCI_IN]) return;
+    HvXhciRing *r = &dv->ep[PTR_DCI_IN];
     uint32_t trb[4];
     uint64_t at;
     pthread_mutex_lock(&x->mu);
@@ -359,6 +382,12 @@ static void run_ptr_in(HvXhci *x) {
         uint32_t n = want < 6 ? want : 6;
         wr(x, buf, x->preports[x->phead % HV_XHCI_REPORTS], n);
         x->phead++;
+        uint64_t nd = ++x->pdelivered;
+        if (nd == 1 || nd == 100 || nd == 1000 || nd == 10000 || nd == 100000) {
+            char msg[64];
+            snprintf(msg, sizeof msg, "%llu reports read by macOS", (unsigned long long)nd);
+            tlog(x, TAB, msg);
+        }
         transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, PTR_DCI_IN);
     }
     pthread_mutex_unlock(&x->mu);
@@ -366,13 +395,19 @@ static void run_ptr_in(HvXhci *x) {
 
 /* ---- commands ---- */
 
-static void init_ring_from_ctx(HvXhci *x, int slot, int dci) {
-    uint64_t ctx = out_ctx(x, slot) + 32ull * dci;
+static void init_ring_from_ctx(HvXhci *x, HvXhciDev *dv, int dci) {
+    uint64_t ctx = out_ctx(x, dv->slot) + 32ull * dci;
     uint64_t deq;
     rd(x, ctx + 8, &deq, 8);
-    x->ep[dci].dequeue = deq & ~0xfull;
-    x->ep[dci].ccs = (int)(deq & 1);
-    x->ep_running[dci] = 1;
+    dv->ep[dci].dequeue = deq & ~0xfull;
+    dv->ep[dci].ccs = (int)(deq & 1);
+    dv->ep_running[dci] = 1;
+}
+
+/* The device addressed in a slot, or NULL. */
+static HvXhciDev *slot_dev(HvXhci *x, int slot) {
+    if (slot < 1 || slot > HV_XHCI_SLOTS || !x->slot_dev[slot]) return NULL;
+    return &x->dev[x->slot_dev[slot] - 1];
 }
 
 static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
@@ -381,7 +416,9 @@ static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
     rd(x, input + 32, slot_ctx, 32);
     rd(x, input + 64, ep0, 32);
     int port = slot_ctx[6]; /* root hub port number, dword 1 bits 23:16 */
-    if (port != 1) return CC_TRB_ERROR;
+    if (port < 1 || port > x->nports || slot < 1 || slot > HV_XHCI_SLOTS) return CC_TRB_ERROR;
+    int d = port - 1;
+    HvXhciDev *dv = &x->dev[d];
     uint32_t dw3 = (uint32_t)(bsr ? 1 : 2) << 27 | (uint32_t)(bsr ? 0 : slot); /* default or addressed; address = slot */
     memcpy(slot_ctx + 12, &dw3, 4);
     uint32_t e0 = 0;
@@ -390,21 +427,32 @@ static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
     memcpy(ep0, &e0, 4);
     wr(x, out, slot_ctx, 32);
     wr(x, out + 32, ep0, 32);
-    x->kbd_slot = slot;
-    init_ring_from_ctx(x, slot, 1);
+    if (dv->slot && dv->slot != slot && x->slot_dev[dv->slot] == d + 1) x->slot_dev[dv->slot] = 0;
+    dv->slot = slot;
+    x->slot_dev[slot] = d + 1;
+    init_ring_from_ctx(x, dv, 1);
+    if (!bsr) {
+        char msg[64];
+        snprintf(msg, sizeof msg, "addressed in slot %d", slot);
+        tlog(x, d, msg);
+    }
     return CC_SUCCESS;
 }
 
 static int configure_endpoints(HvXhci *x, int slot, uint64_t input, int deconfigure) {
+    HvXhciDev *dv = slot_dev(x, slot);
+    if (!dv) return CC_CONTEXT_STATE;
+    int d = (int)(dv - x->dev);
     uint64_t out = out_ctx(x, slot);
     if (deconfigure) {
-        for (int dci = 2; dci < HV_XHCI_EPS; dci++) x->ep_running[dci] = 0;
+        for (int dci = 2; dci < HV_XHCI_EPS; dci++) dv->ep_running[dci] = 0;
+        tlog(x, d, "endpoints deconfigured");
         return CC_SUCCESS;
     }
     uint32_t drop = rd32(x, input), add = rd32(x, input + 4);
     for (int dci = 2; dci < HV_XHCI_EPS; dci++) {
         if (drop & (1u << dci)) {
-            x->ep_running[dci] = 0;
+            dv->ep_running[dci] = 0;
             uint8_t zero[32] = {0};
             wr(x, out + 32ull * dci, zero, 32);
         }
@@ -416,7 +464,8 @@ static int configure_endpoints(HvXhci *x, int slot, uint64_t input, int deconfig
             e0 = (e0 & ~7u) | 1;
             memcpy(ep, &e0, 4);
             wr(x, out + 32ull * dci, ep, 32);
-            init_ring_from_ctx(x, slot, dci);
+            init_ring_from_ctx(x, dv, dci);
+            if (dci == PTR_DCI_IN) tlog(x, d, "report endpoint configured");
         }
     }
     if (add & 1) { /* slot context: context entries and friends */
@@ -455,14 +504,29 @@ static void run_commands(HvXhci *x) {
             continue;
         }
         case TRB_DISABLE_SLOT:
-            if (slot >= 1 && slot <= HV_XHCI_SLOTS) x->slot_used[slot] = 0;
-            if (slot == x->kbd_slot) {
-                x->kbd_slot = 0;
-                memset(x->ep_running, 0, sizeof x->ep_running);
+            if (slot_dev(x, slot)) {
+                HvXhciDev *dv = slot_dev(x, slot);
+                tlog(x, (int)(dv - x->dev), "slot disabled");
+                dv->slot = 0;
+                memset(dv->ep_running, 0, sizeof dv->ep_running);
+                x->slot_dev[slot] = 0;
             }
+            if (slot >= 1 && slot <= HV_XHCI_SLOTS) x->slot_used[slot] = 0;
             break;
         case TRB_ADDRESS_DEVICE:
             cc = address_device(x, slot, ptr, (trb[3] >> 9) & 1);
+            break;
+        }
+        HvXhciDev *dv = slot_dev(x, slot);
+        if (!dv && (type == TRB_CONFIGURE_EP || type == TRB_STOP_EP || type == TRB_SET_TR_DEQUEUE || type == TRB_RESET_DEVICE)) {
+            if (x->m->log) fprintf(stderr, "hengevm: xhci: command %d for slot %d, no device there\n", type, slot);
+            cmd_completion(x, at, CC_CONTEXT_STATE, slot);
+            continue;
+        }
+        switch (type) {
+        case TRB_ENABLE_SLOT:
+        case TRB_DISABLE_SLOT:
+        case TRB_ADDRESS_DEVICE:
             break;
         case TRB_CONFIGURE_EP:
             cc = configure_endpoints(x, slot, ptr, (trb[3] >> 9) & 1);
@@ -483,26 +547,26 @@ static void run_commands(HvXhci *x) {
         }
         case TRB_STOP_EP: {
             int dci = (trb[3] >> 16) & 0x1f;
-            x->ep_running[dci] = 0;
+            dv->ep_running[dci] = 0;
             set_ep_state(x, slot, dci, 3);
             /* The dequeue pointer goes back into the context for the driver to read. */
-            uint64_t deq = x->ep[dci].dequeue | (uint64_t)x->ep[dci].ccs;
+            uint64_t deq = dv->ep[dci].dequeue | (uint64_t)dv->ep[dci].ccs;
             wr(x, out_ctx(x, slot) + 32ull * dci + 8, &deq, 8);
             break;
         }
         case TRB_SET_TR_DEQUEUE: {
             int dci = (trb[3] >> 16) & 0x1f;
             uint64_t p = (uint64_t)trb[1] << 32 | trb[0];
-            x->ep[dci].dequeue = p & ~0xfull;
-            x->ep[dci].ccs = (int)(p & 1);
+            dv->ep[dci].dequeue = p & ~0xfull;
+            dv->ep[dci].ccs = (int)(p & 1);
             wr(x, out_ctx(x, slot) + 32ull * dci + 8, &p, 8);
             break;
         }
         case TRB_RESET_DEVICE: {
-            for (int dci = 2; dci < HV_XHCI_EPS; dci++) x->ep_running[dci] = 0;
+            for (int dci = 2; dci < HV_XHCI_EPS; dci++) dv->ep_running[dci] = 0;
             uint32_t dw3 = (uint32_t)1 << 27; /* default state, address 0 */
             wr(x, out_ctx(x, slot) + 12, &dw3, 4);
-            x->configured = 0;
+            dv->configured = 0;
             break;
         }
         case TRB_NOOP_CMD:
@@ -518,9 +582,13 @@ static void run_commands(HvXhci *x) {
 
 /* ---- ports ---- */
 
+#define PORT_CONNECTED (PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)SPEED_FULL << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT)
+
 static void port_connect(HvXhci *x) {
-    x->portsc[0] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)SPEED_FULL << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
-    port_event(x, 0);
+    for (int p = 0; p < x->nports; p++) {
+        x->portsc[p] = PORT_CONNECTED;
+        port_event(x, p);
+    }
 }
 
 static void port_write(HvXhci *x, int p, uint32_t v) {
@@ -559,10 +627,10 @@ static void reset(HvXhci *x) {
     memset(x->intr, 0, sizeof x->intr);
     for (int i = 0; i < HV_XHCI_INTRS; i++) x->intr[i].pcs = 1;
     memset(x->slot_used, 0, sizeof x->slot_used);
-    memset(x->ep_running, 0, sizeof x->ep_running);
-    x->kbd_slot = 0;
-    x->configured = 0;
-    x->portsc[0] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)SPEED_FULL << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
+    memset(x->slot_dev, 0, sizeof x->slot_dev);
+    memset(x->dev, 0, sizeof x->dev);
+    x->ptr_posted = 0;
+    for (int p = 0; p < HV_XHCI_PORTS; p++) x->portsc[p] = p < x->nports ? PORT_CONNECTED : PORT_PP;
     update_irq(x);
 }
 
@@ -577,7 +645,7 @@ static uint64_t bar_read(HvPciDev *d, int bar, uint64_t off, unsigned size) {
     if (off < CAPLENGTH) {
         static const uint32_t cap[8] = {
             CAPLENGTH | 0x0100u << 16,                           /* CAPLENGTH, HCIVERSION 1.0 */
-            HV_XHCI_SLOTS | (uint32_t)HV_XHCI_INTRS << 8 | (uint32_t)HV_XHCI_PORTS << 24, /* slots, interrupters, ports */
+            HV_XHCI_SLOTS | (uint32_t)HV_XHCI_INTRS << 8, /* slots, interrupters (ports below) */
             1u << 4,                                             /* ERST max 2 segments */
             0,
             1u | (uint32_t)(XECP / 4) << 16,                     /* 64-bit addressing, extended caps */
@@ -585,12 +653,15 @@ static uint64_t bar_read(HvPciDev *d, int bar, uint64_t off, unsigned size) {
             RT,
             0,
         };
+        uint32_t c[8];
+        memcpy(c, cap, sizeof c);
+        c[1] |= (uint32_t)x->nports << 24;
         uint32_t i = (uint32_t)off / 4;
-        v = cap[i];
-        if (size == 8 && i + 1 < 8) v |= (uint64_t)cap[i + 1] << 32;
+        v = c[i];
+        if (size == 8 && i + 1 < 8) v |= (uint64_t)c[i + 1] << 32;
         v >>= 8 * (off & 3);
-    } else if (off >= XECP && off < XECP + 16) { /* Supported Protocol: USB 2.0 on port 1 */
-        static const uint32_t ext[4] = {2u | 0x0200u << 16, 0x20425355, 1u | (uint32_t)HV_XHCI_PORTS << 8, 0};
+    } else if (off >= XECP && off < XECP + 16) { /* Supported Protocol: USB 2.0 on ports 1..nports */
+        const uint32_t ext[4] = {2u | 0x0200u << 16, 0x20425355, 1u | (uint32_t)x->nports << 8, 0};
         uint32_t i = (uint32_t)(off - XECP) / 4;
         v = ext[i];
         if (size == 8 && i + 1 < 4) v |= (uint64_t)ext[i + 1] << 32;
@@ -608,7 +679,7 @@ static uint64_t bar_read(HvPciDev *d, int bar, uint64_t off, unsigned size) {
         }
     } else if (off >= PORTREGS && off < PORTREGS + 16u * HV_XHCI_PORTS) {
         int p = (int)(off - PORTREGS) / 16;
-        v = (off - PORTREGS) % 16 == 0 ? x->portsc[p] : 0;
+        v = (off - PORTREGS) % 16 == 0 && p < x->nports ? x->portsc[p] : 0;
     } else if (off >= RT && off < RT + 0x20 + 32u * HV_XHCI_INTRS) {
         if (off - RT < 0x20) return 0; /* MFINDEX */
         struct HvXhciIntr *it = &x->intr[(off - RT - 0x20) / 32];
@@ -648,7 +719,8 @@ static void bar_write(HvPciDev *d, int bar, uint64_t off, uint64_t v, unsigned s
             if ((v & 1) && !(x->usbcmd & 1)) { /* run */
                 x->usbcmd = (uint32_t)v;
                 x->usbsts &= ~1u;
-                if (x->portsc[0] & PORT_CSC) port_event(x, 0);
+                for (int p = 0; p < x->nports; p++)
+                    if (x->portsc[p] & PORT_CSC) port_event(x, p);
             } else if (!(v & 1)) {
                 x->usbcmd = (uint32_t)v;
                 x->usbsts |= 1;
@@ -680,7 +752,8 @@ static void bar_write(HvPciDev *d, int bar, uint64_t off, uint64_t v, unsigned s
         case 0x38: x->config = (uint32_t)v; break;
         }
     } else if (off >= PORTREGS && off < PORTREGS + 16u * HV_XHCI_PORTS) {
-        if ((off - PORTREGS) % 16 == 0) port_write(x, (int)(off - PORTREGS) / 16, (uint32_t)v);
+        int p = (int)(off - PORTREGS) / 16;
+        if ((off - PORTREGS) % 16 == 0 && p < x->nports) port_write(x, p, (uint32_t)v);
     } else if (off >= RT + 0x20 && off < RT + 0x20 + 32u * HV_XHCI_INTRS) {
         struct HvXhciIntr *it = &x->intr[(off - RT - 0x20) / 32];
         uint64_t r = (off - RT - 0x20) % 32;
@@ -713,17 +786,25 @@ static void bar_write(HvPciDev *d, int bar, uint64_t off, uint64_t v, unsigned s
         if (slot == 0) {
             x->cmd_running = 1;
             run_commands(x);
-        } else if (slot == x->kbd_slot) {
+        } else if (slot_dev(x, slot)) {
+            HvXhciDev *dv = slot_dev(x, slot);
+            int d = (int)(dv - x->dev);
             int dci = (int)(v & 0xff);
             if (dci < 1 || dci >= HV_XHCI_EPS) return;
             /* A doorbell starts a stopped endpoint again (a halted one waits for Reset Endpoint). */
             uint32_t state = rd32(x, out_ctx(x, slot) + 32ull * dci) & 7;
             if (state == 2) return;
             if (state != 1) set_ep_state(x, slot, dci, 1);
-            x->ep_running[dci] = 1;
-            if (dci == 1) run_ep0(x, slot);
-            else if (dci == KBD_DCI_IN) run_ep_in(x);
-            else if (dci == PTR_DCI_IN) run_ptr_in(x);
+            dv->ep_running[dci] = 1;
+            if (dci == 1) run_ep0(x, d);
+            else if (d == KBD && dci == KBD_DCI_IN) run_ep_in(x);
+            else if (d == TAB && dci == PTR_DCI_IN) {
+                if (!x->ptr_posted) {
+                    x->ptr_posted = 1;
+                    tlog(x, d, "macOS is reading reports: the Android pointer drives it");
+                }
+                run_ptr_in(x);
+            }
         }
     }
 }
@@ -797,6 +878,12 @@ void hv_xhci_pointer(HvXhci *x, int ax, int ay, int buttons) {
     hv_machine_wake(x->m);
 }
 
+int hv_xhci_pointer_live(HvXhci *x) {
+    if (!x || !x->tablet) return 0;
+    HvXhciDev *dv = &x->dev[TAB];
+    return dv->slot && dv->ep_running[PTR_DCI_IN] && __atomic_load_n(&x->ptr_posted, __ATOMIC_RELAXED);
+}
+
 void hv_xhci_poll(HvXhci *x) {
     if (!x) return;
     if (x->rhead != x->rtail) run_ep_in(x);
@@ -809,6 +896,7 @@ HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
     pthread_mutex_init(&x->mu, NULL);
     const char *tab = getenv("HV_USB_TABLET");
     x->tablet = tab && *tab == '1';
+    x->nports = x->tablet ? 2 : 1;
     /* QEMU's xHCI IDs. Class 0x0c0330 with revision 0: macOS's IOPCIClassMatch compares all 32 bits. */
     hv_pci_init(&x->pci, 0x1b36, 0x000d, 0x0c033000, 0x1af4, 0x1100);
     x->pci.opaque = x;
