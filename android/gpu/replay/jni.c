@@ -57,3 +57,32 @@ JNIEXPORT void JNICALL Java_dev_henge_android_GpuView_nativeReimsStop(JNIEnv *en
     reims_host_stop();
 #endif
 }
+
+/* Settings > Mouse: Android's pointer (reims_host_native_pointer). */
+JNIEXPORT void JNICALL Java_dev_henge_android_GpuView_nativeReimsNativePointer(JNIEnv *env, jclass cls, jboolean on) {
+    (void)env, (void)cls;
+#ifdef HENGE_REIMS
+    reims_host_native_pointer(on == JNI_TRUE);
+#else
+    (void)on;
+#endif
+}
+
+/* The Mac's pointer glyph for Android's pointer: premultiplied RGBA when it changed since knownSeq, else
+   null; meta (6 ints): seq, width, height, hot x, hot y, shown. */
+JNIEXPORT jbyteArray JNICALL Java_dev_henge_android_GpuView_nativeReimsCursor(JNIEnv *env, jclass cls, jint knownSeq, jintArray meta) {
+    (void)cls;
+#ifdef HENGE_REIMS
+    static unsigned char buf[512 * 512 * 4];
+    int m[6] = {0};
+    int n = reims_host_cursor((unsigned)knownSeq, buf, (int)sizeof buf, m);
+    if (meta && (*env)->GetArrayLength(env, meta) >= 6) (*env)->SetIntArrayRegion(env, meta, 0, 6, m);
+    if (n <= 0) return NULL;
+    jbyteArray a = (*env)->NewByteArray(env, n);
+    if (a) (*env)->SetByteArrayRegion(env, a, 0, n, (const jbyte *)buf);
+    return a;
+#else
+    (void)env, (void)knownSeq, (void)meta;
+    return NULL;
+#endif
+}

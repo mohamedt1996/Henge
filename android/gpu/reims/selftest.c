@@ -63,7 +63,8 @@ static int mmio(int device, int write, uint64_t off, uint64_t *value) {
     __atomic_store_n(&s->state, HV_REIMS_REQUEST, __ATOMIC_RELEASE);
     syscall(SYS_futex, &s->state, FUTEX_WAKE, 1, NULL, NULL, 0);
     uint64_t until = now_ms() + 5000;
-    while (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != HV_REIMS_REPLY)
+    /* Answered: REPLY for a read, IDLE for a write (writes are posted, 0.3.59). */
+    while (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) == HV_REIMS_REQUEST)
         if (now_ms() > until) return -1;
     if (!write) *value = s->value;
     __atomic_store_n(&s->state, HV_REIMS_IDLE, __ATOMIC_RELEASE);

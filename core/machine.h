@@ -71,6 +71,7 @@ typedef struct HvStats {
     uint64_t tr_waits, tr_wait_ticks;   /* translation lock likewise */
     uint64_t words_inline, words_ool, words_pool; /* translated code size by part */
     uint64_t refills;
+    uint64_t race_gave_up;    /* remote TLBI drops posted after waiting HV_RACE_SPIN_US for the target's walk */
     uint64_t asid_remote, asid_kept; /* TLBIs by ASID done to other CPUs from the TLBI's own; the running process's TLB kept */
     uint64_t pageend_light;   /* page-end loads and stores hv_tlb_refill did itself, not the helper */
     uint64_t ijc_light;       /* branch-cache misses resolved without the dispatcher (hv_ijc_resolve) */         /* TLB misses filled by the light path (hv_tlb_refill) */

@@ -58,7 +58,16 @@ public class ScreenActivity extends Activity {
         view.overlay = vulkan;
         view.macPointer = vulkan && "reims".equals(gpuMode);
         view.trackpad = "trackpad".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("touch", "direct"));
-        if (vulkan) view.setPointerIcon(android.view.PointerIcon.getSystemIcon(this, android.view.PointerIcon.TYPE_NULL));
+        // Settings > Mouse: Android's pointer (the default): a mouse moves Android's own pointer, drawn by the
+        // display at its own rate with the Mac's glyph, and the Mac's goes exactly there (the engine's USB
+        // absolute pointer, HV_USB_TABLET). Captured: the mouse's raw movement drives the Mac's pointer.
+        view.nativePointer = view.macPointer
+                && !"capture".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("mouse", "android"));
+        if (view.macPointer) {
+            try { GpuView.nativeReimsNativePointer(view.nativePointer); } catch (Throwable ignored) { }
+        }
+        if (vulkan) view.setPointerIcon(android.view.PointerIcon.getSystemIcon(this,
+                view.nativePointer ? android.view.PointerIcon.TYPE_ARROW : android.view.PointerIcon.TYPE_NULL));
         root.addView(view);
 
         // A hidden field takes the soft keyboard's text; its characters go to the Mac as keys.
@@ -143,7 +152,35 @@ public class ScreenActivity extends Activity {
         im.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0);
     }
 
-    @Override protected void onResume() { super.onResume(); view.connect(); }
+    @Override protected void onResume() { super.onResume(); immersive(); view.connect(); }
+
+    /** The Mac's screen takes the whole display: the navigation bar too (a swipe from the edge shows it for a
+     *  moment), so Mac screen: Half is exactly half the window and Screen scaling: Sharp doubles each pixel. */
+    private void immersive() {
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                getWindow().setDecorFitsSystemWindows(false);
+                android.view.WindowInsetsController c = getWindow().getInsetsController();
+                if (c != null) {
+                    c.hide(android.view.WindowInsets.Type.systemBars());
+                    c.setSystemBarsBehavior(android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                }
+            } else {
+                getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                        | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+            }
+            android.view.WindowManager.LayoutParams lp = getWindow().getAttributes();
+            lp.layoutInDisplayCutoutMode = android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            getWindow().setAttributes(lp);
+        } catch (Throwable ignored) { }
+    }
+
+    @Override public void onWindowFocusChanged(boolean has) {
+        super.onWindowFocusChanged(has);
+        if (has) immersive();
+    }
     @Override protected void onPause() { super.onPause(); view.disconnect(); }
     @Override protected void onDestroy() { if (gpu != null) gpu.stop(); super.onDestroy(); }
 
@@ -177,11 +214,21 @@ public class ScreenActivity extends Activity {
         boolean overlay;
         /* The screen under this view draws the Mac's own pointer (Graphics: reims): a mouse may be captured. */
         boolean macPointer;
+        boolean nativePointer; // Settings > Mouse: Android's pointer
         /* Settings, Touch: Trackpad. The screen is a laptop's trackpad: a finger moves the Mac's pointer from
            where it is, a tap clicks where it is. Nothing is steered to a place, so nothing depends on reading
            the Mac's cursor back. */
         boolean trackpad;
         private float lastX, lastTouchY;
+
+        /* The window's size, landscape, for Mac screen: Half at the next start (VmService.halfScreen). */
+        @Override protected void onSizeChanged(int w, int h, int ow, int oh) {
+            super.onSizeChanged(w, h, ow, oh);
+            int big = Math.max(w, h), small = Math.min(w, h);
+            if (big >= 1280 && small >= 960)
+                getContext().getSharedPreferences("henge", Context.MODE_PRIVATE).edit()
+                        .putInt("screenWinW", big).putInt("screenWinH", small).apply();
+        }
 
         RfbView(Context c) {
             super(c);
@@ -301,6 +348,7 @@ public class ScreenActivity extends Activity {
                 // A mouse's own movement (250) adds to the one waiting instead.
                 byte[] last = outbox.peekLast();
                 if (b[0] == 5 && last != null && last[0] == 5 && last[1] == b[1]) outbox.pollLast();
+                if ((b[0] & 0xff) == 251 && last != null && (last[0] & 0xff) == 251 && last[1] == b[1]) outbox.pollLast();
                 if ((b[0] & 0xff) == 250 && last != null && (last[0] & 0xff) == 250 && last[1] == b[1]) {
                     int dx = (short) ((last[2] & 0xff) << 8 | (last[3] & 0xff)) + (short) ((b[2] & 0xff) << 8 | (b[3] & 0xff));
                     int dy = (short) ((last[4] & 0xff) << 8 | (last[5] & 0xff)) + (short) ((b[4] & 0xff) << 8 | (b[5] & 0xff));
@@ -403,8 +451,68 @@ public class ScreenActivity extends Activity {
 
         private void captureMouse() {
             // Only over a screen that draws the Mac's own pointer: elsewhere, without Android's, the mouse
-            // would be invisible.
+            // would be invisible. Not with Android's pointer, which is the point of it.
+            if (nativePointer) { cursorPoll(); return; }
             if (macPointer && !noCapture && !hasPointerCapture() && hasWindowFocus()) { requestFocus(); requestPointerCapture(); }
+        }
+
+        /* Settings > Mouse: Android's pointer. Where it is, 0..32767 across the Mac's screen (message 251, the
+           engine's own: buttons, x, y), so the Mac's pointer sits under Android's. */
+        private void absolute(int mask, float x, float y) {
+            if (dst.width() == 0 || dst.height() == 0) return;
+            int ax = Math.max(0, Math.min(32767, (int) ((x - dst.left) * 32768f / dst.width())));
+            int ay = Math.max(0, Math.min(32767, (int) ((y - dst.top) * 32768f / dst.height())));
+            sendAsync(new byte[]{(byte) 251, (byte) mask, (byte) (ax >> 8), (byte) ax, (byte) (ay >> 8), (byte) ay});
+        }
+
+        /* Android's pointer wears the Mac's glyph (an arrow, a text beam, a hand...), at the size the Mac's
+           screen is drawn, and hides when the Mac hides its own. Looked at 20 times a second while a mouse is
+           in use; a new icon only when the glyph or its scale changed. */
+        private int cursorSeq = -1;
+        private float cursorScale;
+        private boolean cursorShown = true, cursorPolling;
+        private long cursorUntil;
+        private final int[] cursorMeta = new int[6];
+        private final Runnable cursorTick = new Runnable() {
+            @Override public void run() {
+                cursorUpdate();
+                if (android.os.SystemClock.uptimeMillis() < cursorUntil) postDelayed(this, 50);
+                else cursorPolling = false;
+            }
+        };
+
+        private void cursorPoll() {
+            cursorUntil = android.os.SystemClock.uptimeMillis() + 3000; // looked at until 3 s after the mouse last moved
+            if (cursorPolling) return;
+            cursorPolling = true;
+            cursorUpdate();
+            postDelayed(cursorTick, 50);
+        }
+
+        private void cursorUpdate() {
+            if (!nativePointer || fbW == 0 || dst.width() == 0) return;
+            float s = dst.width() / (float) fbW;
+            byte[] px;
+            try { px = GpuView.nativeReimsCursor(s == cursorScale ? cursorSeq : -1, cursorMeta); } catch (Throwable t) { return; }
+            boolean shown = cursorMeta[5] != 0;
+            if (px == null && shown == cursorShown) return;
+            cursorShown = shown;
+            if (!shown) {
+                setPointerIcon(android.view.PointerIcon.getSystemIcon(getContext(), android.view.PointerIcon.TYPE_NULL));
+                cursorSeq = cursorMeta[0];
+                return;
+            }
+            if (px == null) { cursorSeq = -1; return; } // shown again: fetch the glyph next time
+            int w = cursorMeta[1], h = cursorMeta[2];
+            if (w <= 0 || h <= 0 || px.length < w * h * 4) return;
+            Bitmap b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            b.copyPixelsFromBuffer(java.nio.ByteBuffer.wrap(px, 0, w * h * 4)); // RGBA, premultiplied: as Bitmap holds it
+            int sw = Math.max(1, Math.round(w * s)), sh = Math.max(1, Math.round(h * s));
+            if (sw != w || sh != h) b = Bitmap.createScaledBitmap(b, sw, sh, true);
+            float hx = Math.max(0, Math.min(sw - 1, cursorMeta[3] * s)), hy = Math.max(0, Math.min(sh - 1, cursorMeta[4] * s));
+            setPointerIcon(android.view.PointerIcon.create(b, hx, hy));
+            cursorSeq = cursorMeta[0];
+            cursorScale = s;
         }
 
         @Override public void onWindowFocusChanged(boolean has) {
@@ -449,6 +557,24 @@ public class ScreenActivity extends Activity {
             if (!isMouse(e)) return super.onGenericMotionEvent(e);
             captureMouse(); // from the next event on, the mouse comes through onCapturedPointerEvent
             layoutScreen();
+            if (nativePointer) {
+                switch (e.getActionMasked()) {
+                case MotionEvent.ACTION_HOVER_MOVE:
+                case MotionEvent.ACTION_HOVER_ENTER:
+                case MotionEvent.ACTION_BUTTON_PRESS:
+                case MotionEvent.ACTION_BUTTON_RELEASE:
+                    buttons = mouseButtons(e);
+                    absolute(buttons, e.getX(), e.getY());
+                    return true;
+                case MotionEvent.ACTION_SCROLL: {
+                    float v = e.getAxisValue(MotionEvent.AXIS_VSCROLL), hz = e.getAxisValue(MotionEvent.AXIS_HSCROLL);
+                    int b = buttons | (v > 0 ? 8 : v < 0 ? 16 : 0) | (hz < 0 ? 32 : hz > 0 ? 64 : 0);
+                    if (b != buttons) { absolute(b, e.getX(), e.getY()); absolute(buttons, e.getX(), e.getY()); }
+                    return true;
+                }
+                }
+                return super.onGenericMotionEvent(e);
+            }
             switch (e.getActionMasked()) {
             case MotionEvent.ACTION_HOVER_MOVE:
             case MotionEvent.ACTION_HOVER_ENTER:
@@ -476,7 +602,8 @@ public class ScreenActivity extends Activity {
                 captureMouse();
                 // Android sends a mouse's button presses as touch down/up too: the button state is the truth.
                 buttons = mouseButtons(e);
-                pointer(buttons, e.getX(), e.getY());
+                if (nativePointer) absolute(buttons, e.getX(), e.getY()); // a drag: the pointer goes with it
+                else pointer(buttons, e.getX(), e.getY());
                 return true;
             }
             switch (e.getActionMasked()) {

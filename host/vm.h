@@ -71,6 +71,11 @@ const char *hv_vm_reason_name(int reason);
 void hv_vm_key(uint16_t code, int down);
 void hv_vm_key_hid(uint8_t usage, int down); /* HID keyboard usage, which is what iOS reports for a hardware keyboard */
 void hv_vm_mouse_move(int dx, int dy);
+/* The USB absolute pointer (HV_USB_TABLET=1, xhci.c): x, y from 0 to 32767 across the Mac's screen, buttons
+   bit 0 left, 1 right, 2 middle. Nothing without the tablet. */
+void hv_vm_tablet(int x, int y, int buttons);
+/* 1 if the Mac has the absolute pointer. */
+int hv_vm_has_tablet(void);
 void hv_vm_mouse_button(int button, int down); /* 0 left, 1 right, 2 middle */
 void hv_vm_mouse_wheel(int dy);
 void hv_vm_mouse_hwheel(int dx);

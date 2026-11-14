@@ -605,6 +605,16 @@ public class MainActivity extends Activity {
         tnote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(tnote);
         c.addView(hairline());
+        final boolean captured = "capture".equals(prefs.getString("mouse", "android"));
+        c.addView(choiceRow("Mouse", new String[]{"Android's pointer", "Captured"}, captured ? 1 : 0,
+                i -> { prefs.edit().putString("mouse", i == 0 ? "android" : "capture").apply(); render(true); }));
+        TextView mnote = text(captured
+                ? "A mouse's raw movement moves the Mac's pointer, with the Mac's own speed and acceleration; Android's pointer is hidden. Takes effect at the next start."
+                : "A mouse moves Android's own pointer, drawn by the tablet's display as fast as it refreshes and dressed as the Mac's (arrow, text beam, hand), and the Mac's pointer is put exactly under it, so it moves like a real mouse and clicks land where you see them. Uses Android's pointer speed. Takes effect at the next start.",
+                13, DIM, false);
+        mnote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(mnote);
+        c.addView(hairline());
         if ("reims".equals(prefs.getString("gpu", "on"))) {
             final java.io.File copyAll = new java.io.File(VmService.reimsHomeDir(this), "copy-in-all");
             c.addView(choiceRow("GPU memory checks", new String[]{"Used", "Everything"}, copyAll.exists() ? 1 : 0,
@@ -714,15 +724,17 @@ public class MainActivity extends Activity {
                 }
             }
         }
-        final int[] jitSizes = {0, 512, 384, 256};
-        int jitNow = 0;
+        final int[] jitSizes = {1024, 0, 512, 384, 256};
+        int jitNow = 1;
         for (int i = 0; i < jitSizes.length; i++) if (jitSizes[i] == prefs.getInt("jitMb", 0)) jitNow = i;
-        c.addView(choiceRow("JIT cache", new String[]{"768 MB", "512", "384", "256"}, jitNow,
+        c.addView(choiceRow("JIT cache", new String[]{"1 GB", "768 MB", "512", "384", "256"}, jitNow,
                 i -> { prefs.edit().putInt("jitMb", jitSizes[i]).apply(); render(true); }));
         TextView jnote = text("Room for the Mac's code as the CPU engine translates it. When it fills, all of it is dropped and its "
                 + "memory given back to Android, then code is translated again as it runs. Smaller leaves the tablet more memory "
                 + "and re-translates more often: at 384 the Mi Pad 7 dropped it one to three times every 30 seconds with four "
-                + "Mac apps open. If the tablet is short of memory (the log's \"memory available\"), try 512 first.", 13, DIM, false);
+                + "Mac apps open. If the tablet is short of memory (the log's \"memory available\"), try 512 first. "
+                + "1 GB: at 768 the Mi Pad 7 still dropped it every minute and a half, and over half of what it then translated "
+                + "was code it had before; 1 GB drops it less often for about 350 MB more of the tablet's memory.", 13, DIM, false);
         jnote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(jnote);
         c.addView(hairline());

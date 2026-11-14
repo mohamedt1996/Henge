@@ -7,6 +7,7 @@
 #include "memop.h"
 #include "mmu.h"
 #include "operands.h"
+#include "sysreg.h"
 
 /* A block has two parts. The hot part is the code that runs every time: the translated
    instructions. The cold part is what hardly ever does: exits not chained yet, memory slow
@@ -1387,7 +1388,9 @@ static int translate_msr_inline(Emit *e, uint32_t insn, uint64_t pc) {
 static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical) {
     static int type = -1;
 #ifdef __linux__
-    type = 0; /* no Darwin commpage; the host counter's rate also differs: helper reads the 24 MHz clock */
+    /* No Darwin commpage. Where the engine's clock is the CPU's counter (mach_time.h: 24 MHz as it is,
+       19.2 MHz times 5/4), the same two instructions it reads; anything else: the helper. */
+    type = hv_counter_mode() ? 3 : 0;
 #else
     if (type < 0) type = *(volatile uint8_t *)(uintptr_t)COMMPAGE_TIMEBASE_TYPE;
 #endif
@@ -1402,11 +1405,17 @@ static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical) 
     uint32_t slow = e->nool - 1;
     int el0 = !(e->flags & HV_BLOCK_EL1);
     int r = is_stolen(rt) ? 15 : rt;
-    if (type == 1) put(e, 0xd5033fdfu);                                  /* isb; then CNTVCT_EL0 */
-    put(e, (type == 1 ? 0xd53be040u : type == 2 ? 0xd53be0c0u : 0xd53cfac0u) | (uint32_t)r);
-    put_lit(e, 6, COMMPAGE_TIMEBASE_OFFSET);
-    put(e, LDR_X(6, 6, 0));
-    put(e, ADD_LSL(r, r, 6, 0));
+    if (type == 3) { /* Linux: isb; mrs r, cntvct_el0; for 19.2 MHz add r, r, r, lsr #2 (mach_time.h) */
+        put(e, 0xd5033fdfu);
+        put(e, 0xd53be040u | (uint32_t)r);
+        if (hv_counter_mode() == 2) put(e, 0x8b400000u | (uint32_t)r << 16 | 2u << 10 | (uint32_t)r << 5 | (uint32_t)r);
+    } else {
+        if (type == 1) put(e, 0xd5033fdfu);                                  /* isb; then CNTVCT_EL0 */
+        put(e, (type == 1 ? 0xd53be040u : type == 2 ? 0xd53be0c0u : 0xd53cfac0u) | (uint32_t)r);
+        put_lit(e, 6, COMMPAGE_TIMEBASE_OFFSET);
+        put(e, LDR_X(6, 6, 0));
+        put(e, ADD_LSL(r, r, 6, 0));
+    }
     if (r != rt) put(e, STR_X(r, 28, slot_of(rt)));
     if (el0) e->ool[slow].join = e->n;
     return 1;

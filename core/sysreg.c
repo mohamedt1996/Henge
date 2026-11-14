@@ -34,9 +34,44 @@ uint64_t hv_counter(void) {
     return counter();
 }
 
+int hv_counter_mode(void) {
+#ifdef __linux__
+    return hv_cnt_mode();
+#else
+    return 0;
+#endif
+}
+
 static int undefined(HvCpu *cpu, uint64_t pc) {
     hv_raise_undef(cpu, pc);
     return 1;
+}
+
+/* A remote TLBI drop that raced the target's page walk or branch-cache fill (walk_seq or ijc_seq odd) is
+   tried again once they are over, instead of after a fixed 64 yields: a walk takes a few microseconds,
+   and the post it would otherwise become costs about 20 (0.3.58's log: 1.4 to 2.4 thousand raced posts a
+   second, waited for by 3 to 10% of one CPU). Waits at most HV_RACE_SPIN_US (default 15) in all. */
+static uint64_t race_budget_ticks(void) {
+    static int64_t t = -1;
+    if (t < 0) {
+        const char *v = getenv("HV_RACE_SPIN_US");
+        t = (v && *v ? atoll(v) : 15) * 24; /* 24 MHz ticks */
+    }
+    return (uint64_t)t;
+}
+
+static int target_busy(HvCpu *c) {
+    HvPerCpu *p = c->pc_state;
+    return p && ((__atomic_load_n(&p->walk_seq, __ATOMIC_ACQUIRE) | __atomic_load_n(&p->ijc_seq, __ATOMIC_ACQUIRE)) & 1);
+}
+
+/* Waits (spinning) until c is neither walking nor filling, or until the deadline; 0 at the deadline. */
+static int wait_target_quiet(HvCpu *c, uint64_t deadline) {
+    for (unsigned n = 0;; n++) {
+        if (!target_busy(c)) return 1;
+        __asm__ volatile("yield");
+        if ((n & 15) == 15 && mach_absolute_time() >= deadline) return 0;
+    }
 }
 
 /* Timer control: ISTATUS (bit 2) reflects the compare right now. */
@@ -498,8 +533,11 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
                 if (!c || c == cpu) continue;
                 if (by_asid) {
                     int r = 0;
-                    for (int t = 0; t < 4 && (r = hv_tlbi_drop_remote_asid(c, (int)(xt >> 48))) == 0; t++)
-                        for (int s = 0; s < 64; s++) __asm__ volatile("yield");
+                    uint64_t deadline = 0;
+                    for (int t = 0; t < 8 && (r = hv_tlbi_drop_remote_asid(c, (int)(xt >> 48))) == 0; t++) {
+                        if (!deadline) deadline = mach_absolute_time() + race_budget_ticks();
+                        if (!wait_target_quiet(c, deadline)) break;
+                    }
                     if (r == 1) {
                         if (m->stats_interval) m->stats.asid_remote++;
                         continue;
@@ -512,8 +550,12 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
                 for (uint64_t p = 0; done && p < npages; p++) {
                     uint64_t pva = va + (p << HV_TLB_PAGE_BITS);
                     int r = 0;
-                    for (int t = 0; t < 4 && (r = hv_tlbi_drop_remote_va(c, pva, asid)) == 0; t++)
-                        for (int s = 0; s < 64; s++) __asm__ volatile("yield");
+                    uint64_t deadline = 0;
+                    for (int t = 0; t < 8 && (r = hv_tlbi_drop_remote_va(c, pva, asid)) == 0; t++) {
+                        if (!deadline) deadline = mach_absolute_time() + race_budget_ticks();
+                        if (!wait_target_quiet(c, deadline)) break;
+                    }
+                    if (r == 0 && deadline && m->stats_interval) m->stats.race_gave_up++;
                     done = r == 1;
                     if (r < 0) why = 3;
                 }

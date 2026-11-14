@@ -23,7 +23,7 @@ DEVS = $(basename $(notdir $(wildcard devices/*.c)))
 ENGINE = $(CORE:%=$(B)/%.o) $(B)/jit_region.o $(B)/disk.o $(B)/enter.o
 DEV = $(DEVS:%=$(B)/%.o) $(B)/pvg_android.o
 ASM = $(A)/harness.h $(A)/harness.S $(patsubst tests/%,$(A)/%,$(wildcard tests/*_programs.S tests/*_cases.s))
-TESTS = $(B)/test_classify $(B)/test_operands $(B)/test_jit_region $(B)/test_mmu $(B)/test_xchain $(B)/test_jit $(B)/test_mem $(B)/test_exc $(B)/test_devices
+TESTS = $(B)/test_classify $(B)/test_operands $(B)/test_jit_region $(B)/test_mmu $(B)/test_xchain $(B)/test_jit $(B)/test_mem $(B)/test_exc $(B)/test_devices $(B)/test_xhci $(B)/test_reims_link
 
 all: $(B)/libhengevm.a $(B)/hengevm-android $(TESTS)
 
@@ -117,6 +117,10 @@ $(B)/test_mmu: tests/test_mmu.c $(ENGINE)
 	$(T) $^ $(LIBS) -o $@
 $(B)/test_xchain: tests/test_xchain.c $(ENGINE)
 	$(T) $^ $(LIBS) -o $@
+$(B)/test_reims_link: tests/test_reims_link.c android/pvg_reims.c android/gpu/reims_link.h $(ENGINE) $(DEV)
+	$(T) tests/test_reims_link.c $(ENGINE) $(DEV) $(LIBS) -o $@
+$(B)/test_xhci: tests/test_xhci.c $(ENGINE) $(DEV)
+	$(T) tests/test_xhci.c $(ENGINE) $(DEV) $(LIBS) -o $@
 $(B)/test_devices: tests/test_devices.c $(ASM) $(ENGINE) $(DEV)
 	$(T) tests/test_devices.c $(A)/devices_programs.S $(A)/harness.S $(ENGINE) $(DEV) $(LIBS) -o $@
 $(B)/test_%: tests/test_%.c $(ASM) $(ENGINE)

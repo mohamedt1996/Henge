@@ -7,8 +7,8 @@ android {
         applicationId 'dev.henge.android'
         minSdk 29
         targetSdk 34
-        versionCode 63
-        versionName '0.3.58'
+        versionCode 64
+        versionName '0.3.59'
         ndk { abiFilters 'arm64-v8a' }
     }
     // One key for every build (CI's runners make a new debug key each run, and Android only updates an

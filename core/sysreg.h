@@ -13,6 +13,9 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc);
 
 /* The guest's counter (CNTPCT): host mach_absolute_time, which runs at 24 MHz. */
 uint64_t hv_counter(void);
+/* How translated code reads the counter on this host: 0 through the helper, 1 the CPU's counter as it is
+   (24 MHz), 2 the CPU's counter times 5/4 (19.2 MHz). Always 0 on Darwin, which has its own path. */
+int hv_counter_mode(void);
 
 /* One TLBI on one CPU's own TLB and branch cache. */
 void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_t op2, uint64_t xt);

@@ -9,7 +9,10 @@
    INTx) with a USB HID boot keyboard on port 1: what Virtualization.framework
    gives a macOS guest as its "Virtual USB Keyboard", and so the keyboard path
    macOS takes. Key changes come from the host UI on any thread
-   (hv_xhci_key); the CPU thread delivers them (hv_xhci_poll). */
+   (hv_xhci_key); the CPU thread delivers them (hv_xhci_poll).
+   With HV_USB_TABLET=1 in the environment the device is a composite one: interface 1 is an absolute
+   pointer (QEMU's usb-tablet report, which macOS drives with its generic HID pointer driver), so a host
+   pointer can put the Mac's exactly where it is (hv_xhci_pointer) instead of steering a relative mouse. */
 #define HV_XHCI_SLOTS 8
 #define HV_XHCI_PORTS 1
 #define HV_XHCI_INTRS 4
@@ -50,6 +53,11 @@ typedef struct HvXhci {
     uint32_t rhead, rtail;
     uint8_t state[8];      /* modifiers, reserved, six keys: the current report */
     uint64_t delivered;
+    /* the absolute pointer (interface 1, endpoint 2 IN), when HV_USB_TABLET=1: buttons, x, y (0..32767), wheel */
+    int tablet;
+    uint8_t preports[HV_XHCI_REPORTS][6];
+    uint32_t phead, ptail;
+    uint8_t pstate[6];
 } HvXhci;
 
 HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus);
@@ -57,6 +65,9 @@ HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus);
 void hv_xhci_key(HvXhci *x, uint8_t usage, int down);
 /* The same, by Linux input key code (what the host UI produces). */
 void hv_xhci_key_linux(HvXhci *x, uint16_t code, int down);
+/* Any thread, HV_USB_TABLET=1 only: the absolute pointer at x, y (0..32767 across the Mac's screen) with
+   buttons (bit 0 left, 1 right, 2 middle). */
+void hv_xhci_pointer(HvXhci *x, int ax, int ay, int buttons);
 /* CPU thread: hand waiting reports to the guest. */
 void hv_xhci_poll(HvXhci *x);
 

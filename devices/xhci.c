@@ -44,6 +44,7 @@ enum { CC_SUCCESS = 1, CC_TRB_ERROR = 5, CC_STALL = 6, CC_SLOTS_FULL = 9, CC_SHO
 #define SPEED_FULL 1
 
 #define KBD_DCI_IN 3 /* endpoint 1 IN */
+#define PTR_DCI_IN 5 /* endpoint 2 IN: the absolute pointer (HV_USB_TABLET=1) */
 
 /* ---- the keyboard's descriptors (USB HID 1.11 boot keyboard) ---- */
 
@@ -65,6 +66,26 @@ static const uint8_t config_desc[34] = {
     9, 4, 0, 0, 1, 3, 1, 1, 0,                /* interface 0: HID, boot, keyboard */
     9, 0x21, 0x11, 0x01, 0, 1, 0x22, sizeof report_desc, 0, /* HID 1.11, one report descriptor */
     7, 5, 0x81, 3, 8, 0, 10,                  /* EP1 IN, interrupt, 8 bytes, every 10 ms */
+};
+
+/* HV_USB_TABLET=1: interface 1, an absolute pointer. QEMU's usb-tablet report (three buttons, X and Y
+   0..32767, a wheel), which macOS guests drive with the generic HID pointer driver. */
+static const uint8_t ptr_report_desc[] = {
+    0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x03,
+    0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x05, 0x81, 0x01,
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00, 0x26, 0xff, 0x7f, 0x35, 0x00, 0x46, 0xff, 0x7f,
+    0x75, 0x10, 0x95, 0x02, 0x81, 0x02, 0x05, 0x01, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7f, 0x35, 0x00,
+    0x45, 0x00, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06, 0xc0, 0xc0,
+};
+
+static const uint8_t config_desc_tablet[59] = {
+    9, 2, 59, 0, 2, 1, 0, 0xa0, 50,           /* two interfaces, remote wakeup, 100 mA */
+    9, 4, 0, 0, 1, 3, 1, 1, 0,                /* interface 0: HID, boot, keyboard */
+    9, 0x21, 0x11, 0x01, 0, 1, 0x22, sizeof report_desc, 0,
+    7, 5, 0x81, 3, 8, 0, 10,                  /* EP1 IN, interrupt, 8 bytes, every 10 ms */
+    9, 4, 1, 0, 1, 3, 0, 0, 0,                /* interface 1: HID, no boot protocol (an absolute pointer) */
+    9, 0x21, 0x11, 0x01, 0, 1, 0x22, sizeof ptr_report_desc, 0,
+    7, 5, 0x82, 3, 8, 0, 1,                   /* EP2 IN, interrupt, 8 bytes, every 1 ms: the pointer as it moves */
 };
 
 static const char *const strings[] = {NULL, "HengeVM", "HengeVM USB Keyboard", "1"};
@@ -197,6 +218,7 @@ static int control(HvXhci *x, const uint8_t setup[8], uint8_t *out, int max) {
     if (type == 0x80 && req == 6) { /* GET_DESCRIPTOR (device) */
         uint8_t dt = value >> 8, idx = value & 0xff;
         if (dt == 1) src = device_desc, len = sizeof device_desc;
+        else if (dt == 2 && x->tablet) src = config_desc_tablet, len = sizeof config_desc_tablet;
         else if (dt == 2) src = config_desc, len = sizeof config_desc;
         else if (dt == 3) {
             if (idx == 0) {
@@ -212,9 +234,10 @@ static int control(HvXhci *x, const uint8_t setup[8], uint8_t *out, int max) {
                 return -1;
         } else
             return -1; /* no device qualifier: full speed only */
-    } else if (type == 0x81 && req == 6) { /* GET_DESCRIPTOR (interface): HID, report */
-        if ((value >> 8) == 0x22) src = report_desc, len = sizeof report_desc;
-        else if ((value >> 8) == 0x21) src = config_desc + 18, len = 9;
+    } else if (type == 0x81 && req == 6) { /* GET_DESCRIPTOR (interface): HID, report; wIndex: the interface */
+        int pi = x->tablet && setup[4] == 1;
+        if ((value >> 8) == 0x22) src = pi ? ptr_report_desc : report_desc, len = pi ? (int)sizeof ptr_report_desc : (int)sizeof report_desc;
+        else if ((value >> 8) == 0x21) src = pi ? config_desc_tablet + 43 : config_desc + 18, len = 9;
         else return -1;
     } else if (type == 0x80 && req == 0) { /* GET_STATUS */
         tmp[0] = 0, tmp[1] = 0;
@@ -232,7 +255,8 @@ static int control(HvXhci *x, const uint8_t setup[8], uint8_t *out, int max) {
         tmp[0] = 0;
         src = tmp, len = 1;
     } else if (type == 0xa1 && req == 1) { /* GET_REPORT */
-        src = x->state, len = 8;
+        if (x->tablet && setup[4] == 1) src = x->pstate, len = 6;
+        else src = x->state, len = 8;
     } else if (type == 0xa1 && (req == 2 || req == 3)) { /* GET_IDLE, GET_PROTOCOL */
         tmp[0] = req == 3 ? 1 : 0;
         src = tmp, len = 1;
@@ -314,6 +338,28 @@ static void run_ep_in(HvXhci *x) {
         x->rhead++;
         x->delivered++;
         transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, KBD_DCI_IN);
+    }
+    pthread_mutex_unlock(&x->mu);
+}
+
+/* The same for the absolute pointer's reports (HV_USB_TABLET=1). */
+static void run_ptr_in(HvXhci *x) {
+    int slot = x->kbd_slot;
+    if (!slot || !x->tablet || !x->ep_running[PTR_DCI_IN]) return;
+    HvXhciRing *r = &x->ep[PTR_DCI_IN];
+    uint32_t trb[4];
+    uint64_t at;
+    pthread_mutex_lock(&x->mu);
+    while (x->phead != x->ptail && ring_peek(x, r, trb, &at)) {
+        int type = (trb[3] >> 10) & 0x3f;
+        ring_advance(r);
+        if (type != TRB_NORMAL) continue;
+        uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
+        uint32_t want = trb[2] & 0x1ffff;
+        uint32_t n = want < 6 ? want : 6;
+        wr(x, buf, x->preports[x->phead % HV_XHCI_REPORTS], n);
+        x->phead++;
+        transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, PTR_DCI_IN);
     }
     pthread_mutex_unlock(&x->mu);
 }
@@ -677,6 +723,7 @@ static void bar_write(HvPciDev *d, int bar, uint64_t off, uint64_t v, unsigned s
             x->ep_running[dci] = 1;
             if (dci == 1) run_ep0(x, slot);
             else if (dci == KBD_DCI_IN) run_ep_in(x);
+            else if (dci == PTR_DCI_IN) run_ptr_in(x);
         }
     }
 }
@@ -732,15 +779,36 @@ void hv_xhci_key_linux(HvXhci *x, uint16_t code, int down) {
     if (code < 256) hv_xhci_key(x, linux_to_hid[code], down);
 }
 
+void hv_xhci_pointer(HvXhci *x, int ax, int ay, int buttons) {
+    if (!x || !x->tablet) return;
+    ax = ax < 0 ? 0 : ax > 32767 ? 32767 : ax;
+    ay = ay < 0 ? 0 : ay > 32767 ? 32767 : ay;
+    uint8_t r[6] = {(uint8_t)(buttons & 7), (uint8_t)ax, (uint8_t)(ax >> 8), (uint8_t)ay, (uint8_t)(ay >> 8), 0};
+    pthread_mutex_lock(&x->mu);
+    memcpy(x->pstate, r, 6);
+    /* A move with the same buttons as the newest waiting one replaces it: only where the pointer is now
+       matters, and a guest that reads slowly is not left walking an old path. A button change always queues. */
+    uint32_t waiting = x->ptail - x->phead;
+    uint8_t *last = waiting ? x->preports[(x->ptail - 1) % HV_XHCI_REPORTS] : NULL;
+    if (last && last[0] == r[0]) memcpy(last, r, 6);
+    else if (waiting < HV_XHCI_REPORTS) memcpy(x->preports[x->ptail++ % HV_XHCI_REPORTS], r, 6);
+    else memcpy(last, r, 6);
+    pthread_mutex_unlock(&x->mu);
+    hv_machine_wake(x->m);
+}
+
 void hv_xhci_poll(HvXhci *x) {
-    if (!x || x->rhead == x->rtail) return;
-    run_ep_in(x);
+    if (!x) return;
+    if (x->rhead != x->rtail) run_ep_in(x);
+    if (x->phead != x->ptail) run_ptr_in(x);
 }
 
 HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
     HvXhci *x = calloc(1, sizeof *x);
     x->m = m;
     pthread_mutex_init(&x->mu, NULL);
+    const char *tab = getenv("HV_USB_TABLET");
+    x->tablet = tab && *tab == '1';
     /* QEMU's xHCI IDs. Class 0x0c0330 with revision 0: macOS's IOPCIClassMatch compares all 32 bits. */
     hv_pci_init(&x->pci, 0x1b36, 0x000d, 0x0c033000, 0x1af4, 0x1100);
     x->pci.opaque = x;

@@ -73,4 +73,9 @@ public class GpuView extends SurfaceView implements SurfaceHolder.Callback {
         return f.exists() ? f : null;
     }
     static native void nativeReimsStop();
+    /** Settings > Mouse: Android's pointer: the Mac's pointer left out of the frames (Android draws it). */
+    static native void nativeReimsNativePointer(boolean on);
+    /** The Mac's pointer glyph when it changed since knownSeq (premultiplied RGBA), else null; meta gets
+     *  {seq, width, height, hot x, hot y, shown}. */
+    static native byte[] nativeReimsCursor(int knownSeq, int[] meta);
 }

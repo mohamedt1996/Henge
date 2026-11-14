@@ -64,6 +64,7 @@ typedef struct {
     uint8_t *glyph;
     uint32_t gw, gh;
     int hx, hy, cursor_on;
+    unsigned glyph_seq; /* each glyph or show/hide: for the app's pointer (reims_host_cursor) */
     Replay *sink;
     pthread_mutex_t show_lock; /* held while a frame is written to the sink: reims_host_set_sink waits for it.
                                   Taken before `lock`, never while holding it. */
@@ -343,6 +344,7 @@ static void on_glyph(void *ctx, const RvgCursorGlyph *g) {
     pthread_mutex_lock(&h->lock);
     free(h->glyph);
     h->glyph = copy, h->gw = g->width, h->gh = g->height, h->hx = g->hot_spot.x, h->hy = g->hot_spot.y;
+    h->glyph_seq++;
     h->cursor_changed = 1;
     pthread_cond_signal(&h->wake);
     pthread_mutex_unlock(&h->lock);
@@ -360,6 +362,7 @@ static void on_show(void *ctx, uint8_t show) {
     Host *h = ctx;
     publish_cursor(h);
     pthread_mutex_lock(&h->lock);
+    if (h->cursor_on != (show != 0)) h->glyph_seq++;
     h->cursor_on = show != 0, h->cursor_changed = 1;
     pthread_cond_signal(&h->wake);
     pthread_mutex_unlock(&h->lock);
@@ -376,9 +379,12 @@ static void publish_cursor(Host *h) {
     __atomic_store_n(&x->cursor_seq, (seq | 1u) + 1u, __ATOMIC_RELEASE);
 }
 
+static volatile int native_pointer; /* reims_host_native_pointer */
+
 static void on_move(void *ctx) {
     Host *h = ctx;
     publish_cursor(h);
+    if (native_pointer) return; /* Android draws the pointer: a move changes no frame */
     pthread_mutex_lock(&h->lock);
     h->cursor_changed = 1;
     pthread_cond_signal(&h->wake);
@@ -396,7 +402,7 @@ static void pointer_lift(Host *h, uint8_t *px) {
    glyph is the callbacks'). Nothing is drawn over the frame when this is called. */
 static void pointer_drop(Host *h, uint8_t *px) {
     h->uw = h->uh = 0;
-    if (!h->cursor_on || !h->glyph || !h->disp) return;
+    if (native_pointer || !h->cursor_on || !h->glyph || !h->disp) return;
     RvgDisplayCoord at = rvg_display_cursor_position(h->disp);
     int x0 = (int)at.x - h->hx, y0 = (int)at.y - h->hy;
     int x1 = x0 + (int)h->gw, y1 = y0 + (int)h->gh;
@@ -597,7 +603,9 @@ static void *slot_loop(void *arg) {
         }
         s->value = v;
         h->mmio++;
-        __atomic_store_n(&s->state, HV_REIMS_REPLY, __ATOMIC_RELEASE);
+        /* A write is done with IDLE: the engine posts writes and does not come back for an answer
+           (pvg_reims.c), so this slot can sleep on IDLE again at once. A read is answered with REPLY. */
+        __atomic_store_n(&s->state, asked.write ? HV_REIMS_IDLE : HV_REIMS_REPLY, __ATOMIC_RELEASE);
         futex(&s->state, FUTEX_WAKE, 1, NULL);
         idle_since = now_ns();
         reg_note(h, &asked, sent && taken > sent ? taken - sent : 0, idle_since - taken);
@@ -1014,6 +1022,31 @@ void reims_host_stop(void) {
 }
 
 int reims_host_running(void) { return H != NULL; }
+
+void reims_host_native_pointer(int on) {
+    native_pointer = on != 0;
+    Host *h = H;
+    if (!h) return;
+    pthread_mutex_lock(&h->lock);
+    h->cursor_changed = 1; /* lifted from (or drawn into) the frame now */
+    pthread_cond_signal(&h->wake);
+    pthread_mutex_unlock(&h->lock);
+}
+
+int reims_host_cursor(unsigned known_seq, unsigned char *out, int cap, int meta[6]) {
+    Host *h = H;
+    if (!h) return -1;
+    pthread_mutex_lock(&h->lock);
+    int n = -1;
+    meta[0] = (int)h->glyph_seq, meta[1] = (int)h->gw, meta[2] = (int)h->gh, meta[3] = h->hx, meta[4] = h->hy, meta[5] = h->cursor_on;
+    if (h->glyph) {
+        n = 0;
+        size_t need = (size_t)h->gw * h->gh * 4;
+        if (h->glyph_seq != known_seq && out && (size_t)cap >= need) memcpy(out, h->glyph, need), n = (int)need;
+    }
+    pthread_mutex_unlock(&h->lock);
+    return n;
+}
 
 void reims_host_set_sink(Replay *r) {
     pthread_mutex_lock(&host_lock);

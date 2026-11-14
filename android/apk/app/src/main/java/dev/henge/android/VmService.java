@@ -44,6 +44,12 @@ public class VmService extends Service {
      *  Mi Pad 7's 3200x2136, so the Mac's pixels are exactly 2x2 of the tablet's (Screen scaling: Sharp). */
     public static String halfScreen(Context c) {
         int w = 0, h = 0;
+        // The window the Mac's screen was last shown in (ScreenActivity), where it was a full-screen one: a
+        // navigation bar or a cutout makes it smaller than the panel (0.3.58's log: 3200x2067), and only half
+        // the window fits it a whole number of times (Screen scaling: Sharp).
+        android.content.SharedPreferences p = c.getSharedPreferences("henge", Context.MODE_PRIVATE);
+        int ww = p.getInt("screenWinW", 0), wh = p.getInt("screenWinH", 0);
+        if (ww >= 1280 && wh >= 960) return (ww / 2 & ~1) + "x" + (wh / 2 & ~1);
         try {
             android.hardware.display.DisplayManager dm = c.getSystemService(android.hardware.display.DisplayManager.class);
             android.view.Display.Mode m = dm.getDisplay(android.view.Display.DEFAULT_DISPLAY).getMode();
@@ -392,6 +398,10 @@ public class VmService extends Service {
             // The Mac's disk: the data is flushed at each of macOS's flushes (fdatasync), not the file's times too.
             pb.environment().put("HV_FLUSH", "2");
             // Graphics: reims: the Mac's screen size (Settings), every pixel of which is copied on this driver.
+            // Settings > Mouse: Android's pointer: the Mac gets a USB absolute pointer beside its keyboard
+            // (devices/xhci.c), which Android's pointer drives (ScreenActivity, message 251).
+            pb.environment().put("HV_USB_TABLET",
+                    "capture".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("mouse", "android")) ? "0" : "1");
             if (reims) {
                 String macScreen = getSharedPreferences("henge", MODE_PRIVATE).getString("reimsMode", "1280x800");
                 pb.environment().put("HV_REIMS_MODE", "half".equals(macScreen) ? halfScreen(this) : macScreen);

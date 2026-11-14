@@ -410,6 +410,14 @@ void hv_vm_mouse_move(int dx, int dy) {
     hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
 }
 
+void hv_vm_tablet(int x, int y, int buttons) {
+    hv_xhci_pointer(board.usb, x, y, buttons);
+}
+
+int hv_vm_has_tablet(void) {
+    return board.usb && board.usb->tablet;
+}
+
 void hv_vm_mouse_button(int button, int down) {
     static const uint16_t codes[3] = {HV_BTN_LEFT, HV_BTN_RIGHT, HV_BTN_MIDDLE};
     if (button < 0 || button > 2) return;

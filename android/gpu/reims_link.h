@@ -8,7 +8,8 @@
 
      engine (vCPU thread)                         app (libhengegpu.so)
        MMIO read/write ── slot: state 1 ──▶  slot's thread: rvg_device_mmio_* / rvg_iosurface_device_mmio_*
-       waits (spin, then futex)  ◀── state 2 ──  value
+       read: waits (spin, then futex)  ◀── state 2 ──  value
+       write: goes on (posted); the thread's next access waits for state 0, which the app sets for a write
        irq thread  ◀── irq_bits, irq_seq (futex) ──  raise_interrupt callbacks
 
    One slot per engine thread that touches the GPU (each vCPU, the device thread), so vCPUs never wait

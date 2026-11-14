@@ -331,6 +331,7 @@ static void pointer_wait(int ms) {
 /* The viewer's own message 250 (Henge's app, a captured mouse): the mouse's movement as it is, with the
    RFB button mask. Nothing steers: the pointer thread is told there is no place to walk to. */
 static void buttons_event(Client *c, int mask);
+static void pointer_event(Client *c, int mask, int x, int y);
 
 static void relative_event(Client *c, int mask, int dx, int dy) {
     pthread_mutex_lock(&P.mu);
@@ -338,6 +339,33 @@ static void relative_event(Client *c, int mask, int dx, int dy) {
     pthread_mutex_unlock(&P.mu);
     if (dx || dy) hv_vm_mouse_move(dx, dy);
     buttons_event(c, mask);
+}
+
+/* The viewer's own message 251 (Henge's app, Settings > Mouse: Android's pointer): where Android's pointer is,
+   0..32767 across the Mac's screen, with the RFB button mask. With the USB absolute pointer (HV_USB_TABLET=1)
+   it goes there as it is, buttons with it, so a click lands exactly where Android drew the pointer; the
+   wheel stays the relative mouse's. Without it, the steering of message 5. */
+static void absolute_event(Client *c, int mask, int x, int y) {
+    if (!hv_vm_has_tablet()) {
+        pointer_event(c, mask, (int)((int64_t)x * c->w / 32768), (int)((int64_t)y * c->h / 32768));
+        return;
+    }
+    pthread_mutex_lock(&P.mu);
+    P.have = 0, P.settled = 1;
+    pthread_mutex_unlock(&P.mu);
+    if ((mask ^ c->buttons) & 7) {
+        /* macOS misses a press let go at once, as for the mouse (buttons_event). */
+        uint64_t held = now_ms() - c->pressed_at;
+        if ((c->buttons & 7 & ~mask) && held < 60) usleep((useconds_t)(60 - held) * 1000);
+        if (mask & 7 & ~c->buttons) c->pressed_at = now_ms();
+    }
+    int b = (mask & 1) | (mask & 4 ? 2 : 0) | (mask & 2 ? 4 : 0); /* RFB 1 left, 2 middle, 4 right -> HID */
+    hv_vm_tablet(x, y, b);
+    if (mask & 8) hv_vm_mouse_wheel(1);
+    if (mask & 16) hv_vm_mouse_wheel(-1);
+    if (mask & 32) hv_vm_mouse_hwheel(-1);
+    if (mask & 64) hv_vm_mouse_hwheel(1);
+    c->buttons = mask & 7;
 }
 
 static void pointer_event(Client *c, int mask, int x, int y) {
@@ -439,6 +467,10 @@ static void serve(Client *c) {
             case 250: /* Henge's app: a captured mouse's movement (relative_event) */
                 if (recv_all(c->fd, b, 5)) return;
                 relative_event(c, b[0], (int16_t)get16(b + 1), (int16_t)get16(b + 3));
+                break;
+            case 251: /* Henge's app: Android's own pointer, absolute (absolute_event) */
+                if (recv_all(c->fd, b, 5)) return;
+                absolute_event(c, b[0], get16(b + 1), get16(b + 3));
                 break;
             case 6: /* ClientCutText */
                 if (recv_all(c->fd, b, 7)) return;

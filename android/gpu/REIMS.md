@@ -674,6 +674,41 @@ plug-in have no counterpart here, see the section below):
   test_jit, test_exc, test_xchain; test_devices' timer checks fail the same way with and without these changes under
   qemu's timing, as dczva does). Not run on a tablet; the next log's statistics lines say what each changed.
 
+0.3.59, from the 0.3.58 log (2026-11-14, a Mac at Half with YouTube and apple.com playing) and the list after it:
+
+- **Settings > Mouse: Android's pointer** (the default). A mouse moves Android's own pointer, which the display
+  draws at its own rate, dressed in the Mac's glyph (`GpuView.nativeReimsCursor`, scaled to the screen), and the
+  Mac's pointer is put exactly under it: the USB device beside the keyboard is now a composite one with an absolute
+  pointer (`devices/xhci.c`, QEMU's usb-tablet report; HV_USB_TABLET=1, set by the app), driven by the app's
+  message 251 (`android/vnc.c`). Clicks carry their position, so they land where the pointer is drawn; the wheel
+  stays the relative mouse's. The Mac's pointer is left out of the frames then (`reims_host_native_pointer`), so
+  its moves cost no frame. Captured is the old way. `tests/test_xhci.c` drives the controller as a guest driver
+  does: both configurations, the report descriptor by interface, endpoint 2's reports, merging and clamping. Not
+  run on macOS: if the keyboard or pointer misbehaves, Mouse: Captured restores the old USB device.
+- **Posted GPU register writes** (`android/pvg_reims.c`): a write goes on as soon as the app's slot has it; the
+  thread's next access waits for it, so order holds and reads see every write. The log had the Mac's CPUs waiting
+  1 to 4.7 s of every 30 here (single waits to 11 ms), mostly on gfx +0x1020. The app marks a write done with
+  IDLE. `tests/test_reims_link.c` runs the engine's half against a stand-in slot thread. HV_REIMS_POSTED=0: the
+  old way.
+- **The Mac's clock read in place** (`android/compat/mach/mach_time.h`, `translate_counter`): the engine's time is
+  the CPU's counter where its rate converts exactly (24 MHz, or 19.2 MHz times 5/4 = c + c/4, the Mi Pad 7's), so
+  translated code reads CNTVCT with `isb; mrs; add` instead of 150 to 180 thousand helper calls a second.
+  HV_CLOCK_COUNTER=1: the system clock and the helper, as before.
+- **Raced TLBI drops wait for the walk** (`core/sysreg.c`): a remote drop that met the target mid-walk is tried
+  again when the walk is over (at most HV_RACE_SPIN_US, 15), not after 64 yields; posts cost about 20 us each.
+  Stats: "raced drops still posted after waiting".
+- **The shader primer** (`reims/reims_primer.py`): metal2vulkan's pipeline records (descriptors, not
+  translations) appended to `$HOME/.cache/henge-pipelines.bin` (32 MiB at most) and warmed on the first device
+  of the next run (256 MiB of driver cache data); the log says how many after 60 s. HENGE_PRIMER=0: off.
+  Type-checked against the pinned reims-vgpu and metal2vulkan.
+- **Mac screen: Half from the window**, and the Mac's screen immersive: the log's window was 3200x2067 (the
+  navigation bar), so 1600x1068 never fitted it twice and Sharp fell back to a smooth 1.94x. The screen now hides
+  the system bars, and Half halves the window the screen was last shown in.
+- **Settings > JIT cache: 1 GB.** The log: the 768 MB cache filled and was dropped whole every ~80 s, and 52 to
+  73% of what was translated after was code it had held (translating took 7 to 10% of the time). Dropping by
+  parts would answer it properly; not done yet. Nor is presenting reims's frame without reading it back (it needs
+  an export from reims-vgpu's frame target and an image shared between two Vulkan devices).
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

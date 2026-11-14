@@ -86,21 +86,25 @@ static int wait_for_app(void) {
     return 0;
 }
 
-static uint64_t forward(int device, int write, uint64_t off, uint64_t value, unsigned size) {
-    if (my_slot < 0) {
-        my_slot = __atomic_fetch_add(&R.nslots, 1, __ATOMIC_ACQ_REL);
-        if (my_slot >= HV_REIMS_SLOTS) { fprintf(stderr, "hengevm: reims: more GPU threads than slots\n"); abort(); }
+/* Posted writes (0.3.59): a register write is handed to the app's slot and the vCPU goes on, as a write to
+   a real device's registers is posted on its bus; the next access from the same thread (read or write)
+   first waits for it to be done, so one thread's accesses still reach the device in order, and a read
+   still sees every earlier write. The tablet's log: the Mac's CPUs stood 1 to 4.7 s of every 30 waiting
+   here, mostly on the gfx doorbell write (+0x1020), with single waits up to 11 ms. HV_REIMS_POSTED=0: every
+   access waited for, as before. The app marks a write done with IDLE (a read with REPLY). */
+static __thread int my_pending;
+static __thread uint64_t my_pending_since;
+
+static int posted_writes(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("HV_REIMS_POSTED");
+        on = !(v && *v == '0');
     }
-    if (!app_alive() && wait_for_app() != 0) {
-        if (R.lost++ % 1000 == 0) fprintf(stderr, "hengevm: reims: the app's GPU is gone; %llu accesses dropped\n", (unsigned long long)R.lost);
-        return 0;
-    }
-    HvReimsSlot *s = &R.h->slot[my_slot];
-    uint64_t began = now_ns();
-    s->device = (uint32_t)device, s->write = (uint32_t)write, s->size = size, s->offset = off, s->value = value;
-    s->sent_ns = began;
-    __atomic_store_n(&s->state, HV_REIMS_REQUEST, __ATOMIC_RELEASE);
-    futex(&s->state, FUTEX_WAKE, 1, NULL);
+    return on;
+}
+
+static int64_t spin_limit_ns(void) {
     /* Most answers take microseconds, and a CPU thread that sleeps here pays the scheduler twice (the app's
        thread woken, then this one: on the tablet an access cost a millisecond on average, 0.3.24). So it
        stays awake for the first 150 us, by the clock (2000 loads were a few microseconds), and sleeps
@@ -110,8 +114,15 @@ static uint64_t forward(int device, int write, uint64_t off, uint64_t value, uns
         const char *us = getenv("HV_REIMS_SPIN_US");
         spin_ns = (us && *us ? atoll(us) : 150) * 1000;
     }
+    return spin_ns;
+}
+
+/* Waits until the slot's request is no longer REQUEST (answered: REPLY, or IDLE for a write); 0, or -1
+   when the app died with it (the slot is then IDLE and the access counts as lost). */
+static int wait_answer(HvReimsSlot *s, uint64_t began) {
+    int64_t spin_ns = spin_limit_ns();
     for (unsigned spin = 0;; spin++) {
-        if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) == HV_REIMS_REPLY) goto done;
+        if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != HV_REIMS_REQUEST) return 0;
         if ((spin & 63) == 63 && (int64_t)(now_ns() - began) >= spin_ns) break;
 #if defined(__aarch64__)
         __asm__ volatile("yield");
@@ -120,15 +131,43 @@ static uint64_t forward(int device, int write, uint64_t off, uint64_t value, uns
     for (;;) {
         struct timespec t = {0, 100 * 1000000};
         futex(&s->state, FUTEX_WAIT, HV_REIMS_REQUEST, &t);
-        if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) == HV_REIMS_REPLY) break;
+        if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != HV_REIMS_REQUEST) return 0;
         if (!app_alive()) { /* the app died with our request: answer 0 rather than hang the vCPU */
             __atomic_store_n(&s->state, HV_REIMS_IDLE, __ATOMIC_RELEASE);
             R.lost++;
-            return 0;
+            return -1;
         }
         R.waits++;
     }
-done:;
+}
+
+static uint64_t forward(int device, int write, uint64_t off, uint64_t value, unsigned size) {
+    if (my_slot < 0) {
+        my_slot = __atomic_fetch_add(&R.nslots, 1, __ATOMIC_ACQ_REL);
+        if (my_slot >= HV_REIMS_SLOTS) { fprintf(stderr, "hengevm: reims: more GPU threads than slots\n"); abort(); }
+    }
+    HvReimsSlot *s = &R.h->slot[my_slot];
+    if (my_pending) { /* this thread's posted write: done before anything else of its goes */
+        uint64_t w0 = now_ns();
+        wait_answer(s, my_pending_since);
+        __atomic_fetch_add(&R.wait_ns, now_ns() - w0, __ATOMIC_RELAXED);
+        my_pending = 0;
+    }
+    if (!app_alive() && wait_for_app() != 0) {
+        if (R.lost++ % 1000 == 0) fprintf(stderr, "hengevm: reims: the app's GPU is gone; %llu accesses dropped\n", (unsigned long long)R.lost);
+        return 0;
+    }
+    uint64_t began = now_ns();
+    s->device = (uint32_t)device, s->write = (uint32_t)write, s->size = size, s->offset = off, s->value = value;
+    s->sent_ns = began;
+    __atomic_store_n(&s->state, HV_REIMS_REQUEST, __ATOMIC_RELEASE);
+    futex(&s->state, FUTEX_WAKE, 1, NULL);
+    if (write && posted_writes()) {
+        my_pending = 1, my_pending_since = began;
+        __atomic_fetch_add(&R.h->requests, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
+    if (wait_answer(s, began) != 0) return 0;
     __atomic_fetch_add(&R.wait_ns, now_ns() - began, __ATOMIC_RELAXED);
     uint64_t v = s->value;
     __atomic_store_n(&s->state, HV_REIMS_IDLE, __ATOMIC_RELEASE);
