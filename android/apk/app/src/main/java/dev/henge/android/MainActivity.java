@@ -608,12 +608,12 @@ public class MainActivity extends Activity {
         final boolean captured = "capture".equals(prefs.getString("mouse", "android"));
         c.addView(choiceRow("Mouse", new String[]{"Android's pointer", "Captured"}, captured ? 1 : 0,
                 i -> { prefs.edit().putString("mouse", i == 0 ? "android" : "capture").apply(); render(true); }));
-        TextView mnote = text(captured
+        TextView mousenote = text(captured
                 ? "A mouse's raw movement moves the Mac's pointer, with the Mac's own speed and acceleration; Android's pointer is hidden. Takes effect at the next start."
                 : "A mouse moves Android's own pointer, drawn by the tablet's display as fast as it refreshes and dressed as the Mac's (arrow, text beam, hand), and the Mac's pointer is put exactly under it, so it moves like a real mouse and clicks land where you see them. Uses Android's pointer speed. Takes effect at the next start.",
                 13, DIM, false);
-        mnote.setPadding(dp(17), 0, dp(17), dp(12));
-        c.addView(mnote);
+        mousenote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(mousenote);
         c.addView(hairline());
         if ("reims".equals(prefs.getString("gpu", "on"))) {
             final java.io.File copyAll = new java.io.File(VmService.reimsHomeDir(this), "copy-in-all");
