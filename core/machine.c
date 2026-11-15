@@ -13,6 +13,7 @@ extern void hv_exit(void);
 extern void hv_helper_entry(void);
 extern void hv_helper_thunk(void);
 extern void hv_chain_thunk(void);
+extern void hv_chain_thunk_x7(void);
 extern void hv_ijc_thunk(void);
 extern void hv_xjump_thunk(void);
 
@@ -573,7 +574,8 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     cpu->exit_routine = (uint64_t)hv_exit;
     cpu->helper_routine = (uint64_t)hv_helper_entry;
     cpu->helper_thunk = (uint64_t)hv_helper_thunk;
-    cpu->chain_thunk = (uint64_t)hv_chain_thunk;
+    /* Stubs reach it through a shared tail with x7 = their data (translate.c put_tramp); HV_NO_TRAMPS: as before. */
+    cpu->chain_thunk = getenv("HV_NO_TRAMPS") ? (uint64_t)hv_chain_thunk : (uint64_t)hv_chain_thunk_x7;
     cpu->ijc_thunk = (uint64_t)hv_ijc_thunk;
     cpu->xjump_thunk = (uint64_t)hv_xjump_thunk;
     cpu->el = 1;

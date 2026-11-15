@@ -388,6 +388,8 @@ public class VmService extends Service {
             pb.environment().put("HV_JIT_PARTS", "parts".equals(prefs.getString("jitParts", "whole")) ? "4" : "1");
             // Settings > Longer blocks: a conditional branch does not end a translated block (the engine's HV_SUPERBLOCKS).
             if ("on".equals(prefs.getString("longBlocks", "off"))) pb.environment().put("HV_SUPERBLOCKS", "1");
+            // Settings > Compact code: Off puts the translator's slow paths and exits back as they were before 0.3.66.
+            if ("off".equals(prefs.getString("compactCode", "on"))) pb.environment().put("HV_NO_TRAMPS", "1");
             // Huge pages: On asks for them as the Mac touches its memory; Eager also touches all of it at the start,
             // while the tablet still has 2 MB runs of free memory to give (devices/vmapple.c).
             String huge = prefs.getString("hugepages", "off");

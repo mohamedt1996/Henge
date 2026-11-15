@@ -24,7 +24,7 @@ static HvMachine m;
 static HvBlock *block_at(uint32_t index, uint64_t va, uint32_t *code) {
     HvBlock *b = &m.blocks[index];
     memset(b, 0, sizeof *b);
-    b->va = va, b->pa = va, b->ram = &m.ram[0], b->pg = (uint32_t)((va - BASE) / PAGE), b->code = code;
+    b->va = va, b->pa = va, b->ramx = 0, b->pg = (uint32_t)((va - BASE) / PAGE), b->code = code;
     b->gen = m.ram[0].page_gen[b->pg];
     uint32_t h = hv_block_hash(b->va, b->pa, b->flags);
     b->next = m.hash[h], m.hash[h] = b;

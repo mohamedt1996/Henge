@@ -40,7 +40,7 @@ int main(int argc, char **argv) {
     for (int r = 0; r < reps; r++) {
         uint32_t words = (uint32_t)(n / 4), i = 0;
         while (i < words) {
-            HvBlock b = {.va = base + 4ull * i, .pa = base + 4ull * i, .flags = (uint32_t)flags, .ram = &m.ram[0], .pg = (4ull * i) >> 14, .maker = 1};
+            HvBlock b = {.va = base + 4ull * i, .pa = base + 4ull * i, .flags = (uint32_t)flags, .ramx = 0, .pg = (4ull * i) >> 14, .maker = 1};
             uint32_t page_left = (uint32_t)((16384 - ((4ull * i) & 16383)) / 4);
             uint32_t avail = words - i < page_left ? words - i : page_left;
             if (hv_translate_block(&m, &b, code + i, avail) != 0) { m.jit.used = 0; m.nslots = 0; continue; }

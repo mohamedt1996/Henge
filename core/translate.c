@@ -25,6 +25,7 @@
 #define MAX_OOL 1024
 #define WORDS_PER_INSN_MAX 96 /* stop the block before the buffer could overflow */
 #define MAX_RELS 8192
+#define MAX_TRAMPS 4096
 #define JIT_CHUNK_WORDS (256u * 1024) /* 1 MB: CBZ, B.cond and LDR (literal) reach both ways from anywhere in it */
 
 enum { FIX_LDR, FIX_ADR };
@@ -80,6 +81,8 @@ typedef struct {
     int flat;           /* HV_K2: all in one, in the order written */
     struct { uint32_t at, target; uint8_t from_cold; } rel[MAX_RELS]; /* a branch in one part to a word in the other */
     uint32_t nrel;
+    struct { uint32_t at; uint8_t cold, which; } tramp[MAX_TRAMPS]; /* a B to one of the chunk's shared tails (put_tramp) */
+    uint32_t ntramp;
     uint32_t nhot, ncold; /* the finished block's parts in words, ncold with the pool */
     uint64_t pool[MAX_LITS];
     uint32_t npool;
@@ -204,6 +207,32 @@ static void put_lit(Emit *e, int reg, uint64_t value) {
 
 /* adr xR, <16-byte HvHelperInfo in the pool> */
 
+/* 0.3.66: shared tails. A slow path's call of hv_helper_thunk, a chainable exit's of hv_chain_thunk and an unchained
+   exit's of hv_xjump_thunk each were three or four instructions at every site (save x30, load the thunk's address,
+   point at the site's data, blr) with the data in the pool or after an alignment nop. Now the site is `adr` at
+   its data, which follows, and a B to a tail that does the rest; one copy of the tails starts every chunk of the
+   JIT region (chunk_take), always within a B's reach. 2-3 words less at each of a block's 3.5 such sites:
+   a seventh of the translated code (tools/jitsize.c). HV_NO_TRAMPS: the sites as before. */
+enum { TRAMP_HELPER, TRAMP_CHAIN, TRAMP_XJUMP };
+#define TRAMP_WORDS 8
+static const uint8_t tramp_at[3] = {0, 4, 6};
+
+static int use_tramps(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("HV_NO_TRAMPS") == NULL;
+    return v;
+}
+
+/* adr xR, <the word after the B that follows>; B <tail> (aimed when the block is placed). */
+static void put_tramp(Emit *e, int reg, int which) {
+    put(e, 0x10000040u | (uint32_t)reg); /* adr xR, .+8 */
+    if (e->ntramp < MAX_TRAMPS) {
+        e->tramp[e->ntramp].at = e->n, e->tramp[e->ntramp].cold = (uint8_t)(e->in_cold && !e->flat), e->tramp[e->ntramp].which = (uint8_t)which;
+        e->ntramp++;
+    } else e->overflow = 1;
+    put(e, B_OP);
+}
+
 static void put_ool(Emit *e, Ool o) {
     o.at = e->n - 1; /* the branch just emitted */
     o.site = e->cur_pc;
@@ -294,10 +323,13 @@ static void put_xjump(Emit *e, uint64_t target, int check) {
         put_ijc_jump(e, 1);
         return;
     }
-    if (!(e->n & 1)) put(e, 0xd503201f); /* nop: the data after the br starts 8-byte aligned */
-    put(e, 0x10000007u | 3u << 5);       /* adr x7, data */
-    put(e, LDR_X(15, 28, HV_CPU_XJUMP_THUNK));
-    put(e, BR_X(15));
+    if (use_tramps()) put_tramp(e, 7, TRAMP_XJUMP); /* x7 = the data, which the thunk reads where it lies */
+    else {
+        if (!(e->n & 1)) put(e, 0xd503201f); /* nop: the data after the br starts 8-byte aligned */
+        put(e, 0x10000007u | 3u << 5);       /* adr x7, data */
+        put(e, LDR_X(15, 28, HV_CPU_XJUMP_THUNK));
+        put(e, BR_X(15));
+    }
     put(e, (e->flags & 0x7fffffffu) | (check ? 1u << 31 : 0));
     put(e, 0);
     put(e, (uint32_t)target);
@@ -427,10 +459,13 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
         e->site_direct = !check && !xa;
     }
     if (check) link_here(e, to_exit, p0);
-    put(e, STR_X(30, 28, HV_CPU_X(30)));
-    put(e, LDR_X(15, 28, HV_CPU_CHAIN_THUNK));
-    if ((e->n & 1) == 0) put(e, 0xd503201f);                         /* nop: the data starts 8-byte aligned */
-    put(e, BLR_X(15));
+    if (use_tramps()) put_tramp(e, 7, TRAMP_CHAIN); /* x7 = {slot address, target VA}; x30 stays the guest's (hv_chain_thunk_x7) */
+    else {
+        put(e, STR_X(30, 28, HV_CPU_X(30)));
+        put(e, LDR_X(15, 28, HV_CPU_CHAIN_THUNK));
+        if ((e->n & 1) == 0) put(e, 0xd503201f);                         /* nop: the data starts 8-byte aligned */
+        put(e, BLR_X(15));
+    }
     put(e, (uint32_t)(uintptr_t)slot);
     put(e, (uint32_t)((uintptr_t)slot >> 32));
     put(e, (uint32_t)target);
@@ -456,6 +491,12 @@ static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op);
    from where the helper would resume (bits 31..19, in words). */
 static void put_helper_refill(Emit *e, uint64_t pc, uint32_t insn, uint32_t rflags, uint32_t retry) {
     put_helper(e, pc, insn, HV_OP_MEM);
+    if (use_tramps()) {
+        uint32_t resume = e->n; /* the word after the info: where the helper comes back to */
+        uint32_t back = resume - retry;
+        if (back < (1u << 13) && rflags < (1u << 11)) e->w[e->n - 1] = HV_OP_MEM | rflags << 8 | back << 19;
+        return;
+    }
     uint32_t resume = e->n - 1; /* the ldr x0, [x28] the helper comes back to */
     uint32_t back = resume - retry;
     if (back < (1u << 13) && rflags < (1u << 11)) e->pool[e->npool - 1] = (uint64_t)insn | (uint64_t)(HV_OP_MEM | rflags << 8 | back << 19) << 32;
@@ -464,6 +505,16 @@ static void put_helper_refill(Emit *e, uint64_t pc, uint32_t insn, uint32_t rfla
 /* The return address is where it goes back to, so the thunk's RET goes where the CPU expects
    and leaves its stack of return addresses as it was. The HvHelperInfo is in the pool. */
 static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
+    if (use_tramps()) {
+        /* x6 = the HvHelperInfo, which follows; the tail saves the guest's x30 and makes x30 the word after it.
+           hv_helper_entry and the refill load the guest's x0 themselves on every way back. */
+        put_tramp(e, 6, TRAMP_HELPER);
+        put(e, (uint32_t)pc);
+        put(e, (uint32_t)(pc >> 32));
+        put(e, insn);
+        put(e, op);
+        return;
+    }
     uint32_t info = e->npool;
     e->pool[info] = pc;
     e->pool[info + 1] = (uint64_t)insn | (uint64_t)op << 32;
@@ -1890,6 +1941,7 @@ int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t a
 static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail, int nogroup) {
     Emit *e = &E;
     e->n = e->other_n = e->npool = e->nfix = e->nool = e->nsite = e->nrel = 0;
+    e->ntramp = 0;
     e->w = e->hot;
     e->in_cold = 0;
     e->flat = hv_knob[HV_K_TEST2];
@@ -1923,7 +1975,7 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
         }
         e->after[i] = e->n;
         i++;
-        if (e->n + WORDS_PER_INSN_MAX * 2 > MAX_WORDS || e->other_n + WORDS_PER_INSN_MAX * 2 > MAX_WORDS || e->npool + 8 > MAX_LITS || e->nool + 4 > MAX_OOL || e->nrel + 256 > MAX_RELS) break;
+        if (e->n + WORDS_PER_INSN_MAX * 2 > MAX_WORDS || e->other_n + WORDS_PER_INSN_MAX * 2 > MAX_WORDS || e->npool + 8 > MAX_LITS || e->nool + 4 > MAX_OOL || e->nrel + 256 > MAX_RELS || e->ntramp + 64 > MAX_TRAMPS) break;
     }
     if (!ended) put_branch_exit(e, b->va + 4ull * i, 1);
     b->ninsns = i;
@@ -1976,6 +2028,7 @@ static __thread struct {
     HvMachine *m;
     uint64_t gen;
     uint32_t *hot, *cold;
+    uint32_t *tramp; /* its copy of the shared tails (put_tramp) */
 } chunk;
 
 static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_at, uint32_t **cold_at) {
@@ -1983,13 +2036,26 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
     if (chunk.m != m || chunk.gen != gen || !chunk.hot || (size_t)(chunk.cold - chunk.hot) < (size_t)hot + cold) {
         size_t want = JIT_CHUNK_WORDS;
         if (want > m->jit.capacity) want = m->jit.capacity;
-        if (want < (size_t)hot + cold) want = (size_t)hot + cold;
+        if (want < (size_t)hot + cold + TRAMP_WORDS) want = (size_t)hot + cold + TRAMP_WORDS;
         uint32_t *p = hv_jit_reserve(&m->jit, want);
         if (!p) {
             chunk.hot = NULL;
             return -1;
         }
         chunk.m = m, chunk.gen = gen, chunk.hot = p, chunk.cold = p + ((want + 1) & ~(size_t)1);
+        /* The shared tails first (put_tramp), 8 words:
+           helper: the guest's x30 saved, x30 = the word after the 16-byte info x6 points at, hv_helper_thunk;
+           chain:  hv_chain_thunk_x7 (x7 = the stub's data, x30 untouched);
+           xjump:  hv_xjump_thunk (x7 = the site's data). */
+        const uint32_t tails[TRAMP_WORDS] = {
+            STR_X(30, 28, HV_CPU_X(30)), 0x910040deu /* add x30, x6, #16 */, LDR_X(15, 28, HV_CPU_HELPER_THUNK), BR_X(15),
+            LDR_X(15, 28, HV_CPU_CHAIN_THUNK), BR_X(15),
+            LDR_X(15, 28, HV_CPU_XJUMP_THUNK), BR_X(15),
+        };
+        hv_jit_write(&m->jit, p, tails, sizeof tails);
+        hv_jit_finish(&m->jit, p, TRAMP_WORDS);
+        chunk.tramp = p;
+        chunk.hot = p + TRAMP_WORDS;
     }
     *hot_at = chunk.hot;
     chunk.hot += hot;
@@ -2007,6 +2073,11 @@ int hv_translate_place(HvMachine *m, HvBlock *b) {
         uint32_t at = e->rel[k].at, target = e->rel[k].target;
         if (e->rel[k].from_cold) patch_branch(&e->cold[at], (dst + target) - (cold + at));
         else patch_branch(&e->hot[at], (cold + target) - (dst + at));
+    }
+    for (uint32_t k = 0; k < e->ntramp; k++) { /* each B to a shared tail, now that it is known where both are */
+        uint32_t at = e->tramp[k].at;
+        int64_t off = (chunk.tramp + tramp_at[e->tramp[k].which]) - ((e->tramp[k].cold ? cold : dst) + at);
+        (e->tramp[k].cold ? e->cold : e->hot)[at] = B_OP | (uint32_t)(off & 0x3ffffff);
     }
     /* Exits in the page to blocks that exist already (or back to this one's
        start) are chained now, in the copy about to be written: no trip through

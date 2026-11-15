@@ -782,6 +782,14 @@ public class MainActivity extends Activity {
         pnote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(pnote);
         c.addView(hairline());
+        c.addView(choiceRow("Compact code", new String[]{"On", "Off"}, "off".equals(prefs.getString("compactCode", "on")) ? 1 : 0,
+                i -> { prefs.edit().putString("compactCode", i == 0 ? "on" : "off").apply(); render(true); }));
+        TextView ccnote = text("On (since 0.3.66): the translated code's slow paths and exits share their last steps, which makes "
+                + "it about an eighth smaller: the cache holds more and fills later (the log's \"a block is N instructions, M "
+                + "bytes\"). Off: as before, should the Mac misbehave with it.", 13, DIM, false);
+        ccnote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(ccnote);
+        c.addView(hairline());
         c.addView(choiceRow("Longer blocks", new String[]{"Off", "On"}, "on".equals(prefs.getString("longBlocks", "off")) ? 1 : 0,
                 i -> { prefs.edit().putString("longBlocks", i == 1 ? "on" : "off").apply(); render(true); }));
         TextView lbnote = text("Experimental. Translated code goes on past a conditional branch instead of ending there, which leaves "

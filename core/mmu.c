@@ -958,7 +958,7 @@ static int tlb_maps_block(HvCpu *cpu, const HvBlock *b) {
     const HvTlbEntry *e = hv_tlb_ent(cpu, (b->va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), table);
     uint64_t page_va = b->va & ~(uint64_t)PAGE_MASK, page_pa = b->pa & ~(uint64_t)PAGE_MASK;
     return __atomic_load_n(&e->exec_tag, __ATOMIC_RELAXED) == hv_exec_key(page_va, e->addend) &&
-           (uint64_t)e->addend == (uint64_t)(uintptr_t)(b->ram->host + (page_pa - b->ram->pa)) - page_va;
+           (uint64_t)e->addend == (uint64_t)(uintptr_t)(hv_block_ram(cpu->m, b)->host + (page_pa - hv_block_ram(cpu->m, b)->pa)) - page_va;
 }
 
 /* The dispatcher caching a block it found for va: only while the TLB still

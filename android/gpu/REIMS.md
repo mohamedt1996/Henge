@@ -800,6 +800,16 @@ plug-in have no counterpart here, see the section below):
   The changes within reach (a shared call sequence per 1 MB chunk, a smaller info) come to 7-10%, not the third
   hoped for, for new assembly on every slow path; not made. Sharing literals: 0.1%.
 
+0.3.66, smaller translated code and bookkeeping:
+
+- **Shared tails** (`core/translate.c` `put_tramp`, `chunk_take`; `host/enter.S` `hv_chain_thunk_x7`): a slow
+  path's call of the helper, a chainable exit's stub and an unchained exit's lookup each end in `adr` at their
+  data, which follows in the code, and a B to one of three tails at the start of every 1 MB chunk. Before, each
+  site saved x30, loaded the thunk's address and did a blr, with its data in the pool or after an alignment nop,
+  and reloaded x0 after (the thunks do). `jitsize` on libc: 12.49 -> 10.87 words per instruction (13% less: literals
+  1.51 -> 0.30, out of line 6.25 -> 5.85). Settings > Compact code: Off (HV_NO_TRAMPS) is the old form.
+- **A block's record is 48 bytes** (64): the RAM range as an index, narrow counts, no flush count.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

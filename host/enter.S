@@ -41,6 +41,7 @@
     .globl _hv_helper_entry
     .globl _hv_helper_thunk
     .globl _hv_chain_thunk
+    .globl _hv_chain_thunk_x7
     .globl _hv_ijc_thunk
     .globl _hv_xjump_thunk
     .globl _hv_fp_enter
@@ -298,6 +299,8 @@ _hv_helper_thunk:
 _hv_chain_thunk:
     mov x7, x30
     ldr x30, [x28, #240]
+// The same with x7 = the data and x30 never touched (the stub's `adr x7` and B to a shared tail: translate.c put_tramp).
+_hv_chain_thunk_x7:
     ldr w15, [x28, #CPU_EXIT_REQ]
     cbnz w15, 1f
     ldr x6, [x7]

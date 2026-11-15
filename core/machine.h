@@ -32,19 +32,21 @@ typedef struct HvMmio {
     int self_locked;     /* the device takes its own lock (the GIC): no device lock around it */
 } HvMmio;
 
-/* 64 bytes (0.3.62: the pointers first and the page index in 32 bits; it was 80 with the padding). */
+/* 48 bytes (0.3.66; 64 in 0.3.62, 80 before): the RAM range as its index, the instruction count and the maker
+   narrow, no flush count (its checks were HV_JIT_POISON's, which go by the address). A full cache holds millions. */
+#define HV_NO_RAM 0xff
 typedef struct HvBlock {
     uint64_t va, pa;
-    struct HvRam *ram;   /* where its page lives, for a quick staleness check */
     uint32_t *code;
     struct HvBlock *next;
-    uint32_t jit_gen;    /* full flushes when it was made */
     uint32_t flags;      /* HV_BLOCK_* state the translation depends on */
-    uint32_t ninsns;
     uint32_t gen;        /* page_gen of its page when translated */
-    uint32_t pg;         /* its page's index in ram (16 KB pages: 64 TB of RAM) */
-    uint32_t maker;      /* the CPU that translated it (index + 1; 0: not a CPU, as in tests) */
+    uint32_t pg;         /* its page's index in its RAM range (16 KB pages: 64 TB of RAM) */
+    uint16_t ninsns;
+    uint8_t maker;       /* the CPU that translated it (index + 1; 0: not a CPU, as in tests) */
+    uint8_t ramx;        /* where its page lives: m->ram[ramx] (hv_block_ram), for a quick staleness check */
 } HvBlock;
+_Static_assert(sizeof(HvBlock) == 48, "HvBlock size");
 
 #define HV_BLOCK_EL1   1u        /* translated for EL1 (selects tlb[1]) */
 #define HV_BLOCK_FPOFF 2u        /* CPACR_EL1.FPEN traps FP/SIMD at this EL */
@@ -305,6 +307,7 @@ static inline uint32_t hv_block_hash(uint64_t va, uint64_t pa, uint32_t flags) {
     return (uint32_t)(h ^ (h >> 29)) & (HV_BLOCK_HASH - 1);
 }
 
+static inline struct HvRam *hv_block_ram(HvMachine *m, const HvBlock *b) { return &m->ram[b->ramx]; }
 static inline uint32_t *hv_slot_code(const HvMachine *m, uint32_t at) { return at ? m->jit.base + (at - 1) : NULL; }
 static inline uint32_t hv_slot_at(const HvMachine *m, const uint32_t *p) { return p ? (uint32_t)(p - m->jit.base) + 1 : 0; }
 
