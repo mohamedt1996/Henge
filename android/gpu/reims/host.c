@@ -1048,6 +1048,16 @@ int reims_host_cursor(unsigned known_seq, unsigned char *out, int cap, int meta[
     return n;
 }
 
+/* The Mac's screen as the guest set it (0s before it has). */
+void reims_host_mode(int wh[2]) {
+    Host *h = H;
+    wh[0] = wh[1] = 0;
+    if (!h) return;
+    pthread_mutex_lock(&h->lock);
+    wh[0] = (int)h->mode_w, wh[1] = (int)h->mode_h;
+    pthread_mutex_unlock(&h->lock);
+}
+
 void reims_host_set_sink(Replay *r) {
     pthread_mutex_lock(&host_lock);
     Host *h = H;

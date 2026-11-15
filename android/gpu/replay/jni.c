@@ -68,6 +68,16 @@ JNIEXPORT void JNICALL Java_dev_henge_android_GpuView_nativeReimsNativePointer(J
 #endif
 }
 
+/* The Mac's screen size, two ints (0s before the guest set it): the app maps touches and its pointer by it. */
+JNIEXPORT void JNICALL Java_dev_henge_android_GpuView_nativeReimsMode(JNIEnv *env, jclass cls, jintArray wh) {
+    (void)cls;
+    int m[2] = {0, 0};
+#ifdef HENGE_REIMS
+    reims_host_mode(m);
+#endif
+    if (wh && (*env)->GetArrayLength(env, wh) >= 2) (*env)->SetIntArrayRegion(env, wh, 0, 2, m);
+}
+
 /* The Mac's pointer glyph for Android's pointer: premultiplied RGBA when it changed since knownSeq, else
    null; meta (6 ints): seq, width, height, hot x, hot y, shown. */
 JNIEXPORT jbyteArray JNICALL Java_dev_henge_android_GpuView_nativeReimsCursor(JNIEnv *env, jclass cls, jint knownSeq, jintArray meta) {

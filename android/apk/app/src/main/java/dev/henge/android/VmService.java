@@ -396,7 +396,9 @@ public class VmService extends Service {
             // Settings > Cores for the Mac: a fast core of its own for each of the Mac's CPUs (the engine binds them),
             // Android's other groups kept off those cores, the fast cores kept out of deep idle states (coreTuning).
             boolean coresOn = !install && !gunyah() && !"off".equals(prefs.getString("coreTuning", "on"));
-            boolean awakeOn = coresOn && !"off".equals(prefs.getString("coreAwake", "on"));
+            // 0.3.64: off unless asked. With it (the 0.3.62 and 0.3.63 runs) the tablet held its cores to 1.9 GHz by
+            // 3.5 minutes; without (0.3.61's run) by 7.5. The engine's waits rest in WFE now, which wakes at once.
+            boolean awakeOn = coresOn && "on".equals(prefs.getString("coreAwake", "off"));
             pb.environment().put("HV_CPU_PIN", coresOn ? "1" : "0");
             // Settings > Big core: Leave out (the default) keeps the Mac's CPUs off a core faster than all the others.
             pb.environment().put("HV_CPU_PRIME", "use".equals(prefs.getString("bigCore", "avoid")) ? "1" : "0");
@@ -619,6 +621,7 @@ public class VmService extends Service {
     /** The files coreTuning may write and put back, and what may be written to them: nothing else reaches a root shell. */
     private static boolean tunable(String file, String value) {
         return (file.matches("/dev/cpuset/[a-z-]+/cpus") || file.matches("/sys/devices/system/cpu/cpu[0-9]+/power/pm_qos_resume_latency_us")
+                || file.matches("/sys/devices/system/cpu/cpu[0-9]+/cpufreq/scaling_max_freq")
                 || file.equals("/proc/sys/vm/page-cluster") || file.equals("/sys/kernel/mm/lru_gen/enabled"))
                 && value.matches("[0-9a-zA-Z,/-]{1,40}");
     }
@@ -659,6 +662,9 @@ public class VmService extends Service {
     private String coreTuning(File log, boolean groups, boolean awake, int macCpus) {
         android.content.SharedPreferences p = getSharedPreferences("henge", MODE_PRIVATE);
         coreTuningBack(log, p);
+        // Settings > Steady speed: the Mac's cores capped at 85% of their top clock, so they hold it and do not
+        // climb to the tablet's heat limit and get cut to two thirds (1.7 of 2.6 GHz in the logs).
+        boolean steady = groups && "on".equals(p.getString("steadySpeed", "off"));
         if (!groups && !awake) return "";
         Cores k = cores(macCpus, !"use".equals(p.getString("bigCore", "avoid")));
         if (k == null) {
@@ -675,6 +681,10 @@ public class VmService extends Service {
         }
         // Kept out of deep idle: the Mac's cores only (0.3.61); a spare core sleeps as deep as it likes.
         if (awake) for (int c : k.mac) files.add("/sys/devices/system/cpu/cpu" + c + "/power/pm_qos_resume_latency_us");
+        if (steady && k != null) for (int c : k.mac) {
+            files.add("/sys/devices/system/cpu/cpu" + c + "/cpufreq/scaling_max_freq");
+            files.add("/sys/devices/system/cpu/cpu" + c + "/cpufreq/cpuinfo_max_freq");
+        }
         for (String f : files) read.append("echo \"").append(f).append("=$(cat ").append(f).append(" 2>/dev/null)\"; ");
         java.util.Map<String, String> now = new java.util.LinkedHashMap<>();
         for (String line : DeviceCheck.sh(true, read + "true").split("\n")) {
@@ -708,6 +718,19 @@ public class VmService extends Service {
                 want.put("/sys/kernel/mm/lru_gen/enabled", "y");
                 said.append(said.length() > 0 ? ", " : "").append("lru_gen ").append(gen).append(" -> on");
             }
+        }
+        if (steady) {
+            String capped = "";
+            for (int c : k.mac) {
+                String f = "/sys/devices/system/cpu/cpu" + c + "/cpufreq/scaling_max_freq";
+                String was = now.get(f), top = now.get("/sys/devices/system/cpu/cpu" + c + "/cpufreq/cpuinfo_max_freq");
+                if (was == null || top == null || !was.matches("[0-9]+") || !top.matches("[0-9]+")) continue;
+                long cap = Long.parseLong(top) * 85 / 100;
+                if (Long.parseLong(was) <= cap) continue; // lower already (the tablet's own limit): left alone
+                want.put(f, Long.toString(cap));
+                capped = String.format(java.util.Locale.US, "%.1f GHz", cap / 1e6);
+            }
+            if (!capped.isEmpty()) said.append(said.length() > 0 ? ", " : "").append("the Mac's cores capped at ").append(capped);
         }
         int woken = 0;
         if (awake) {

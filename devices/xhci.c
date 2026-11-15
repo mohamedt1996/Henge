@@ -618,6 +618,16 @@ static void run_commands(HvXhci *x) {
 
 #define PORT_CONNECTED (PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)SPEED_FULL << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT)
 
+static int reset_ms(void) {
+    static int ms = -1;
+    if (ms < 0) {
+        const char *e = getenv("HV_USB_RESET_MS");
+        ms = e && *e ? atoi(e) : 20;
+        if (ms < 0 || ms > 500) ms = 20;
+    }
+    return ms;
+}
+
 /* At reset the keyboard's port is connected; the tablet's waits for hv_xhci_poll (ptr_plug_at). */
 static void port_connect(HvXhci *x) {
     x->portsc[0] = PORT_CONNECTED;
@@ -642,6 +652,17 @@ static void port_write(HvXhci *x, int p, uint32_t v) {
     uint32_t s = x->portsc[p];
     s &= ~(v & PORT_CHANGES); /* write 1 to clear */
     if (v & PORT_PED) s &= ~PORT_PED;
+    /* 0.3.64: the tablet's port takes its reset as hardware does: PR stays set for a while (HV_USB_RESET_MS, 20;
+       0: at once) and the port is enabled, with its change and event, when hv_xhci_poll finds it due. Answered
+       within the write, macOS reset the port 9546 times before it went on (the 0.3.63 logs). After 20 resets taken
+       this way it is at once again, as before: the device did come up that way. */
+    if ((v & PORT_PR) && p == 1 && x->ptr_plugged && reset_ms() > 0 && x->ptr_resets <= 20) {
+        if (!(s & PORT_PR)) x->ptr_reset_at = mono_ns() + (uint64_t)reset_ms() * 1000000ull;
+        s = (s & ~PORT_PED) | PORT_PR;
+        x->portsc[p] = s;
+        hv_machine_wake(x->m); /* CPU 0 polls: it finishes the reset */
+        return;
+    }
     if (v & PORT_PR) { /* reset: enabled, in U0 */
         s = (s & ~(0xfu << PORT_PLS_SHIFT)) | PORT_PED | PORT_PRC;
         x->portsc[p] = s;
@@ -677,6 +698,7 @@ static void reset(HvXhci *x) {
     memset(x->dev, 0, sizeof x->dev);
     x->ptr_posted = 0;
     x->ptr_plugged = 0, x->ptr_plug_at = 0; /* plugged in again once the driver runs (hv_xhci_poll) */
+    x->ptr_reset_at = 0, x->ptr_resets = 0;
     for (int p = 0; p < HV_XHCI_PORTS; p++) x->portsc[p] = p == 0 ? PORT_CONNECTED : PORT_PP;
     update_irq(x);
 }
@@ -940,6 +962,11 @@ void hv_xhci_poll(HvXhci *x) {
         x->ptr_plugged = 1;
         x->portsc[1] = PORT_CONNECTED;
         tmile(x, TAB, "plugged in on port 2");
+        port_event(x, 1);
+    }
+    if (x->ptr_reset_at && (x->portsc[1] & PORT_PR) && mono_ns() >= x->ptr_reset_at) { /* the tablet's port reset is over */
+        x->ptr_reset_at = 0;
+        x->portsc[1] = (x->portsc[1] & ~(PORT_PR | 0xfu << PORT_PLS_SHIFT)) | PORT_PED | PORT_PRC;
         port_event(x, 1);
     }
     if (x->rhead != x->rtail) run_ep_in(x);

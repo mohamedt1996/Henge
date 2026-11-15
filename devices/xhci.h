@@ -68,6 +68,7 @@ typedef struct HvXhci {
     uint64_t ptr_plug_at;  /* when to connect it (CLOCK_MONOTONIC ns), 0: not yet known */
     int ptr_said;          /* lines of the tablet's setting up logged */
     uint32_t ptr_resets;   /* resets of port 2 since it was plugged in */
+    uint64_t ptr_reset_at; /* when the reset in progress on port 2 is over (CLOCK_MONOTONIC ns), 0: none */
     uint8_t preports[HV_XHCI_REPORTS][6];
     uint32_t phead, ptail;
     uint8_t pstate[6];

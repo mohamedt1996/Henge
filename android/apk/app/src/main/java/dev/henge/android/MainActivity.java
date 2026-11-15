@@ -689,8 +689,17 @@ public class MainActivity extends Activity {
             bigNote.setPadding(dp(17), 0, dp(17), dp(12));
             c.addView(bigNote);
             c.addView(hairline());
-            c.addView(choiceRow("Fast cores awake", new String[]{"On", "Off"}, "off".equals(prefs.getString("coreAwake", "on")) ? 1 : 0,
-                    i -> { prefs.edit().putString("coreAwake", i == 0 ? "on" : "off").apply(); render(true); }));
+            c.addView(choiceRow("Steady speed", new String[]{"Off", "On"}, "on".equals(prefs.getString("steadySpeed", "off")) ? 1 : 0,
+                    i -> { prefs.edit().putString("steadySpeed", i == 1 ? "on" : "off").apply(); render(true); }));
+            TextView steadyNote = text("Needs root. Caps the Mac's cores at 85% of their top clock (2.2 of 2.6 GHz on the Mi Pad 7) "
+                    + "while the Mac runs. Flat out they reach the tablet's heat limit in a few minutes and are cut to 1.7-1.9 GHz; "
+                    + "capped they may hold 2.2. Slower in the first minutes, possibly faster after. Put back when the Mac stops.",
+                    13, DIM, false);
+            steadyNote.setPadding(dp(17), 0, dp(17), dp(12));
+            c.addView(steadyNote);
+            c.addView(hairline());
+            c.addView(choiceRow("Fast cores awake", new String[]{"Off", "On"}, "on".equals(prefs.getString("coreAwake", "off")) ? 1 : 0,
+                    i -> { prefs.edit().putString("coreAwake", i == 1 ? "on" : "off").apply(); render(true); }));
             TextView awakeNote = text("Needs root. The fast cores do not go into deep sleep while the Mac runs, so work handed between "
                     + "the Mac's CPUs and the GPU is picked up sooner. Costs a little power and heat: if the tablet slows down "
                     + "sooner with this on, turn it off.", 13, DIM, false);

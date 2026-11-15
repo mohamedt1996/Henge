@@ -157,6 +157,17 @@ int main(void) {
     while ((pt = next_event(pev)) >= 0)
         if (pt == 34 && (pev[0] >> 24) == 2) port2 = 1;
     CHECK((rd_bar(x, 0x440 + 16) & 1) && port2, "tablet: port 2 plugged in (connected %u, its change event %d)", rd_bar(x, 0x440 + 16) & 1, port2);
+    /* The tablet's port reset takes a while (0.3.64): PR stays set, then enabled with its change and an event. */
+    w(x, 0x440 + 16, 0x611, 4); /* PR, PP, full speed, CCS */
+    CHECK((rd_bar(x, 0x440 + 16) & 0x12) == 0x10, "tablet: a reset just asked for: PORTSC %08x (PR and not yet enabled expected)", rd_bar(x, 0x440 + 16));
+    hv_xhci_poll(x);
+    CHECK(rd_bar(x, 0x440 + 16) & 0x10, "tablet: the reset was over at once");
+    x->ptr_reset_at = 1; /* due */
+    hv_xhci_poll(x);
+    port2 = 0;
+    while ((pt = next_event(pev)) >= 0)
+        if (pt == 34 && (pev[0] >> 24) == 2) port2 = 1;
+    CHECK((rd_bar(x, 0x440 + 16) & 0x200012) == 0x200002 && port2, "tablet: after the reset: PORTSC %08x (enabled, PRC), event %d", rd_bar(x, 0x440 + 16), port2);
     int ks = bring_up(x, 1, OUTCTX, EP0RING, &cn);
     n = control_in(x, ks, &en, 0x80, 6, 0x0200, 0, 255);
     CHECK(n == 34 && at(BUF)[4] == 1, "tablet: the keyboard's configuration unchanged (%d bytes)", n);

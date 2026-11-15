@@ -778,6 +778,17 @@ plug-in have no counterpart here, see the section below):
   instruction now: a block of 5 instructions is 26 words inline, 33 of exits and slow paths, 9 of literals). The
   real work, shared slow paths and smaller exits, is not done.
 
+0.3.64, from the 0.3.63 runs (2026-11-15: the Mac's pointer under Android's only at the middle of the screen):
+
+- **Places on the Mac's screen reckoned by the Mac's screen** (`ScreenActivity.layoutScreen`, `GpuView.nativeReimsMode`,
+  `android/vnc.c` `mac_size`): with Graphics: reims the VNC framebuffer is the boot framebuffer (640 wide in the
+  logs: every steered place had x <= 639), and the app laid touches and the pointer out by it: right at the middle,
+  off towards the left and right. Both sides now use the size the Mac set (1600x1068).
+- **The tablet's port reset takes 20 ms** (`devices/xhci.c`, HV_USB_RESET_MS; after 20 resets at once again):
+  answered within the register write, macOS reset the port 9546 times in each run before it addressed the device.
+- **Fast cores awake: off by default.** With it the tablet held its cores to 1.9 GHz by 3.5 minutes, without by 7.5.
+- **Settings > Steady speed** (root, off): the Mac's cores capped at 85% of their top clock.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

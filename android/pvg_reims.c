@@ -355,6 +355,15 @@ int hv_pvg_external_pointer(int *x, int *y) {
 }
 
 uint64_t hv_pvg_reims_wait_ns(void) { return __atomic_load_n(&R.wait_ns, __ATOMIC_RELAXED); }
+/* The Mac's screen with Graphics: reims (0: reims is the GPU and the size is given; -1: not). The VNC framebuffer
+   is the boot framebuffer then, of another size (640 wide in the logs), so places on the Mac's screen are
+   reckoned by this (android/vnc.c). */
+int hv_pvg_reims_screen(int *w, int *h) {
+    if (!R.h || !R.h->engine_alive || !R.h->display_w || !R.h->display_h) return -1;
+    *w = (int)R.h->display_w, *h = (int)R.h->display_h;
+    return 0;
+}
+
 /* The awake part of a wait now (us), as learnt (spin_now_ns). */
 int hv_pvg_reims_spin_us(void) { return (int)(spin_now_ns() / 1000); }
 

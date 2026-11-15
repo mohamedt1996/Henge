@@ -18,6 +18,8 @@ void reims_host_set_sink(Replay *r);
 /* Settings > Mouse: Android's pointer. On: the Mac's pointer is not drawn into the frames (Android draws it,
    with the Mac's glyph, where the mouse is), and its moves cost no frame. */
 void reims_host_native_pointer(int on);
+/* The Mac's screen as the guest set it (0s before it has). */
+void reims_host_mode(int wh[2]);
 /* The Mac's pointer glyph, when it changed since known_seq: premultiplied RGBA into out (cap bytes), and
    meta = {seq, width, height, hot x, hot y, shown}. Returns the bytes written, 0 when nothing changed (meta
    still filled), -1 with no glyph or host. */

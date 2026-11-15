@@ -332,6 +332,15 @@ static void pointer_wait(int ms) {
    RFB button mask. Nothing steers: the pointer thread is told there is no place to walk to. */
 static void buttons_event(Client *c, int mask);
 static void pointer_event(Client *c, int mask, int x, int y);
+int hv_pvg_reims_screen(int *w, int *h);
+
+/* The Mac's screen in pixels: the app's places (message 5) and the pointer thread's are in these. 0.3.64: with
+   Graphics: reims not the VNC framebuffer's size, which is the boot framebuffer's (the 0.3.61-63 logs: 640 wide):
+   reckoned by that, a place was right at the middle of the screen and further off the nearer an edge. */
+static void mac_size(const Client *c, int *w, int *h) {
+    if (hv_pvg_reims_screen(w, h) == 0) return;
+    *w = (int)c->w, *h = (int)c->h;
+}
 
 static void relative_event(Client *c, int mask, int dx, int dy) {
     pthread_mutex_lock(&P.mu);
@@ -353,7 +362,9 @@ static void absolute_event(Client *c, int mask, int x, int y) {
         was_live = live;
     }
     if (!live) {
-        pointer_event(c, mask, (int)((int64_t)x * c->w / 32768), (int)((int64_t)y * c->h / 32768));
+        int mw, mh;
+        mac_size(c, &mw, &mh);
+        pointer_event(c, mask, (int)((int64_t)x * mw / 32768), (int)((int64_t)y * mh / 32768));
         return;
     }
     pthread_mutex_lock(&P.mu);
@@ -479,8 +490,10 @@ static void serve(Client *c) {
                 if (recv_all(c->fd, b, 5)) return;
                 /* A finger's tap or drag, a place on the Mac's screen: through the tablet where macOS reads it
                    (0.3.63), not by steering the mouse there, which fought the tablet's place in the 0.3.62 run. */
-                if (hv_vm_has_tablet() && c->w > 0 && c->h > 0)
-                    absolute_event(c, b[0], (int)(((int64_t)get16(b + 1) * 32768 + 16384) / c->w), (int)(((int64_t)get16(b + 3) * 32768 + 16384) / c->h));
+                int mw = 0, mh = 0;
+                mac_size(c, &mw, &mh);
+                if (hv_vm_has_tablet() && mw > 0 && mh > 0)
+                    absolute_event(c, b[0], (int)(((int64_t)get16(b + 1) * 32768 + 16384) / mw), (int)(((int64_t)get16(b + 3) * 32768 + 16384) / mh));
                 else
                     pointer_event(c, b[0], get16(b + 1), get16(b + 3));
                 break;

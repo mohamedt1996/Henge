@@ -384,10 +384,21 @@ public class ScreenActivity extends Activity {
 
         /** Where the Mac's screen lies in this view: the framebuffer letterboxed, as the GPU view letterboxes its
          *  frame (screen_vk.c). From the size alone, so touches map before (or without) a VNC frame. */
+        /* The picture's size: the Mac's screen. 0.3.64: with Graphics: reims that is the size the Mac set on the GPU
+           side, which draws it; the VNC framebuffer is the boot framebuffer then, of another shape (640 wide in the
+           logs), and laid out by it a touch or the pointer was right at the middle and off towards the sides. */
+        private int scrW, scrH;
+        private final int[] macMode = new int[2];
+
         private void layoutScreen() {
-            if (fbW == 0 || fbH == 0 || getWidth() == 0 || getHeight() == 0) return;
-            float s = Math.min(getWidth() / (float) fbW, getHeight() / (float) fbH);
-            int w = Math.round(fbW * s), h = Math.round(fbH * s);
+            scrW = fbW; scrH = fbH;
+            if (overlay && macPointer) {
+                try { GpuView.nativeReimsMode(macMode); } catch (Throwable ignored) { macMode[0] = 0; }
+                if (macMode[0] >= 320 && macMode[1] >= 200) { scrW = macMode[0]; scrH = macMode[1]; }
+            }
+            if (scrW == 0 || scrH == 0 || getWidth() == 0 || getHeight() == 0) return;
+            float s = Math.min(getWidth() / (float) scrW, getHeight() / (float) scrH);
+            int w = Math.round(scrW * s), h = Math.round(scrH * s);
             int x = (getWidth() - w) / 2, y = (getHeight() - h) / 2;
             dst.set(x, y, x + w, y + h);
         }
@@ -412,8 +423,8 @@ public class ScreenActivity extends Activity {
 
         // ---- pointer ----
 
-        private int fx(float x) { return dst.width() == 0 ? 0 : clamp((int) ((x - dst.left) * fbW / dst.width()), fbW); }
-        private int fy(float y) { return dst.height() == 0 ? 0 : clamp((int) ((y - dst.top) * fbH / dst.height()), fbH); }
+        private int fx(float x) { return dst.width() == 0 || scrW == 0 ? 0 : clamp((int) ((x - dst.left) * scrW / dst.width()), scrW); }
+        private int fy(float y) { return dst.height() == 0 || scrH == 0 ? 0 : clamp((int) ((y - dst.top) * scrH / dst.height()), scrH); }
         private static int clamp(int v, int max) { return Math.max(0, Math.min(max - 1, v)); }
 
         private void pointer(int mask, float x, float y) {
@@ -493,8 +504,8 @@ public class ScreenActivity extends Activity {
         }
 
         private void cursorUpdate() {
-            if (!nativePointer || fbW == 0 || dst.width() == 0) return;
-            float s = dst.width() / (float) fbW;
+            if (!nativePointer || scrW == 0 || dst.width() == 0) return;
+            float s = dst.width() / (float) scrW;
             byte[] px;
             try { px = GpuView.nativeReimsCursor(s == cursorScale ? cursorSeq : -1, cursorMeta); } catch (Throwable t) { return; }
             boolean shown = cursorMeta[5] != 0;
