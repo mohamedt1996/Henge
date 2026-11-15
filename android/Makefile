@@ -119,6 +119,8 @@ $(B)/test_xchain: tests/test_xchain.c $(ENGINE)
 	$(T) $^ $(LIBS) -o $@
 $(B)/test_reims_link: tests/test_reims_link.c android/pvg_reims.c android/gpu/reims_link.h $(ENGINE) $(DEV)
 	$(T) tests/test_reims_link.c $(ENGINE) $(DEV) $(LIBS) -o $@
+$(B)/jitsize: tools/jitsize.c $(ENGINE)
+	$(T) $^ $(LIBS) -o $@
 $(B)/test_jitparts: tests/test_jitparts.c $(ENGINE)
 	$(T) $^ $(LIBS) -o $@
 $(B)/test_xhci: tests/test_xhci.c $(ENGINE) $(DEV)

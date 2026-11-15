@@ -538,6 +538,25 @@ static void reg_note(Host *h, const HvReimsSlot *s, uint64_t reach, uint64_t dev
 }
 
 /* The log's line of them every 10 s (beat_loop), and the counts start again. */
+/* 0.3.65: the app's own memory once a minute (this process: Java, the GPU side's heaps, the driver's mappings),
+   beside the engine's "henge: memory:". The Mac's RAM is mapped here too (shared, counted once on the tablet). */
+static void memory_report(void) {
+    long long rss = -1, anon = -1, file = -1, shm = -1, swap = -1, v;
+    char line[160];
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    while (fgets(line, sizeof line, f)) {
+        if (sscanf(line, "VmRSS: %lld kB", &v) == 1) rss = v;
+        else if (sscanf(line, "RssAnon: %lld kB", &v) == 1) anon = v;
+        else if (sscanf(line, "RssFile: %lld kB", &v) == 1) file = v;
+        else if (sscanf(line, "RssShmem: %lld kB", &v) == 1) shm = v;
+        else if (sscanf(line, "VmSwap: %lld kB", &v) == 1) swap = v;
+    }
+    fclose(f);
+    hlog("memory: the app holds %lld MB (its own %lld, files and the driver's %lld, shared with the engine %lld) and has %lld MB in swap",
+         rss >> 10, anon >> 10, file >> 10, shm >> 10, swap >> 10);
+}
+
 static void reg_report(Host *h) {
     pthread_mutex_lock(&h->reg_lock);
     uint64_t count = h->reg_n, reach = h->reg_reach_ns, device = h->reg_device_ns;
@@ -652,6 +671,8 @@ static void *beat_loop(void *arg) {
                  (unsigned long long)put, put ? put_ns / 1e6 / put : 0.0);
             last = now_ns();
             reg_report(h);
+            static int beats;
+            if (beats++ % 2 == 1) memory_report();
         }
     }
     return NULL;

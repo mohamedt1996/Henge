@@ -49,6 +49,56 @@ static long long file_number(const char *path) {
     return v;
 }
 
+/* 0.3.65: where the memory is, once a minute, on a line of its own: this process (the Mac's RAM and the JIT
+   cache are its shared memory, the engine's own tables its anonymous memory; what of them is in swap), and the
+   tablet's as /proc/meminfo has it (everything else: Android, its apps, the app's GPU side, which says its own
+   in "henge-gpu: memory:"). The 0.3.64 log: swap full at 6.1 GB with 0.4 GB free, and nothing said whose. */
+static void memory_line(FILE *out) {
+    long long rss = -1, anon = -1, file = -1, shm = -1, swap = -1, v;
+    char line[160];
+    FILE *f = fopen("/proc/self/status", "r");
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            if (sscanf(line, "VmRSS: %lld kB", &v) == 1) rss = v;
+            else if (sscanf(line, "RssAnon: %lld kB", &v) == 1) anon = v;
+            else if (sscanf(line, "RssFile: %lld kB", &v) == 1) file = v;
+            else if (sscanf(line, "RssShmem: %lld kB", &v) == 1) shm = v;
+            else if (sscanf(line, "VmSwap: %lld kB", &v) == 1) swap = v;
+        }
+        fclose(f);
+    }
+    long long m_anon = -1, m_shm = -1, m_cache = -1, m_slab = -1, m_kgsl = -1, m_free = -1, m_zram = -1;
+    f = fopen("/proc/meminfo", "r");
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            if (sscanf(line, "AnonPages: %lld kB", &v) == 1) m_anon = v;
+            else if (sscanf(line, "Shmem: %lld kB", &v) == 1) m_shm = v;
+            else if (sscanf(line, "Cached: %lld kB", &v) == 1) m_cache = v;
+            else if (sscanf(line, "Slab: %lld kB", &v) == 1) m_slab = v;
+            else if (sscanf(line, "MemFree: %lld kB", &v) == 1) m_free = v;
+            else if (sscanf(line, "KgslShmemUsage: %lld kB", &v) == 1 || sscanf(line, "GPUTotalUsed: %lld kB", &v) == 1) m_kgsl = v;
+            else if (sscanf(line, "Zram: %lld kB", &v) == 1) m_zram = v;
+        }
+        fclose(f);
+    }
+    /* What the swap's contents take of the tablet's memory, where it may be read (root's, on most). */
+    long long z_orig = -1, z_used = -1;
+    f = fopen("/sys/block/zram0/mm_stat", "r");
+    if (f) {
+        long long o, c, u;
+        if (fscanf(f, "%lld %lld %lld", &o, &c, &u) == 3) z_orig = o >> 20, z_used = u >> 20;
+        fclose(f);
+    }
+    fprintf(out, "henge: memory: the engine holds %lld MB (the Mac's RAM and the JIT cache %lld, its own %lld, files %lld) and has %lld MB in swap",
+            rss >> 10, shm >> 10, anon >> 10, file >> 10, swap >> 10);
+    fprintf(out, "; the tablet: programs' own %lld MB, shared %lld, files cached %lld, kernel %lld, free %lld", m_anon >> 10, m_shm >> 10,
+            m_cache >> 10, m_slab >> 10, m_free >> 10);
+    if (m_kgsl >= 0) fprintf(out, ", the GPU's %lld", m_kgsl >> 10);
+    if (z_used >= 0) fprintf(out, "; swap holds %lld MB in %lld MB of memory", z_orig, z_used);
+    else if (m_zram >= 0) fprintf(out, "; swap takes %lld MB of memory", m_zram >> 10);
+    fprintf(out, "\n");
+}
+
 static void host_state(FILE *out) {
     FILE *f = fopen("/proc/meminfo", "r");
     if (f) {
@@ -496,6 +546,8 @@ static void *install_heartbeat(void *arg) {
         if (u) fprintf(stderr, " | usb: %s, kernel driver %s (status %#x)", u->rom_on ? "iBoot has it" : "iBoot let go",
                        u->pci_on ? "on" : "not started", u->vio.status);
         fputc('\n', stderr);
+        static int beats;
+        if (beats++ % 2 == 1) memory_line(stderr);
         if (heartbeat_no_cpus) continue;
         still = moved ? 0 : still + 1;
         if (moved) reported = 0;

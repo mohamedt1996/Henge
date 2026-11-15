@@ -789,6 +789,17 @@ plug-in have no counterpart here, see the section below):
 - **Fast cores awake: off by default.** With it the tablet held its cores to 1.9 GHz by 3.5 minutes, without by 7.5.
 - **Settings > Steady speed** (root, off): the Mac's cores capped at 85% of their top clock.
 
+0.3.65, from the 0.3.64 log (2026-11-15: the mouse works; swap full at 6.1 of 6.1 GB, 0.4 GB free):
+
+- **Where the memory is, once a minute**: "henge: memory:" (the engine: the Mac's RAM and JIT cache, its own, what
+  of it is in swap; the tablet's programs, shared memory, file cache, kernel, GPU, and what the swap takes) and
+  "henge-gpu: memory:" (the app's process). Nothing said whose the 12 GB of demand on a 7.5 GB tablet were.
+- **`build/android/jitsize code.bin`** (`tools/jitsize.c`): the translator's output measured on a file of arm64 code
+  without a guest. On libc's .text: 12.5 words per instruction (the tablet: 13-15): a block of 4.5 instructions is
+  21 words inline, 13 of exit stubs (1.6 exits of 8), 15 of slow paths (1.8 of 8.2) and 7 of their 16-byte infos.
+  The changes within reach (a shared call sequence per 1 MB chunk, a smaller info) come to 7-10%, not the third
+  hoped for, for new assembly on every slow path; not made. Sharing literals: 0.1%.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
