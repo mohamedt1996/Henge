@@ -250,9 +250,9 @@ public class MainActivity extends Activity {
         if (running) {
             hero.addView(primary("▶  Open Screen", true, v -> startActivity(new Intent(this, ScreenActivity.class))));
             hero.addView(gap(10));
-            hero.addView(secondary(VmService.instantResume(this) ? "Save & Stop" : "Shut Down", BAD, v -> VmService.stop(this)));
+            hero.addView(secondary(VmService.instantResume(this) && !VmService.gunyah() ? "Save & Stop" : "Shut Down", BAD, v -> VmService.stop(this)));
         } else {
-            boolean saved = VmService.instantResume(this) && VmService.resumeFile(this).exists();
+            boolean saved = VmService.instantResume(this) && !VmService.gunyah() && VmService.resumeFile(this).exists();
             hero.addView(primary(saved ? "▶  Resume" : "▶  Start", !busy, v -> launch("run")));
         }
         page.addView(hero);
