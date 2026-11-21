@@ -23,6 +23,8 @@
 #include "pvg_lite.h"
 #include "vm.h"
 #include "install.h"
+#include "snapshot.h"
+#include <dispatch/dispatch.h>
 
 /* The machine lives in vm.c; these name its parts here. */
 #define m (*hv_vm_machine())
@@ -44,6 +46,34 @@ typedef struct RunArgs {
     const char *dump_path;
 } RunArgs;
 static RunArgs run_args;
+/* Instant resume testing: "save PATH" / "saveexit PATH" in HV_INPUT_FILE, --resume PATH. CPU 0 runs on cpu_thread
+   here, so that thread finishes a pause and waits for the saving thread to let it run on. */
+static dispatch_semaphore_t resume_go;
+static const char *snapshot_ident(void) {
+    static char id[256];
+    snprintf(id, sizeof id, "hengevm-mac-test %d cpus", hv_vm_ncpus());
+    return id;
+}
+static void save_now(const char *path, int then_exit) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (hv_vm_pause() != 0) {
+        fprintf(stderr, "hengevm: save: the machine stopped instead of pausing\n");
+        return;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    fprintf(stderr, "hengevm: save: paused in %.3f s\n", (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9);
+    char err[256];
+    int r = hv_snapshot_save(path, snapshot_ident(), err, sizeof err);
+    if (r) fprintf(stderr, "hengevm: save failed: %s\n", err);
+    if (then_exit && !r) {
+        fprintf(stderr, "hengevm: saved; exiting as if killed\n");
+        _exit(0);
+    }
+    if (hv_vm_continue() != 0) fprintf(stderr, "hengevm: save: cannot run on\n");
+    dispatch_semaphore_signal(resume_go);
+    fprintf(stderr, "hengevm: save: running on\n");
+}
 static uint64_t translate_va;
 
 /* Chained blocks run without returning to the dispatcher; this makes them leave
@@ -559,6 +589,103 @@ static void *input_thread(void *unused) {
                 fclose(bf);
             }
         }
+        else if (!strncmp(line, "save ", 5)) save_now(line + 5, 0);
+        else if (!strncmp(line, "saveexit ", 9)) save_now(line + 9, 1);
+        else if (!strncmp(line, "linkflap", 8)) hv_vm_link_flap();
+        else if (!strncmp(line, "dis ", 4)) { /* debugging: "dis VA": 64 words of guest code at a kernel VA, through CPU 0's tables */
+            uint64_t va = strtoull(line + 4, NULL, 16);
+            HvCpu *c0 = hv_vm_cpu(0);
+            HvWalk wv;
+            hv_mmu_walk(c0, va, HV_ACC_EXEC, 1, &wv);
+            const uint32_t *w = !wv.fsc ? hv_phys_ptr(hv_vm_machine(), wv.pa, 256) : NULL;
+            fprintf(stderr, "dis %llx pa %llx fsc %u:", (unsigned long long)va, (unsigned long long)wv.pa, (unsigned)wv.fsc);
+            for (int k = 0; w && k < 64; k++) fprintf(stderr, " %08x", w[k]);
+            fprintf(stderr, "\n");
+        }
+        else if (!strncmp(line, "devstate", 8)) { /* debugging: what each device has been asked and not answered */
+            HvVmapple *bd = hv_vm_board();
+            struct { const char *name; HvVirtio *v; } vs[] = {
+                {"root", bd->root_blk ? &bd->root_blk->vio : NULL}, {"aux", bd->aux_blk ? &bd->aux_blk->vio : NULL},
+                {"net", bd->net ? &bd->net->vio : NULL}, {"snd", bd->snd ? &bd->snd->vio : NULL},
+                {"kbd", bd->keyboard ? &bd->keyboard->vio : NULL}, {"mouse", bd->mouse ? &bd->mouse->vio : NULL},
+                {"balloon", bd->balloon ? &bd->balloon->vio : NULL}};
+            for (unsigned k = 0; k < sizeof vs / sizeof vs[0]; k++) {
+                HvVirtio *v = vs[k].v;
+                if (!v) continue;
+                fprintf(stderr, "devstate %s: status %x isr %x intx %d features %llx", vs[k].name, v->status, v->isr, v->pci.intx, (unsigned long long)v->driver_features);
+                for (int q = 0; q < v->nq; q++) {
+                    HvVirtq *vq = &v->q[q];
+                    uint16_t *avail = vq->avail ? hv_phys_ptr(hv_vm_machine(), vq->avail, 4) : NULL;
+                    uint16_t *used = vq->used ? hv_phys_ptr(hv_vm_machine(), vq->used, 4) : NULL;
+                    fprintf(stderr, " | q%d size %u en %u last_avail %u avail %u used %u", q, vq->size, vq->enabled, vq->last_avail,
+                            avail ? avail[1] : 0, used ? used[1] : 0);
+                }
+                fprintf(stderr, "\n");
+            }
+            hv_pvg_lite_debug(bd->pvg, stderr);
+            HvGic *g = bd->gic;
+            fprintf(stderr, "devstate gic ctlr %x; SPIs enabled+pending:", g->ctlr);
+            for (int i = 32; i < HV_GIC_NUM_IRQS; i++)
+                if (g->enabled[i] && (g->latch[i] || g->level[i])) fprintf(stderr, " %d%s", i, g->active[i] ? "(active)" : "");
+            fprintf(stderr, "; pending not enabled:");
+            for (int i = 32; i < HV_GIC_NUM_IRQS; i++)
+                if (!g->enabled[i] && (g->latch[i] || g->level[i])) fprintf(stderr, " %d", i);
+            fprintf(stderr, "; active:");
+            for (int i = 32; i < HV_GIC_NUM_IRQS; i++) if (g->active[i]) fprintf(stderr, " %d", i);
+            fprintf(stderr, "\n");
+#pragma push_macro("cpu")
+#undef cpu
+            for (int c = 0; c < hv_vm_ncpus(); c++) {
+                HvGicCpu *gc = &g->cpu[c];
+                HvCpu *cp = hv_vm_cpu(c);
+                fprintf(stderr, "devstate cpu %d: pc %llx el%u off %d daif %llx pmr %llx igrpen1 %llx depth %d ppi pending:", c,
+                        (unsigned long long)cp->pc, cp->el, cp->off, (unsigned long long)cp->daif, (unsigned long long)gc->pmr,
+                        (unsigned long long)gc->igrpen1, gc->depth);
+                for (int i = 0; i < 32; i++) if (gc->latch[i] || gc->level[i]) fprintf(stderr, " %d%s", i, gc->enabled[i] ? "" : "(off)");
+                fprintf(stderr, " cntv_ctl %llx\n", (unsigned long long)cp->cntv_ctl);
+            }
+#pragma pop_macro("cpu")
+            HvXhci *x = bd->usb;
+            if (x) {
+                fprintf(stderr, "devstate xhci usbcmd %x usbsts %x cmd_running %d ports %x %x;", x->usbcmd, x->usbsts, x->cmd_running, x->portsc[0], x->portsc[1]);
+                for (int sl = 1; sl <= HV_XHCI_SLOTS; sl++)
+                    if (x->slot_used[sl] >= 0 && x->slots[sl].dev >= 0) {
+                        fprintf(stderr, " slot %d dev %d configured %d eps running:", sl, x->slots[sl].dev, x->slots[sl].configured);
+                        for (int e = 1; e < HV_XHCI_EPS; e++) if (x->slots[sl].ep_running[e]) fprintf(stderr, " %d", e);
+                        fprintf(stderr, ";");
+                    }
+                fprintf(stderr, " kbd reports %u..%u tp reports %u..%u tp_mt %d\n", x->rtail, x->rhead, x->tp_rtail, x->tp_rhead, x->tp_mt);
+            }
+        }
+        else if (sscanf(line, "pause %d", &x) == 1) { /* paused for x seconds, then on (as Henge in the background, not killed) */
+            if (hv_vm_pause() == 0) {
+                fprintf(stderr, "hengevm: paused for %d s\n", x);
+                sleep((unsigned)x);
+                if (hv_vm_continue() != 0) fprintf(stderr, "hengevm: pause: cannot run on\n");
+                dispatch_semaphore_signal(resume_go);
+                fprintf(stderr, "hengevm: running on after the pause\n");
+            }
+        }
+        else if (!strncmp(line, "btn ", 4)) { /* "btn CODE 1|0": any evdev button code on the virtio mouse (testing) */
+            unsigned code = 0;
+            int down = 0;
+            if (sscanf(line + 4, "%i %d", &code, &down) == 2) {
+                hv_virtio_input_send(board.mouse, HV_EV_KEY, (uint16_t)code, down);
+                hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+            }
+        }
+        else if (!strncmp(line, "tp ", 3)) { /* "tp ID 0|1|2 X Y": a finger down/move/up on the USB Magic Trackpad 2, sensor units (testing) */
+            int id = 0, phase = 0, px = 0, py = 0;
+            if (sscanf(line + 3, "%d %d %d %d", &id, &phase, &px, &py) == 4) {
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                uint32_t ms = (uint32_t)((uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000);
+                hv_xhci_touch(board.usb, id, phase, px, py, ms);
+                if (phase == 1) hv_xhci_touch_frame(board.usb, ms);
+            }
+        }
+        else if (!strncmp(line, "tpclick ", 8)) /* "tpclick 1|0": the Magic Trackpad 2's own press (testing) */
+            hv_xhci_touch_button(board.usb, atoi(line + 8));
         else if (!strncmp(line, "press", 5) || !strncmp(line, "release", 7)) {
             hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, line[0] == 'p');
             hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
@@ -588,6 +715,14 @@ static void *input_thread(void *unused) {
         else if (sscanf(line, "wait %d", &x) == 1) sleep((unsigned)x);
         else if (!strncmp(line, "type ", 5)) type_text(line + 5);
         else if (!strncmp(line, "prof ", 5)) prof_dump(line + 5);
+        else if (!strncmp(line, "balloon ", 8)) { /* MB the guest should hand back (HV_BALLOON set at boot) */
+            HvVmapple *bd = hv_vm_board();
+            if (!bd || !bd->balloon) fprintf(stderr, "hengevm: no balloon (set HV_BALLOON)\n");
+            else {
+                hv_virtio_balloon_set_target(bd->balloon, (uint64_t)atoll(line + 8) << 20);
+                fprintf(stderr, "hengevm: balloon: the guest has handed over %llu MB\n", (unsigned long long)(hv_virtio_balloon_actual(bd->balloon) >> 20));
+            }
+        }
         else if (!strncmp(line, "knob ", 5)) {
             char name[32];
             if (sscanf(line, "knob %31s %d", name, &x) == 2 && !hv_knob_set(hv_vm_machine(), name, x))
@@ -651,12 +786,14 @@ static void *input_thread(void *unused) {
             }
             fprintf(stderr, "hengevm: find: %d places\n", n);
         }
-        else if (!strncmp(line, "grep ", 5)) { /* lines of text in guest RAM (the kernel's log) */
+        else if (!strncmp(line, "grep ", 5) || !strncmp(line, "grepall ", 8)) { /* lines of text in guest RAM (the kernel's
+                                                                                   log, launchd's); grep stops at 40 */
             HvVmapple *bd = hv_vm_board();
-            const char *word = line + 5;
+            int all = line[4] == 'a';
+            const char *word = line + (all ? 8 : 5);
             size_t wn = strlen(word);
             uint64_t hits = 0;
-            for (uint64_t i = 0; i + wn < bd->ram_size && hits < 40; i++) {
+            for (uint64_t i = 0; i + wn < bd->ram_size && (all || hits < 40); i++) {
                 if (bd->ram[i] != (uint8_t)word[0] || memcmp(bd->ram + i, word, wn)) continue;
                 uint64_t from = i;
                 while (from > 0 && i - from < 200 && bd->ram[from - 1] >= 32 && bd->ram[from - 1] < 127) from--;
@@ -667,6 +804,26 @@ static void *input_thread(void *unused) {
                 i = to;
             }
             fprintf(stderr, "hengevm: grep: %llu lines\n", (unsigned long long)hits);
+        }
+        else if (!strncmp(line, "vdump ", 6)) { /* "vdump VA LEN FILE": guest memory at a VA as CPU 0 maps it now (EL1), up to 64 KB */
+            unsigned long long va = 0, len = 0;
+            char out[400];
+            if (sscanf(line + 6, "%llx %lli %399s", &va, &len, out) == 3 && len > 0 && len <= 65536) {
+                HvVmapple *bd = hv_vm_board();
+                FILE *vf = fopen(out, "wb");
+                unsigned long long done = 0;
+                while (vf && done < len) {
+                    HvWalk wv;
+                    hv_mmu_walk(hv_vm_cpu(0), va + done, HV_ACC_READ, 1, &wv);
+                    uint64_t off = wv.pa - 0x70000000ull, n = 0x4000 - ((va + done) & 0x3fff);
+                    if (n > len - done) n = len - done;
+                    if (wv.fsc || wv.pa < 0x70000000ull || off + n > bd->ram_size) break;
+                    fwrite(bd->ram + off, 1, n, vf);
+                    done += n;
+                }
+                if (vf) fclose(vf);
+                fprintf(stderr, "hengevm: vdump %llx: %llu bytes\n", va, done);
+            }
         }
         else if (!strncmp(line, "page ", 5)) { /* a 16 KB file: is it in guest RAM, and how does the copy there differ? */
             static uint8_t want[0x4000];
@@ -795,6 +952,10 @@ static void *cpu_thread(void *unused) {
     int r;
     for (;;) {
         r = hv_vm_run_cpu0();
+        if (r == HV_EXIT_HALT && atomic_load(&cpu.halted) == HV_HALT_SAVE && hv_vm_finish_pause() == 0) {
+            dispatch_semaphore_wait(resume_go, DISPATCH_TIME_FOREVER); /* saved: run on (or the process ends) */
+            continue;
+        }
         if (r != HV_EXIT_HALT || cpu.halted || cpu.pc != a->brk || --a->brk_hits == 0) break;
         m.stop_pc = ~0ull; /* step past it: run one block, then re-arm */
         uint64_t at = cpu.pc;
@@ -882,7 +1043,7 @@ static void *cpu_thread(void *unused) {
 }
 
 static void usage(void) {
-    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--screenshot PNG] [--watch VA] [--stats SECONDS [--profile 1]] [--cpus N] [--window] [--no-pvg] [--no-chain] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES] [--install IPSW]\n");
+    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--screenshot PNG] [--watch VA] [--stats SECONDS [--profile 1]] [--cpus N] [--window] [--no-pvg] [--no-chain] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES] [--install IPSW] [--serial S] [--model S] [--soc-name S] [--product-name S] [--model-id S]\n");
     exit(2);
 }
 
@@ -904,7 +1065,7 @@ static void install_progress(int step, double p, void *user) {
 int main(int argc, char **argv) {
     const char *rom = NULL, *disk_path = NULL, *aux_path = NULL;
     uint64_t seed = 0, ecid = 0, ram_mb = 4096, aux_offset = 16384;
-    const char *install_ipsw = NULL;
+    const char *install_ipsw = NULL, *resume_path = NULL;
     const char *share_folder = NULL;
     int log = 1, trace = 0, use_pvg = 1, no_chain = 0;
     const char *screenshot = NULL;
@@ -912,6 +1073,7 @@ int main(int argc, char **argv) {
     int stats = 0, profile = 0, window = 0;
     uint64_t brk = ~0ull, brk_hits = 1, dump_pa = 0, dump_len = 0;
     const char *dump_path = NULL;
+    const char *serial = NULL, *model = NULL, *soc_name = NULL, *product_name = NULL, *model_id = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--window")) {
             window = 1;
@@ -966,6 +1128,11 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--aux-offset")) aux_offset = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--install")) install_ipsw = argv[++i];
+        else if (!strcmp(argv[i], "--model")) model = argv[++i];
+        else if (!strcmp(argv[i], "--soc-name")) soc_name = argv[++i];
+        else if (!strcmp(argv[i], "--product-name")) product_name = argv[++i];
+        else if (!strcmp(argv[i], "--model-id")) model_id = argv[++i];
+        else if (!strcmp(argv[i], "--resume")) resume_path = argv[++i];
         else usage();
     }
     if (!rom || !disk_path || !aux_path) usage();
@@ -973,7 +1140,8 @@ int main(int argc, char **argv) {
 
     HvVmConfig vc = {.rom = rom, .disk = disk_path, .aux = aux_path, .aux_offset = aux_offset, .ecid = ecid, .seed = seed,
                      .ram_mb = ram_mb, .ncpus = ncpus, .log = log, .no_net = getenv("HV_NO_NET") != NULL,
-                     .installer = install_ipsw != NULL};
+                     .installer = install_ipsw != NULL, .serial = serial, .model = model, .soc_name = soc_name,
+                     .product_name = product_name, .model_id = model_id};
     if (getenv("HV_JIT_MB")) vc.jit_bytes = (size_t)atoi(getenv("HV_JIT_MB")) << 20; /* debugging: a small region flushes often */
     hv_prof_register = hv_prof_register_thread;
     char err[256];
@@ -985,6 +1153,13 @@ int main(int argc, char **argv) {
     if (hv_vm_create(&vc, err, sizeof err) != 0) {
         fprintf(stderr, "hengevm: %s\n", err);
         return 1;
+    }
+    resume_go = dispatch_semaphore_create(0);
+    if (resume_path) {
+        if (hv_snapshot_restore(resume_path, snapshot_ident(), err, sizeof err) != 0) {
+            fprintf(stderr, "hengevm: resume: %s\n", err);
+            return 1;
+        }
     }
     m.trace = trace;
     m.watch_va = watch;

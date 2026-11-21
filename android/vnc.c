@@ -505,6 +505,15 @@ static void serve(Client *c) {
                 if (recv_all(c->fd, b, 5)) return;
                 absolute_event(c, b[0], get16(b + 1), get16(b + 3));
                 break;
+            case 252: /* Henge's app, Settings > Touch: Magic Trackpad: a finger on the Mac's trackpad (devices/xhci.c).
+                         id, phase (0 down, 1 move, 2 up), x and y in the pad's sensor units, the sample's clock in ms. */
+                if (recv_all(c->fd, b, 10)) return;
+                hv_vm_touch(b[0], b[1], get16(b + 2), get16(b + 4), get32(b + 6));
+                break;
+            case 253: /* Henge's app: the fingers that moved since the last frame, one report (the sample's clock) */
+                if (recv_all(c->fd, b, 4)) return;
+                hv_vm_touch_frame(get32(b));
+                break;
             case 6: /* ClientCutText */
                 if (recv_all(c->fd, b, 7)) return;
                 for (uint32_t n = get32(b + 3); n; n--)

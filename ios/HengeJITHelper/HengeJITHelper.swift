@@ -17,8 +17,17 @@ private enum HengeJITWork {
             .appendingPathComponent("StikJIT", isDirectory: true)
         let paths = DDIPaths.default(in: root)
         var configuration = StikJIT.Configuration.default
+        /// Appended to the reply so Henge's log shows how the port was chosen.
+        var portNote = ""
+        var needsScan = false
         if let rsdPort = request.rsdPort {
             configuration.rsdPort = rsdPort
+        } else if request.operation != .resetDDI {
+            // Henge found no advertised port. StikJIT's 49152 is closed when the device picked another at boot.
+            let lookup = RSDPortResolver.resolve()
+            NSLog("[HengeJIT] RemotePairing port: %@", lookup.detail)
+            if let port = lookup.port { configuration.rsdPort = port } else { needsScan = true }
+            portNote = " [helper port lookup: \(lookup.detail); using \(configuration.rsdPort)]"
         }
 
         do {
@@ -36,6 +45,14 @@ private enum HengeJITWork {
             let pairingURL = root.appendingPathComponent("pairingFile-\(UUID().uuidString).plist")
             try pairingData.write(to: pairingURL, options: .atomic)
             defer { try? manager.removeItem(at: pairingURL) }
+            if needsScan {
+                if let port = findRSDPort(pairingFile: pairingURL, base: configuration) {
+                    configuration.rsdPort = port
+                    portNote += " [port scan: using \(port)]"
+                } else {
+                    portNote += " [port scan: no RemotePairing port found]"
+                }
+            }
 
             switch request.operation {
             case .prepare:
@@ -45,10 +62,10 @@ private enum HengeJITWork {
                 switch readiness {
                 case .ready(let security):
                     return .init(success: true,
-                                 message: "LocalDevVPN is reachable and the Developer Disk Image is ready.",
+                                 message: "LocalDevVPN is reachable and the Developer Disk Image is ready." + portNote,
                                  txmPresent: security.isTXMPresent)
                 case .unreachable(let reason), .preparationFailed(let reason):
-                    return .init(success: false, message: reason, txmPresent: StikJIT.isTXMPresent)
+                    return .init(success: false, message: reason + portNote, txmPresent: StikJIT.isTXMPresent)
                 @unknown default:
                     return .init(success: false, message: "StikJIT returned an unknown preparation state.",
                                  txmPresent: StikJIT.isTXMPresent)
@@ -69,15 +86,35 @@ private enum HengeJITWork {
                     forceScript: true,
                     preparationProgress: { NSLog("[HengeJIT] prepare: %@", String(describing: $0)) },
                     progress: { NSLog("[HengeJIT] %@", $0) })
-                return .init(success: true, message: "Henge detached cleanly from its built-in JIT helper.",
+                return .init(success: true, message: "Henge detached cleanly from its built-in JIT helper." + portNote,
                              txmPresent: StikJIT.isTXMPresent)
             case .resetDDI:
                 preconditionFailure("Handled above")
             }
         } catch {
-            return .init(success: false, message: error.localizedDescription,
+            return .init(success: false, message: error.localizedDescription + portNote,
                          txmPresent: StikJIT.isTXMPresent)
         }
+    }
+
+    private static let lastPortKey = "henge.lastRSDPort"
+
+    /// The last port that worked, then every open port in iOS's range, each probed with a real StikJIT call.
+    /// The port changes at each reboot of the device, so a stale remembered one just falls through to the scan.
+    private static func findRSDPort(pairingFile: URL, base: StikJIT.Configuration) -> UInt16? {
+        func works(_ port: UInt16) -> Bool {
+            var probe = base
+            probe.rsdPort = port
+            probe.connectionTimeout = 2
+            return (try? StikJIT.isDDIMounted(pairingFile: pairingFile, configuration: probe)) != nil
+        }
+        let last = UInt16(exactly: UserDefaults.standard.integer(forKey: lastPortKey)) ?? 0
+        if last != 0, works(last) { return last }
+        let open = RSDPortScanner.openPorts(host: base.deviceAddress)
+        NSLog("[HengeJIT] open ports: %@", open.map(String.init).joined(separator: ","))
+        guard let port = open.first(where: works) else { return nil }
+        UserDefaults.standard.set(Int(port), forKey: lastPortKey)
+        return port
     }
 }
 

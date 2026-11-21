@@ -55,6 +55,8 @@ void hv_virtio_init(HvVirtio *v, HvMachine *m, int device_id, uint32_t class_cod
 int hv_virtq_pop(HvVirtio *v, int q, HvVirtqElem *e);
 void hv_virtq_push(HvVirtio *v, int q, const HvVirtqElem *e, uint32_t written);
 void hv_virtio_interrupt(HvVirtio *v);
+/* The device's config changed (a new value the driver should read): ISR bit 1 and a new generation. */
+void hv_virtio_config_changed(HvVirtio *v);
 
 /* Copy between an element's buffers and host memory, skipping `off` bytes of
    the readable (to) or writable (from) segments. Return bytes copied. */

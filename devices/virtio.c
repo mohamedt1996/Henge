@@ -166,6 +166,12 @@ void hv_virtio_interrupt(HvVirtio *v) {
     hv_pci_set_intx(&v->pci, 1);
 }
 
+void hv_virtio_config_changed(HvVirtio *v) {
+    v->config_gen++;
+    v->isr |= 2;
+    hv_pci_set_intx(&v->pci, 1);
+}
+
 int hv_virtq_pop(HvVirtio *v, int qi, HvVirtqElem *e) {
     HvVirtq *q = &v->q[qi];
     uint16_t *avail = hv_phys_ptr(v->m, q->avail, 4 + 2u * q->size);

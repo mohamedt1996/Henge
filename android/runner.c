@@ -11,6 +11,10 @@
 #include "vmapple.h"
 #include "virtio_usb.h"
 #include "pvg_lite.h"
+#include "snapshot.h"
+#include "share.h"
+#include "net_slirp.h"
+#include <semaphore.h>
 #include <sys/stat.h>
 #include <curl/curl.h>
 /* Graphics: reims (pvg_reims.c): what crossed to the app's GPU device. */
@@ -591,6 +595,65 @@ static void on_signal(int sig) {
     hv_vm_stop();
 }
 
+/* Settings > Instant resume (upstream's, host/snapshot.c). The app stops the Mac with SIGUSR1 instead of SIGTERM:
+   it is paused at a block boundary, its disks flushed and idle, and the whole machine (CPUs, RAM, devices) written
+   to HV_RESUME_FILE; the next start with the same Mac, settings and build of the engine picks it up from there
+   instead of booting. A file is used once: the Mac's disk moves on past it as soon as it runs. */
+static const char *resume_file, *resume_ident;
+static sem_t save_asked, save_done;
+static volatile int save_result = -1;
+static volatile sig_atomic_t save_requested;
+
+static void on_save_signal(int sig) {
+    (void)sig;
+    if (save_requested++ || stopping) return;
+    sem_post(&save_asked); /* async-signal-safe: the saver does the work */
+}
+
+static void *saver_thread(void *unused) {
+    (void)unused;
+    sem_wait(&save_asked);
+    char err[256] = "";
+    fprintf(stderr, "hengevm: instant resume: pausing the Mac to save it\n");
+    if (hv_vm_pause() != 0) {
+        fprintf(stderr, "hengevm: instant resume: the Mac stopped by itself instead\n");
+        save_result = -1;
+    } else {
+        save_result = hv_snapshot_save(resume_file, resume_ident, err, sizeof err);
+        fprintf(stderr, "hengevm: instant resume: %s\n", save_result ? err : "saved");
+    }
+    sem_post(&save_done);
+    return NULL;
+}
+
+/* The ident a file is valid for: the app's (its build, the Mac's folder) and this machine's shape. */
+static void resume_setup(const HvVmConfig *vc) {
+    const char *f = getenv("HV_RESUME_FILE");
+    if (!f || !*f) return;
+    static char ident[512];
+    const char *app = getenv("HV_RESUME_IDENT");
+    snprintf(ident, sizeof ident, "%s|%s|%llu MB|%d CPUs", app ? app : "", vc->disk ? vc->disk : "", (unsigned long long)vc->ram_mb,
+             vc->ncpus);
+    resume_file = f, resume_ident = ident;
+    sem_init(&save_asked, 0, 0);
+    sem_init(&save_done, 0, 0);
+    pthread_t t;
+    if (pthread_create(&t, NULL, saver_thread, NULL) == 0) pthread_detach(t);
+}
+
+/* 1 if the Mac was picked up from the file (removed either way: a file is good for one start). */
+static int resume_restore(void) {
+    if (!resume_file || access(resume_file, F_OK) != 0) return 0;
+    uint64_t bytes = 0;
+    int64_t saved_at = 0;
+    char err[256] = "";
+    int ok = hv_snapshot_check(resume_file, resume_ident, &bytes, &saved_at) == 0 &&
+             hv_snapshot_restore(resume_file, resume_ident, err, sizeof err) == 0;
+    if (!ok) fprintf(stderr, "hengevm: instant resume: not resumed (%s): booting\n", err[0] ? err : "a file from another Mac, setting or build");
+    unlink(resume_file);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     int vnc_port = 5900;
     int stats_seconds = 0; /* --stats N: the engine's own statistics every N s (core/dispatch.c print_stats), as host/main.c has */
@@ -767,12 +830,32 @@ int main(int argc, char **argv) {
             setenv("SLIRP_RESOLV_CONF", conf, 1);
         }
     }
+    /* Settings > Mac apps: the folder the Mac and the tablet share (host/share.c, upstream's): a WebDAV server on a
+       Unix socket that the network hands the guest's connections to 10.0.2.4:80. In macOS: Finder > Go > Connect to
+       Server > http://10.0.2.4. What the app brings in (a .dmg, .pkg or .zip) lands there for macOS to open. */
+    const char *share_dir = getenv("HV_SHARE_DIR"), *share_sock = getenv("HV_SHARE_SOCKET");
+    if (!install_dir && share_dir && *share_dir && share_sock && *share_sock) {
+        mkdir(share_dir, 0755);
+        unlink(share_sock);
+        if (hv_share_start(share_dir, share_sock, NULL) == 0) {
+            hv_net_set_share_socket(share_sock);
+            fprintf(stderr, "hengevm: shared folder %s, at http://%s in macOS (Finder > Go > Connect to Server)\n", share_dir, HV_SHARE_ADDR);
+        } else {
+            fprintf(stderr, "hengevm: shared folder: no socket at %s\n", share_sock);
+        }
+    }
     char err[256];
     if (hv_vm_create(&vc, err, sizeof err) != 0) {
         fprintf(stderr, "hengevm: %s\n", err);
         return 1;
     }
     if (getenv("HV_RAM_KEEP")) hv_android_share_with_app(getenv("HV_RAM_FILE")); /* the renderer opens it by name */
+    int resumed = 0;
+    if (!install_dir && !gunyah) {
+        resume_setup(&vc);
+        resumed = resume_restore();
+        if (resumed) fprintf(stderr, "hengevm: instant resume: the Mac goes on where it was saved\n");
+    }
     if (stats_seconds > 0 && !gunyah) {
         /* Settings > Engine statistics: every N s, where the JIT's time goes (TLB misses, slow memory accesses,
            exceptions, interrupts, the Mac's idle share and thirty lines more). Set after the machine is made,
@@ -796,6 +879,7 @@ int main(int argc, char **argv) {
     if (install_dir) usleep(500000); /* usbmuxd installs its own handlers; take SIGINT and SIGTERM back */
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+    signal(SIGUSR1, resume_file ? on_save_signal : on_signal); /* without Instant resume, a stop like SIGTERM's */
     fprintf(stderr, "hengevm: %d CPUs, %llu MB, network %s, sound %s\n", hv_vm_ncpus(),
             (unsigned long long)vc.ram_mb, vc.no_net ? "off" : "on (NAT)", vc.no_sound ? "off" : "on");
     if (!gunyah) {
@@ -804,7 +888,16 @@ int main(int argc, char **argv) {
         hv_vm_start(0, NULL);
         hv_vm_cpu_qos(); /* this thread runs CPU 0: its own signal stack, like the others */
     }
+    if (resumed) hv_vm_link_flap(); /* its network renewed, as after a Mac's sleep */
     int reason = gunyah ? hv_gunyah_run() : hv_vm_run_cpu0();
+    if (!gunyah && resume_file && atomic_load(&hv_vm_cpu(0)->halted) == HV_HALT_SAVE) {
+        /* Stopped to be saved: CPU 0 is this thread, so the pause is finished here, then the saver writes it. */
+        if (hv_vm_finish_pause() == 0) {
+            sem_wait(&save_done);
+            fprintf(stderr, "hengevm: stopped: %s\n", save_result == 0 ? "saved for instant resume" : "not saved (see above)");
+            return save_result == 0 ? 0 : 1;
+        }
+    }
     hv_vm_flush_disks();
     fprintf(stderr, "hengevm: stopped: %s\n", hv_vm_reason_name(reason));
     if (install_dir) {

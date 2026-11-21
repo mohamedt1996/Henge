@@ -221,6 +221,9 @@ static int write_reg(HvCpu *cpu, uint32_t reg, uint64_t v) {
     case R(3, 0, 4, 0, 0): cpu->spsr_el1 = v; return 0;
     case R(3, 0, 4, 0, 1): cpu->elr_el1 = v; return 0;
     case R(3, 0, 1, 0, 0): { /* SCTLR: xnu flips the PAC enables (EnIA/IB/DA/DB) on every process switch */
+        /* No AArch32 at EL0: ITD and SED read as 1 and CP15BEN as 0, whatever is written. macOS 12 reads SCTLR back
+           on its way to user mode and spins for ever if it is not exactly what it expects (0x10007414519d). */
+        v = (v | 1u << 7 | 1u << 8) & ~(uint64_t)(1u << 5);
         uint64_t changed = cpu->sctlr_el1 ^ v;
         cpu->sctlr_el1 = v;
         if (changed & (1u | 1u << 19 | 1u << 24 | 1u << 25)) { /* M, WXN, E0E, EE: what translations depend on */
@@ -422,6 +425,7 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
         else hv_tlb_flush_user(cpu);
         hv_tlb_stash_drop(cpu, (int)(xt >> 48));
         cpu->m->stats.reset_why[1]++;
+        if (cpu->m->stats_interval) cpu->m->stats.ijc_reset_kind[2]++;
         hv_ijc_drop_asid(cpu, (uint16_t)(xt >> 48));
     } else {
         if (cpu->m->log >= 2)
@@ -432,8 +436,30 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
            local TLBI VMALLE1, to drop the old region's global entries. Here every process's user entries are put
            aside under its own TTBR0 and its cached branch targets under its own ASID, so nothing of the old one
            can be seen; such a flush, within 20 us of a TTBR0 change, is left out. */
-        if (crm == 7 && hv_knob[HV_K_SWITCHFLUSH] && since_switch < 480) {
-            if (cpu->m->stats_interval) cpu->m->stats.flush_skipped++;
+        /* HV_SWITCH_FLUSH=2: one in 128 is checked first (hv_tlb_check_all, too slow for all of macOS 27's ~800/s) and done
+           if any entry kept no longer matches the page tables. One in 32 until 2026-11-09: each check walks ~4000 entries
+           (1-2 ms on the phone), up to 26 a second in a login's busiest windows, while other CPUs wait on this one for
+           their TLBIs; none of those checks (thousands, every phone session) ever found an entry out of date. */
+        /* HV_SWITCH_FLUSH=3: under emulation the same flush often comes later than 20 us (the phone: 30-100/s at
+           20-200 us, each emptying every TLB and branch cache of the CPU): up to 200 us it is left out too, if it is at
+           a PC already seen within 20 us of a TTBR0 change, i.e. the same instruction in xnu's switch path. */
+        static _Thread_local uint32_t nth;
+        int late = 0;
+        if (crm == 7 && hv_knob[HV_K_SWITCHFLUSH] >= 3 && since_switch >= 480 && since_switch < 4800) {
+            for (int i = 0; i < 4; i++)
+                if (__atomic_load_n(&cpu->m->switch_flush_pc[i], __ATOMIC_RELAXED) == pc) late = 1;
+        }
+        if (crm == 7 && hv_knob[HV_K_SWITCHFLUSH] >= 3 && since_switch < 480) {
+            int known = 0;
+            for (int i = 0; i < 4 && !known; i++) {
+                uint64_t have = __atomic_load_n(&cpu->m->switch_flush_pc[i], __ATOMIC_RELAXED), zero = 0;
+                if (have == pc) known = 1;
+                else if (!have && __atomic_compare_exchange_n(&cpu->m->switch_flush_pc[i], &zero, pc, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) known = 1;
+            }
+        }
+        if (crm == 7 && hv_knob[HV_K_SWITCHFLUSH] && (since_switch < 480 || late) &&
+            (hv_knob[HV_K_SWITCHFLUSH] < 2 || (nth++ & 127) || !hv_tlb_check_all(cpu))) {
+            if (cpu->m->stats_interval) cpu->m->stats.flush_skipped++, cpu->m->stats.flush_skipped_late += (uint64_t)late;
             return;
         }
         if (crm == 7 && cpu->m->stats_interval) {
@@ -520,7 +546,8 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
             if (by_range && ((xt >> 46) & 3) == 2) { /* 16 KB granule, as xnu uses */
                 npages = (((xt >> 39) & 31) + 1) << (5 * ((xt >> 44) & 3) + 1);
                 va = (uint64_t)((int64_t)((xt & 0x1fffffffffull) << (64 - 37)) >> (64 - 37 - 14));
-                if (npages > 32) npages = 0;
+                /* HV_RANGE_DROP=N: ranges up to N pages are done from here too, in one pass (hv_tlbi_drop_remote_range) */
+                if (npages > (hv_knob[HV_K_RANGEDROP] > 32 ? (uint64_t)hv_knob[HV_K_RANGEDROP] : 32)) npages = 0;
             } else if (by_va) {
                 npages = 1;
             }
@@ -547,7 +574,14 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
                    A drop that raced a page walk or cache fill of c's (they are
                    short) is tried again a few times first. */
                 int done = npages > 0, why = !npages ? (by_range ? 1 : 2) : 0;
-                for (uint64_t p = 0; done && p < npages; p++) {
+                if (done && npages > 1 && hv_knob[HV_K_RANGEDROP] > 0) {
+                    int r = 0;
+                    for (int t = 0; t < 4 && (r = hv_tlbi_drop_remote_range(c, va, npages, asid)) == 0; t++)
+                        for (int s = 0; s < 64; s++) __asm__ volatile("yield");
+                    done = r == 1;
+                    if (r < 0) why = 3;
+                }
+                else for (uint64_t p = 0; done && p < npages; p++) {
                     uint64_t pva = va + (p << HV_TLB_PAGE_BITS);
                     int r = 0;
                     uint64_t deadline = 0;

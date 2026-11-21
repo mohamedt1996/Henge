@@ -20,7 +20,11 @@ typedef struct HvRam {
        16 bits each) that mapped the page writable, or HV_WHINT_MANY when there
        were more. When the page becomes code only those are dropped, not a whole
        TLB scanned. */
-    uint64_t *whint;
+    uint64_t *whint;     /* CPU-major: whint[cpu * npages + page], so CPUs filling the same pages write their own lines */
+    /* Per page: the VA page (| 2) its blocks have been cached as branch targets under since its code last changed;
+       0 none, ~0 more than one. So a code change drops just those cached targets (hv_invalidate_code). */
+    uint64_t *ijc_va;
+    size_t npages;
 } HvRam;
 
 typedef struct HvMmio {
@@ -71,6 +75,10 @@ typedef struct HvStats {
     uint64_t xchained;
     uint64_t kick_src[5];     /* exit_req set by: a request (TLBI), hv_cpu_wake, kick_all, hv_machine_wake, the CPU itself */        /* of them, exits to another page (TLB-checked) */
     uint64_t syncs, sync_ticks;        /* TLBI acks waited for, and host ticks spent waiting */
+    uint64_t sync_len[4], sync_len_ticks[4]; /* those waits by length: under 10 us, 100 us, 1 ms, longer */
+    uint64_t sync_probe[4];            /* a wait 100 us long looks at the other CPU: thread off a core, on one, mid walk, mid cache fill */
+    uint64_t sync_phase[6];            /* a wait 1 ms long: the other CPU running (guest code or dispatcher), translating, in a helper,
+                                          waiting for acks itself, at the flush barrier; or its thread off a core */
     uint64_t dev_waits, dev_wait_ticks; /* device lock taken while another CPU held it */
     uint64_t tr_waits, tr_wait_ticks;   /* translation lock likewise */
     uint64_t words_inline, words_ool, words_pool; /* translated code size by part */
@@ -98,14 +106,19 @@ typedef struct HvStats {
     uint64_t wfe_waits;       /* WFEs that waited on the monitored word in place */
     uint64_t kind_insns[16], kind_words[16]; /* --stats: inline words by instruction kind (HvInsnKind), as translated */
     uint64_t posted_kind[4];
-    uint64_t race_kind[3];    /* remote drops that raced: walk under way, cache fill under way, either during the drop */  /* TLBIs other CPUs had to do themselves: a page or small range that raced, a big range, the rest (ASID, all) */
+    uint64_t race_kind[3];    /* remote drops that raced: walk under way, cache fill under way, either during the drop */
+    uint64_t race_other_page; /* HV_WALK_LOG: drops not counted as raced, the walks meanwhile being of other pages */  /* TLBIs other CPUs had to do themselves: a page or small range that raced, a big range, the rest (ASID, all) */
     uint64_t range_spared;    /* big user-range TLBIs that needed no cached targets dropped */
+    uint64_t code_ijc[3];     /* code changes: no cached target into the page, its VA page's targets dropped, all dropped (HV_IJC_PAGES) */
+    uint64_t ijc_reset_kind[4]; /* whole branch-cache drops: user half, kernel half, one process's by TLBI ASID, one process's by a range of 64 MB or more */
     uint64_t kernel_ranges;   /* big kernel-range TLBIs, dropped by range rather than with everything */
     uint64_t tlb_range_flushes; /* and that dropped only the TLB entries in the range */     /* of hv_ijc_resolve's lookups, ones that walked for the target page */   /* hv_ijc_resolve could not: chaining off/odd target, filters full, no TLB entry, block not made yet */   /* the same for hv_ijc_resolve's fills */
     uint64_t fill_kind[4];    /* ijc fills into an empty slot, over another live salt, over the same salt, over a dead salt */
     uint64_t flush_why[8];
     uint64_t flush_after_switch[4];
-    uint64_t flush_skipped;   /* TLBI all here right after a process switch, left out (HV_SWITCH_FLUSH=1) */ /* TLBI all here, by time since this CPU's last TTBR0 change: <2 us, <20 us, <200 us, later */
+    uint64_t flush_checked, flush_check_entries, flush_check_bad, flush_check_af; /* HV_SWITCH_FLUSH=2: flushes checked, entries walked, out of date (the flush was done), only the access flag */
+    uint64_t flush_skipped;   /* TLBI all here right after a process switch, left out (HV_SWITCH_FLUSH=1) */
+    uint64_t flush_skipped_late; /* of them, 20-200 us after the switch at a PC seen within 20 us of one (HV_SWITCH_FLUSH=3) */ /* TLBI all here, by time since this CPU's last TTBR0 change: <2 us, <20 us, <200 us, later */
     struct { uint64_t pc, n; } flush_pc[8]; /* where TLBI all here comes from (first 8 PCs seen) */    /* whole-TLB flushes: TLBI all (local), TLBI all (shared), SCTLR, TTBR1, TCR, MAIR, range of everything, requests overflowed */
     uint64_t reset_why[8];    /* cache drops: full flush, TLBI by ASID, TLBI user VA, TLBI kernel VA, code change, user VA in every ASID (whole user half), keyed filter full, big user range */
     uint64_t why[6];          /* dispatcher entries by cause: chain fill, kick, exception/sysreg, interrupt, cached target, cache miss */
@@ -192,6 +205,8 @@ typedef struct HvPerCpu {
     uint32_t req_flags;          /* HV_REQ_* */
     uint32_t nreq;
     struct { uint32_t op1, crn, crm, op2; uint64_t xt; } req[64]; /* TLBIs to apply */
+    uint32_t nijc_page;
+    uint64_t ijc_page[16];       /* code changed: cached targets to forget (hv_ijc_drop_code_page), queued as req */
     uint64_t req_seq, ack_seq;
     /* active: inside the dispatcher loop (0 while parked: WFI, powered off, at a
        flush barrier). tlb_live: active and not itself waiting for acks, i.e. it
@@ -199,15 +214,20 @@ typedef struct HvPerCpu {
     int active, tlb_live;
     uint32_t ack_waiters;        /* CPUs asleep in hv_cpu_sync waiting for ack_seq to move (HV_SYNC_WAIT) */
     uint32_t walk_seq;           /* odd while it walks page tables and fills its TLB (see hv_tlbi_drop_remote_va) */
+    uint64_t walk_page[8];       /* the page walk k (walk_seq 2k -> 2k+1) fills, at [k % 8]; HV_WALK_ANY: a process switch */
     uint32_t ijc_seq;            /* odd while it checks a block's mapping in its TLB and caches it (hv_ijc_fill_checked) */
+    uint32_t thread;             /* its host thread (mach_port_t), for --stats: is a CPU waited for running at all */
+    uint8_t phase;               /* for --stats, what a CPU others wait on is doing: HV_PHASE_* */
     HvTlbStash stash[HV_STASHES];
     uint64_t stash_clock;
 } HvPerCpu;
 
+enum { HV_PHASE_RUN, HV_PHASE_TRANSLATE, HV_PHASE_HELPER, HV_PHASE_SYNC, HV_PHASE_FLUSH };
 #define HV_REQ_TLB_ALL 1u   /* drop the whole TLB and branch cache */
 #define HV_REQ_IJC_RESET 2u /* drop the branch cache (code changed) */
 
 typedef struct HvMachine {
+    int locks_initialized;
     HvRam ram[HV_MAX_RAM];
     int nram;
     HvRam *main_ram;     /* the largest region: guest RAM */
@@ -238,6 +258,7 @@ typedef struct HvMachine {
     int trace;           /* print every block entered */
     int log;             /* 1: unknown sysregs, undefined instructions, unmapped accesses; 2: also every exception */
     int slow_mem;        /* tests: send every load and store through hv_mem_emulate */
+    uint64_t switch_flush_pc[4]; /* HV_SWITCH_FLUSH=3: PCs of the TLBI VMALLE1s seen within 20 us of a TTBR0 change (xnu's pmap switch) */
     uint64_t stat_slow_mem; /* hv_mem_emulate calls */
     uint64_t access_pc;  /* guest PC of the load/store being emulated, for logs */
     uint64_t watch_va;   /* debugging: log every write that touches this guest VA (0: off) */
@@ -300,6 +321,11 @@ typedef struct HvMachine {
     /* --profile: host PCs of the CPU thread sampled every millisecond, drained by the stats line. */
     uint64_t *prof;
     uint32_t prof_head, prof_tail;
+    /* The host counter when the machine started: every CPU's CNTVOFF, so the guest's virtual counter (its
+       mach_absolute_time) starts near 0 as on a Mac or under Virtualization.framework. With the host's own
+       count (days of uptime) macOS 12 took the user as idle for that long and put itself to sleep while
+       still starting up: its window server never drew. */
+    uint64_t cntvoff;
 } HvMachine;
 
 static inline uint32_t hv_block_hash(uint64_t va, uint64_t pa, uint32_t flags) {
@@ -359,7 +385,7 @@ int hv_ic_ivau_drops(void);
 /* Settings that say how to translate or wait, to compare ways of doing it in one running guest
    ("knob NAME VALUE" in HV_INPUT_FILE; a new way starts from an empty code cache). Each starts
    from the environment variable named in hv_knob_names. */
-enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_FLUSH, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_TLBT, HV_K_JITCAP, HV_K_RECHECK, HV_K_SYNCWAIT, HV_K_SWITCHFLUSH, HV_K_NOPAGEEND, HV_K_NOREMOTEASID, HV_K_COUNT };
+enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_FLUSH, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_TLBT, HV_K_JITCAP, HV_K_RECHECK, HV_K_SYNCWAIT, HV_K_SWITCHFLUSH, HV_K_RANGEDROP, HV_K_MOVIMM, HV_K_PREDSTAT, HV_K_WALKLOG, HV_K_HOIST, HV_K_IJCPAGES, HV_K_DNSPROXY, HV_K_NOPAGEEND, HV_K_NOREMOTEASID, HV_K_COUNT };
 extern int hv_knob[HV_K_COUNT];
 int hv_knob_set(HvMachine *m, const char *name, int value);
 /* Debugging (HV_WATCH): which pages keep losing their translations. */
@@ -385,6 +411,10 @@ void hv_dev_unlock(HvMachine *m);
 /* Ask another CPU to apply a TLBI (or HV_REQ_* work); returns the sequence to wait for. */
 uint64_t hv_cpu_post_tlbi(HvCpu *target, uint32_t op1, uint32_t crn, uint32_t crm, uint32_t op2, uint64_t xt);
 uint64_t hv_cpu_post(HvCpu *target, uint32_t flags);
+uint64_t hv_cpu_post_ijc_page(HvCpu *target, uint64_t v);
+/* On cpu's own thread: code changed in a page cached as branch targets at VA page v (| 2), or v = 1 (none):
+   forget the return predictions and those targets (mmu.c). */
+void hv_ijc_drop_code_page(HvCpu *cpu, uint64_t v);
 /* Wait until target has done everything up to seq (or is parked, and will before it runs). */
 void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq);
 /* The owner: do what other CPUs asked. */
@@ -396,6 +426,9 @@ void hv_big_unlock(HvMachine *m);
 void hv_big_yield(HvMachine *m);
 /* Make every CPU leave its block at the next exit. */
 void hv_machine_kick_all(HvMachine *m);
+/* Publish a terminal reason, then wake all CPUs, including CPU_OFF waits.
+   A later host stop must not overwrite the guest's shutdown/panic reason. */
+void hv_machine_halt(HvMachine *m, enum HvHaltReason reason);
 /* Wake one CPU out of WFI (and make it leave its block). */
 void hv_cpu_wake(HvCpu *cpu);
 /* Make it leave its block at the next checked exit, without waking it from WFI. */

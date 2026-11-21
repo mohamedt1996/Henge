@@ -60,6 +60,10 @@ struct HvPvgMetal {
     HvLinkHeader *link;
     uint64_t seq;
     int linked; /* the app was attached at the last check */
+    /* hv_pvg_metal_quiesce / destroy (instant resume, a Mac stopped and started again): the worker is busy with a
+       job, the queue is drained (idle), the worker is to end. */
+    int busy, stop;
+    pthread_cond_t idle;
 };
 
 static uint64_t fnv(const void *d, size_t n) {
@@ -306,15 +310,27 @@ static int link_wait(HvPvgMetal *m, uint64_t seq) {
     return 1;
 }
 
+static void job_done(HvPvgMetal *m) {
+    pthread_mutex_lock(&m->lock);
+    m->busy = 0;
+    if (!m->head) pthread_cond_broadcast(&m->idle);
+    pthread_mutex_unlock(&m->lock);
+}
+
 static void *link_work(void *arg) {
     HvPvgMetal *m = arg;
     uint64_t behind_since = 0, late = 0, dropped = 0;
     for (;;) {
         pthread_mutex_lock(&m->lock);
-        while (!m->head) pthread_cond_wait(&m->wake, &m->lock);
+        while (!m->head && !m->stop) pthread_cond_wait(&m->wake, &m->lock);
+        if (!m->head) { /* stopping, and nothing left */
+            pthread_mutex_unlock(&m->lock);
+            break;
+        }
         Job *j = m->head;
         m->head = j->next;
         if (!m->head) m->tail = NULL;
+        m->busy = 1;
         pthread_mutex_unlock(&m->lock);
         uint32_t op = j->cmd[0] & 0xffff;
         /* The display's own state (mode page, acks, swap counters) stays the engine's. */
@@ -341,6 +357,7 @@ static void *link_work(void *arg) {
         hv_pvg_lite_complete(m->lite, j->ch, j->cmd[2]);
         free(j->cmd);
         free(j);
+        job_done(m);
     }
     return NULL;
 }
@@ -372,10 +389,15 @@ static void *work(void *arg) {
     HvPvgMetal *m = arg;
     for (;;) {
         pthread_mutex_lock(&m->lock);
-        while (!m->head) pthread_cond_wait(&m->wake, &m->lock);
+        while (!m->head && !m->stop) pthread_cond_wait(&m->wake, &m->lock);
+        if (!m->head) { /* stopping, and nothing left */
+            pthread_mutex_unlock(&m->lock);
+            break;
+        }
         Job *j = m->head;
         m->head = j->next;
         if (!m->head) m->tail = NULL;
+        m->busy = 1;
         pthread_mutex_unlock(&m->lock);
         uint32_t op = j->cmd[0] & 0xffff, skip = (j->cmd[0] >> 16) * 8;
         uint32_t n = j->len > 12 + skip ? j->len - 12 - skip : 0;
@@ -385,6 +407,7 @@ static void *work(void *arg) {
         hv_pvg_lite_complete(m->lite, j->ch, j->cmd[2]);
         free(j->cmd);
         free(j);
+        job_done(m);
     }
     return NULL;
 }
@@ -399,6 +422,7 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
         if (!m->link) { free(m); return NULL; }
         pthread_mutex_init(&m->lock, NULL);
         pthread_cond_init(&m->wake, NULL);
+        pthread_cond_init(&m->idle, NULL);
         if (pthread_create(&m->worker, NULL, link_work, m) != 0) { free(m); return NULL; }
         fprintf(stderr, "hengevm: gpu link %s: waiting for the app's renderer\n", linkpath);
         return m;
@@ -412,6 +436,7 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
     if (mkdir(m->dir, 0755) != 0 && errno != EEXIST) { free(m); return NULL; }
     pthread_mutex_init(&m->lock, NULL);
     pthread_cond_init(&m->wake, NULL);
+    pthread_cond_init(&m->idle, NULL);
     if (pthread_create(&m->worker, NULL, work, m) != 0) { free(m); return NULL; }
     fprintf(stderr, "hengevm: shader capture into %s\n", m->dir);
     return m;
@@ -436,3 +461,29 @@ void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping) { (void)m; (void)mappin
 void hv_pvg_metal_cursor_moved(HvPvgMetal *m) { (void)m; }
 void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) { (void)m; (void)layer; }
 uint64_t hv_pvg_metal_gpu_frames(HvPvgMetal *m) { (void)m; return 0; }
+
+/* Every command handed over is done (its stamp completed): what instant resume waits for before it saves. */
+void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+    if (!m) return;
+    pthread_mutex_lock(&m->lock);
+    while (m->head || m->busy) pthread_cond_wait(&m->idle, &m->lock);
+    pthread_mutex_unlock(&m->lock);
+}
+
+/* The worker finishes what it has and ends (a Mac stopped, to be made again). The link file stays: the app's
+   renderer keeps it mapped and finds the next engine's header in it. */
+void hv_pvg_metal_destroy(HvPvgMetal *m) {
+    if (!m) return;
+    pthread_mutex_lock(&m->lock);
+    m->stop = 1;
+    pthread_cond_signal(&m->wake);
+    pthread_mutex_unlock(&m->lock);
+    pthread_join(m->worker, NULL);
+    if (m->link) munmap(m->link, HV_LINK_FILE_BYTES);
+    free(m);
+}
+
+/* The display's own state lives in the app's renderer on Android (its swapchain, the last frame): nothing of it
+   goes into an instant-resume file; the renderer draws the next frame the guest sends. */
+size_t hv_pvg_metal_display_state(HvPvgMetal *m, void *out, size_t cap) { (void)m; (void)out; (void)cap; return 0; }
+void hv_pvg_metal_set_display_state(HvPvgMetal *m, const void *in, size_t len) { (void)m; (void)in; (void)len; }

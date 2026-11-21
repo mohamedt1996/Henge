@@ -810,6 +810,37 @@ plug-in have no counterpart here, see the section below):
   1.51 -> 0.30, out of line 6.25 -> 5.85). Settings > Compact code: Off (HV_NO_TRAMPS) is the old form.
 - **A block's record is 48 bytes** (64): the RAM range as an index, narrow counts, no flush count.
 
+0.3.67, upstream Henge (iOS) merged in, 223 commits from 0.1 to 0.3 (Leviidev/Henge main, 2026-11-15):
+
+- **JIT and TLB**: TCR_EL1, PAR_EL1 and PAN read inline at EL1 (a Sonoma login's helper exits for MRS 42-79K/s ->
+  8K/s on the iPhone); a code change drops only the cached branch targets into its page (HV_IJC_PAGES); big range
+  TLBIs drop targets only in chunks that hold some; remote drops let walks of other pages through (HV_WALK_LOG);
+  chaining and placing a block wait for the instruction caches once. Kept from this branch where both did the same
+  thing their own way: the chained-exit list by target page (0.3.55, which the JIT parts of 0.3.62 build on), the
+  light refill for page-end accesses (so HV_RECHECK stays off here, on upstream), the shared tails of 0.3.66.
+  Upstream's HV_SWITCH_FLUSH ended off by default (a checked skip found a stale entry); so it is here.
+  `hv_jit_finish2` and `hv_jit_finish_branch` clean the data cache first on Linux (`__clear_cache`): Apple's
+  cores don't need it, Arm's do (QEMU ran stale code without it: test_jit and test_mem crashed).
+- **GPU replay**: macOS 13's and 14's GPU drivers (command 0x37 replayed as 0x43; Sonoma's object lists at task
+  offset 0x4000); compute pipelines in the GPU trace; the display refresh event (HV_PVG_VBLANK, off).
+- **Input**: macOS's virtio mouse driver drops BTN_RIGHT, so the right button is a Control-click (host/vm.c: the
+  pointer's serial queue, `android/compat/dispatch/dispatch.h` here). The USB bus has upstream's **Magic Trackpad 2**
+  on port 2 and the tablet of 0.3.60 moved to **port 3** (HV_USB_TABLET=1), with its late plug-in and slow port
+  reset as before. Settings > Touch: **Magic Trackpad** sends every finger to it (VNC messages 252, 253;
+  ScreenActivity `magicTouch`, after ios/Henge/Trackpad.swift): macOS's own gestures, tap and two-finger-tap clicks,
+  hold to drag.
+- **Instant resume** (Settings, off): Save & Stop sends SIGUSR1; the runner pauses the Mac and writes it with
+  host/snapshot.c (LZ4 from third_party/lz4 behind `android/compat/compression.h`; dispatch's _f forms instead
+  of blocks); the next Start restores it and flaps the network link. The renderer's own state is not in the file.
+- **Mac apps**: upstream's "Mac apps without macOS" runs apps on iOS's own frameworks (Foundation, UIKit), which
+  Android has not, so it is not here. What carries over: the **shared folder** (host/share.c, a WebDAV server on a
+  Unix socket at 10.0.2.4:80 in macOS; `android/compat/copyfile.h`, `removefile.h`), and Settings > Mac apps
+  brings a .dmg, .pkg or .zip from the tablet into its Mac Apps folder, for macOS to open.
+- Also: the memory balloon (virtio-balloon: holes punched in the RAM file), disk images whose real size is
+  reported and transfers over 128 MB, the guest's virtual counter starting at 0 (CNTVOFF), shutdown and restart
+  without leaving the app's process, macOS 12 Monterey booting to Setup. DNS through Apple's resolver (dns_proxy.c)
+  is stubbed: libslirp's own, as before.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

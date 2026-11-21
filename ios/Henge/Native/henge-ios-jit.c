@@ -510,6 +510,68 @@ static void henge_ios_jit_log_map(const char *tag)
 
 static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes);
 
+/*
+ * The room for a Mac app's allocators. iOS gives an app with extended virtual addressing 64 GB of high address space,
+ * 0x7000000000 to 0x8000000000 (measured on iOS 26; V8's iOS build says the same), and nothing large below it.
+ * Chromium's Mac build reserves more than that at start, so the translation layer places those reservations itself
+ * (tl_loader.c, room_place), in two blocks held here from launch before anything else can land in them (zero-fill and
+ * untouched: no memory). The layout it ends up with:
+ *   0x70-0x78  PartitionAlloc's pools (32 GB, aligned to 32), its 16 GB metadata over their unused halves
+ *   0x78-0x7C  Oilpan's unused lower half: V8's 8 GB at 0x78, the JIT region's writable view at 0x7A (not held,
+ *              2.5 GB after it free for everything else), V8's TrustedRange at 0x7B (held)
+ *   0x7C-0x80  Oilpan's upper half (its 32 GB reservation, aligned to 32, only uses this)
+ * Let go when QEMU starts.
+ */
+#define HENGE_HIGH_BASE 0x7000000000ull
+#define HENGE_JIT_VIEW_AT 0x7A00000000ull
+static const struct { uint64_t at, bytes; } g_high_parts[3] = {
+    {0x7000000000ull, 40ull << 30}, {0x7C00000000ull, 16ull << 30},
+    {0x7B00000000ull, 4ull << 30}, /* 4 GB-aligned slots for V8's smaller aligned reservations (its TrustedRange) */
+};
+static vm_address_t g_high_hold[3];
+static bool g_high_hold_given;
+
+static void henge_ios_hold_high(void)
+{
+    for (int i = 0; i < 3; i++) {
+        if (g_high_hold[i]) continue;
+        vm_address_t a = (vm_address_t)g_high_parts[i].at;
+        kern_return_t kr = vm_allocate(mach_task_self(), &a, (vm_size_t)g_high_parts[i].bytes, VM_FLAGS_FIXED);
+        if (kr == KERN_SUCCESS) {
+            vm_protect(mach_task_self(), a, (vm_size_t)g_high_parts[i].bytes, FALSE, VM_PROT_NONE);
+            g_high_hold[i] = a;
+        }
+        HENGE_LOG("high hold for a Mac app's allocators at %#llx (%llu GB): %s", (unsigned long long)g_high_parts[i].at,
+                  (unsigned long long)(g_high_parts[i].bytes >> 30), mach_error_string(kr));
+    }
+}
+
+static void henge_ios_release_high_hold(void)
+{
+    if (g_high_hold_given) return;
+    for (int i = 0; i < 3; i++)
+        if (g_high_hold[i]) {
+            vm_deallocate(mach_task_self(), g_high_hold[i], (vm_size_t)g_high_parts[i].bytes);
+            g_high_hold[i] = 0;
+        }
+}
+
+/* The held blocks, once, for the translation layer to place large reservations in (they stay held: those are mapped
+   over them). Returns how many (0 if none). */
+HENGE_EXPORT int henge_ios_take_high_room(void **base, size_t *bytes)
+{
+    if (g_high_hold_given) return 0;
+    int n = 0;
+    for (int i = 0; i < 3; i++)
+        if (g_high_hold[i]) {
+            base[n] = (void *)g_high_hold[i];
+            bytes[n] = (size_t)g_high_parts[i].bytes;
+            n++;
+        }
+    g_high_hold_given = n > 0;
+    return n;
+}
+
 static HengeDualMapping henge_prewarmed;
 static bool henge_prewarm_done;
 
@@ -519,6 +581,7 @@ HENGE_EXPORT bool henge_ios_jit_prewarm(size_t bytes)
         return henge_prewarmed.rw_addr != NULL;
     }
     henge_prewarm_done = true;
+    henge_ios_hold_high();
     henge_prewarmed = henge_ios_jit_allocate_real(bytes);
     fprintf(stderr, "[henge-jit] prewarm %s: %zu bytes\n",
             henge_prewarmed.rw_addr ? "OK" : "FAILED", bytes);
@@ -570,6 +633,7 @@ HENGE_EXPORT bool henge_ios_jit_reserve_bottom(size_t end)
 
 HengeDualMapping henge_ios_jit_allocate(size_t bytes)
 {
+    henge_ios_release_high_hold(); /* QEMU is starting: the room is the Mac's */
     /*
      * Hand back the prewarmed region when it is big enough. QEMU asks for
      * exactly tb-size, which is what prewarm was given, so this is the normal
@@ -706,6 +770,11 @@ static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes)
             kr = vm_remap(mach_task_self(), &rw, (vm_size_t)bytes, /*mask=*/0, VM_FLAGS_FIXED,
                           mach_task_self(), (vm_address_t)rx, /*copy=*/FALSE, &cur_prot, &max_prot, VM_INHERIT_NONE);
         }
+    }
+    if (kr != KERN_SUCCESS && g_high_hold[0]) {
+        rw = (vm_address_t)HENGE_JIT_VIEW_AT; /* in the room's unheld middle, where Oilpan's lower half goes unused */
+        kr = vm_remap(mach_task_self(), &rw, (vm_size_t)bytes, 0, VM_FLAGS_FIXED, mach_task_self(), (vm_address_t)rx, FALSE,
+                      &cur_prot, &max_prot, VM_INHERIT_NONE);
     }
     if (kr != KERN_SUCCESS) {
         HENGE_LOG("#%llu: no free space within 2 GiB of rx=%p for the writable view: placing it anywhere", (unsigned long long)n, rx);
@@ -929,6 +998,7 @@ HengeDualMapping henge_ios_jit_allocate(size_t bytes)
 {
     return henge_ios_jit_allocate_real(bytes);
 }
+int henge_ios_take_high_room(void **base, size_t *bytes) { (void)base, (void)bytes; return 0; }
 bool henge_ios_jit_prewarm(size_t bytes) { (void)bytes; return false; }
 bool henge_ios_jit_prewarm_self(size_t bytes) { (void)bytes; return false; }
 bool henge_ios_jit_reserve_bottom(size_t end) { (void)end; return true; }

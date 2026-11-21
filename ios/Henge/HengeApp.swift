@@ -43,6 +43,7 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var running: VirtualMac?
     @State private var tab = Tab.macs
+    @AppStorage(DeskAppearance.key) private var appearance = DeskAppearance.system
 
     var body: some View {
         ZStack {
@@ -60,20 +61,43 @@ struct RootView: View {
             .tint(Desk.accentLight)
             if let running {
                 SessionView(mac: running) { self.running = nil }
+                    .environment(\.colorScheme, .dark) // still dark while it fades out over a light page
                     .transition(.opacity)
             }
         }
-        .preferredColorScheme(.dark)
+        .background(WindowStyle(style: running != nil ? .dark : appearance.style))
         .sheet(isPresented: $jit.showSetup) { JITSetupFlow() }
-        .onChange(of: scenePhase) { phase in
-            guard phase == .active else { return }
-            // Back from StikDebug or TrollStore: claim the JIT region while the debugger is there.
-            JITBootstrap.prewarm()
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
             machines.collectImports()
             jit.enableAtLaunchIfAsked()
+            // StikDebug can launch Henge before it attaches. A task also runs
+            // on the first appearance, when there may be no phase change.
+            for _ in 0..<100 {
+                guard !Task.isCancelled else { return }
+                if JITBootstrap.prewarmed || JITBootstrap.isLive {
+                    jit.objectWillChange.send()
+                    return
+                }
+                if JITBootstrap.debuggedFlag || JITBootstrap.canGrantOwnJIT {
+                    JITBootstrap.prewarm()
+                    // Readiness lives outside the observable coordinator.
+                    jit.objectWillChange.send()
+                    return
+                }
+                do { try await Task.sleep(nanoseconds: 100_000_000) }
+                catch { return } // going into the background cancels this wait
+            }
         }
         .onChange(of: jit.attachGeneration) { _ in JITBootstrap.prewarm() } // the built-in helper attached
-        .task { await Autopilot.run { mac in running = mac } } // testing only: HENGE_AUTOPILOT
+        .task { // testing only: HENGE_AUTOPILOT
+            await Autopilot.run { mac in
+                // A session still on screen (its Mac stopped) is closed first: the same value again would start nothing.
+                guard running != nil else { running = mac; return }
+                running = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { running = mac }
+            }
+        }
     }
 }
 

@@ -141,7 +141,16 @@ static void stop(void *opaque) {
     pthread_mutex_unlock(&A.mu);
 }
 
+static int listening; /* the port and the threads stay from the first attach on: the app keeps its connection */
+
 void hv_audio_attach(HvVirtioSnd *d) {
+    if (listening) { /* again, after hv_audio_detach (a Mac paused and run on): the same port and app */
+        pthread_mutex_lock(&A.mu);
+        A.d = d;
+        pthread_mutex_unlock(&A.mu);
+        d->backend = (HvVirtioSndBackend){start, stop, d};
+        return;
+    }
     const char *p = getenv("HV_AUDIO_PORT");
     int port = p && *p ? atoi(p) : 5901;
     if (port <= 0) return; /* HV_AUDIO_PORT=0: no sound; the device drains by the clock */
@@ -162,6 +171,12 @@ void hv_audio_attach(HvVirtioSnd *d) {
     pthread_detach(t);
     if (pthread_create(&t, NULL, pump_thread, NULL)) return;
     pthread_detach(t);
+    listening = 1;
     d->backend = (HvVirtioSndBackend){start, stop, d};
     fprintf(stderr, "hengevm: sound on 127.0.0.1:%d, for the app to play\n", port);
+}
+
+/* The Mac paused (instant resume) or stopping: nothing more is played; the stream's state stays in the device. */
+void hv_audio_detach(void) {
+    stop(NULL);
 }

@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <time.h>
 
 #include "machine.h"
 
@@ -24,7 +25,7 @@ enum {
     TRB_TRANSFER_EVENT = 32, TRB_CMD_COMPLETION = 33, TRB_PORT_STATUS = 34,
 };
 /* Completion codes. */
-enum { CC_SUCCESS = 1, CC_TRB_ERROR = 5, CC_STALL = 6, CC_SLOTS_FULL = 9, CC_SHORT_PACKET = 13, CC_CONTEXT_STATE = 19 };
+enum { CC_SUCCESS = 1, CC_TRB_ERROR = 5, CC_STALL = 6, CC_SLOTS_FULL = 9, CC_SLOT_NOT_ENABLED = 11, CC_SHORT_PACKET = 13, CC_CONTEXT_STATE = 19 };
 
 /* PORTSC bits. */
 #define PORT_CCS (1u << 0)
@@ -43,37 +44,92 @@ enum { CC_SUCCESS = 1, CC_TRB_ERROR = 5, CC_STALL = 6, CC_SLOTS_FULL = 9, CC_SHO
 #define PORT_CEC (1u << 23)
 #define PORT_CHANGES (PORT_CSC | PORT_PEC | PORT_WRC | PORT_OCC | PORT_PRC | PORT_PLC | PORT_CEC)
 #define SPEED_FULL 1
+#define SPEED_HIGH 2
 
-#define KBD_DCI_IN 3 /* endpoint 1 IN */
-#define PTR_DCI_IN 3 /* the tablet's endpoint 1 IN, on its own slot */
-#define KBD 0        /* dev[]: the keyboard, port 1 */
-#define TAB 1        /* the tablet, port 2 */
+/* ---- the devices' descriptors ---- */
 
-/* ---- the keyboard's descriptors (USB HID 1.11 boot keyboard) ---- */
+/* Port 1: a USB HID 1.11 boot keyboard. */
 
-static const uint8_t report_desc[] = {
+static const uint8_t kbd_report_desc[] = {
     0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0x00, 0x25, 0x01,
     0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01, 0x95, 0x05, 0x75, 0x01,
     0x05, 0x08, 0x19, 0x01, 0x29, 0x05, 0x91, 0x02, 0x95, 0x01, 0x75, 0x03, 0x91, 0x01, 0x95, 0x06,
     0x75, 0x08, 0x15, 0x00, 0x26, 0xff, 0x00, 0x05, 0x07, 0x19, 0x00, 0x29, 0xff, 0x81, 0x00, 0xc0,
 };
 
-static const uint8_t device_desc[18] = {
+static const uint8_t kbd_device_desc[18] = {
     18, 1, 0x00, 0x02, 0, 0, 0, 64, /* USB 2.0, class per interface, EP0 64 bytes */
     0xac, 0x05, 0x20, 0x02,         /* vendor Apple, product 0x0220 (an ANSI keyboard): macOS knows its layout, no Keyboard Setup Assistant */
     0x00, 0x01, 1, 2, 3, 1,         /* bcdDevice 1.00, strings 1-3, one configuration */
 };
 
-static const uint8_t config_desc[34] = {
+static const uint8_t kbd_config_desc[34] = {
     9, 2, 34, 0, 1, 1, 0, 0xa0, 50,           /* one interface, remote wakeup, 100 mA */
     9, 4, 0, 0, 1, 3, 1, 1, 0,                /* interface 0: HID, boot, keyboard */
-    9, 0x21, 0x11, 0x01, 0, 1, 0x22, sizeof report_desc, 0, /* HID 1.11, one report descriptor */
+    9, 0x21, 0x11, 0x01, 0, 1, 0x22, sizeof kbd_report_desc, 0, /* HID 1.11, one report descriptor */
     7, 5, 0x81, 3, 8, 0, 10,                  /* EP1 IN, interrupt, 8 bytes, every 10 ms */
 };
 
-/* HV_USB_TABLET=1: port 2, an absolute pointer. QEMU's usb-tablet as a full-speed device (IDs, descriptors,
-   report: three buttons, X and Y 0..32767, a wheel), which macOS guests drive with the generic HID pointer
-   driver. */
+static const char *const kbd_strings[] = {NULL, "HengeVM", "HengeVM USB Keyboard", "1"};
+
+/* Port 2: an Apple Magic Trackpad 2 (vendor 0x05AC, product 0x0265). The report
+   descriptor is the real device's: a boot-mouse face (report ID 2), a 16-byte
+   vendor data channel (report 0x3f) and a 1387-byte vendor blob (report 0x44).
+   The multitouch report is NOT declared anywhere: after the guest sends
+   feature report {2, 1}, the pad simply starts sending report ID 2 with a
+   12-byte prefix and nine bytes a finger, which the guest's driver knows by
+   the device ID. (The Linux kernel's hid-magicmouse does the same: it
+   registers the MT2's report ID 2 by hand, because the descriptor omits it.) */
+
+static const uint8_t tp_report_desc[] = {
+    /* The mouse face: what the pad looks like before the guest switches it to multitouch. */
+    0x05, 0x01, 0x09, 0x02, 0xa1, 0x01,       /* usage page (generic desktop), usage (mouse), collection (application) */
+    0x09, 0x01, 0xa1, 0x00,                  /* usage (pointer), collection (physical) */
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, /* buttons 1-3 */
+    0x85, 0x02,                              /* report ID 2 */
+    0x95, 0x03, 0x75, 0x01, 0x81, 0x02,
+    0x95, 0x01, 0x75, 0x05, 0x81, 0x01,
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7f, /* X, Y, -127..127 */
+    0x75, 0x08, 0x95, 0x02, 0x81, 0x06,
+    0x95, 0x04, 0x75, 0x08, 0x81, 0x01,
+    0xc0, 0xc0,
+    /* A 16-byte vendor data channel (report 0x3f). */
+    0x05, 0x0d, 0x09, 0x05, 0xa1, 0x01,       /* usage page (digitizer), usage (touch pad), collection (application) */
+    0x06, 0x00, 0xff, 0x09, 0x0c,             /* vendor page 0xff00, usage 0x0c */
+    0x15, 0x00, 0x26, 0xff, 0x00,
+    0x75, 0x08, 0x95, 0x10,
+    0x85, 0x3f,
+    0x81, 0x22,                               /* data, variable, volatile */
+    0xc0,
+    /* A 1387-byte vendor blob (report 0x44). */
+    0x06, 0x00, 0xff, 0x09, 0x0c,             /* vendor page 0xff00, usage 0x0c */
+    0xa1, 0x01,                               /* collection (application) */
+    0x06, 0x00, 0xff, 0x09, 0x0c,             /* usage 0x0c */
+    0x15, 0x00, 0x26, 0xff, 0x00,
+    0x85, 0x44,
+    0x75, 0x08, 0x96, 0x6b, 0x05,             /* 1387 bytes */
+    0x81, 0x00,                               /* constant */
+    0xc0,
+};
+
+static const uint8_t tp_device_desc[18] = {
+    18, 1, 0x00, 0x02, 0, 0, 0, 64, /* USB 2.0, class per interface, EP0 64 bytes */
+    0xac, 0x05, 0x65, 0x02,         /* vendor Apple, product 0x0265 (Magic Trackpad 2) */
+    0x20, 0x02, 1, 2, 3, 1,         /* bcdDevice 2.20, strings 1-3, one configuration */
+};
+
+static const uint8_t tp_config_desc[34] = {
+    9, 2, 34, 0, 1, 1, 0, 0xa0, 50,           /* one interface, remote wakeup, 100 mA */
+    9, 4, 0, 0, 1, 3, 2, 1, 0,                /* interface 0: HID, boot, mouse */
+    9, 0x21, 0x11, 0x01, 0, 1, 0x22, sizeof tp_report_desc, 0, /* HID 1.11, one report descriptor */
+    7, 5, 0x81, 3, 64, 0, 4,                  /* EP1 IN, interrupt, 64 bytes, every 4 ms */
+};
+
+static const char *const tp_strings[] = {NULL, "Apple Inc.", "Magic Trackpad 2", "HengeVM"};
+
+/* HV_USB_TABLET=1 (Android): port 3, an absolute pointer. QEMU's usb-tablet as a full-speed device (IDs,
+   descriptors, report: three buttons, X and Y 0..32767, a wheel), which macOS guests drive with the generic HID
+   pointer driver. */
 static const uint8_t ptr_report_desc[] = {
     0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x03,
     0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x05, 0x81, 0x01,
@@ -85,7 +141,7 @@ static const uint8_t ptr_report_desc[] = {
 static const uint8_t ptr_device_desc[18] = {
     18, 1, 0x00, 0x02, 0, 0, 0, 64, /* USB 2.0, class per interface, EP0 64 bytes */
     0x27, 0x06, 0x01, 0x00,         /* QEMU's tablet: vendor 0x0627, product 0x0001 */
-    0x00, 0x00, 4, 5, 6, 1,         /* bcdDevice 0.00, strings 4-6, one configuration */
+    0x00, 0x00, 1, 2, 3, 1,         /* bcdDevice 0.00, strings 1-3, one configuration */
 };
 
 static const uint8_t ptr_config_desc[34] = {
@@ -95,15 +151,30 @@ static const uint8_t ptr_config_desc[34] = {
     7, 5, 0x81, 3, 8, 0, 10,                  /* EP1 IN, interrupt, 8 bytes, every 10 ms */
 };
 
-static const char *const strings[] = {NULL, "HengeVM", "HengeVM USB Keyboard", "1", "QEMU", "QEMU USB Tablet", "28754"};
+static const char *const ptr_strings[] = {NULL, "QEMU", "QEMU USB Tablet", "28754"};
 
-/* The tablet's setting up, as it happens: the log says whether macOS takes it, and where it stops (at most 80
-   lines, the report counts apart). */
+struct HvXhciDev {
+    const char *const *strings;
+    const uint8_t *device_desc;
+    const uint8_t *config_desc;
+    const uint8_t *report_desc;
+    unsigned report_desc_len;
+};
+static const struct HvXhciDev devs[HV_XHCI_DEVICES] = {
+    {kbd_strings, kbd_device_desc, kbd_config_desc, kbd_report_desc, sizeof kbd_report_desc},
+    {tp_strings, tp_device_desc, tp_config_desc, tp_report_desc, sizeof tp_report_desc},
+    {ptr_strings, ptr_device_desc, ptr_config_desc, ptr_report_desc, sizeof ptr_report_desc},
+};
+
+#define TAB HV_XHCI_TAB
+#define TAB_PORT 2 /* portsc[] index of port 3 */
+
+/* The tablet's setting up, as it happens: the log says whether macOS takes it, and where it stops. */
 static void tlog(HvXhci *x, int d, const char *what) {
     if (d == TAB && x->ptr_said++ < 60) fprintf(stderr, "hengevm: usb tablet: %s\n", what);
 }
 
-/* The steps that say how far macOS got: always logged (0.3.62's 80 lines went on port resets). */
+/* The steps that say how far macOS got: always logged. */
 static void tmile(HvXhci *x, int d, const char *what) {
     (void)x;
     if (d == TAB) fprintf(stderr, "hengevm: usb tablet: %s\n", what);
@@ -236,35 +307,105 @@ static void set_ep_state(HvXhci *x, int slot, int dci, uint32_t state) {
     wr(x, ctx, &dw0, 4);
 }
 
-/* ---- the keyboard's control requests ---- */
+/* ---- endpoint 0: the devices' control requests ---- */
+
+static int tp_build_report(HvXhci *x, uint8_t *out);
+
+/* The Magic Trackpad 2's surface, in 0.01 mm (160.0 x 114.9 mm). The guest's driver
+   reads it out of the sensor-surface register to scale touches into millimetres. */
+#define HV_TP_PHYS_X 16000
+#define HV_TP_PHYS_Y 11490
+
+/* Before the guest's multitouch driver will use the pad it reads a handful of
+   sensor-configuration registers: it selects one by writing feature report 1, reads
+   report 1 back for a five-byte header giving the register's length, then reads the
+   register itself. These are the Magic Trackpad 2's answers, as VoodooInput's
+   simulator gives them (the I2C trackpad emulators talk the same protocol). Returns
+   the register's bytes, report ID first, or 0 for one we do not know. */
+static int tp_register(int rid, uint8_t *out) {
+    uint8_t wl = HV_TP_PHYS_X & 0xff, wh = (HV_TP_PHYS_X >> 8) & 0xff;
+    uint8_t hl = HV_TP_PHYS_Y & 0xff, hh = (HV_TP_PHYS_Y >> 8) & 0xff;
+    static const uint8_t d1[] = {0xd1, 0x81}; /* family ID */
+    static const uint8_t d3[] = {0xd3, 0x01, 0x16, 0x1e, 0x03, 0x95, 0x00, 0x14, 0x1e, 0x62, 0x05, 0x00, 0x00}; /* sensor rows/columns */
+    static const uint8_t d0[] = {0xd0, 0x02, 0x01, 0x00, 0x14, 0x01, 0x00, 0x1e, 0x00, 0x02, 0x14, 0x02, 0x01, 0x0e, 0x02, 0x00}; /* sensor region */
+    static const uint8_t a1[] = {0xa1, 0x00, 0x00, 0x05, 0x00, 0xfc, 0x01}; /* sensor region param */
+    static const uint8_t s7f[] = {0x7f, 0x00, 0x00, 0x00, 0x00};
+    switch (rid) {
+    case 0xd1: memcpy(out, d1, sizeof d1); return (int)sizeof d1;
+    case 0xd3: memcpy(out, d3, sizeof d3); return (int)sizeof d3;
+    case 0xd0: memcpy(out, d0, sizeof d0); return (int)sizeof d0;
+    case 0xa1: memcpy(out, a1, sizeof a1); return (int)sizeof a1;
+    case 0x7f: memcpy(out, s7f, sizeof s7f); return (int)sizeof s7f;
+    case 0xc8: out[0] = 0xc8; out[1] = 0x08; return 2;
+    case 0xd9: { /* sensor surface: width and height, then a fixed calibration tail */
+        const uint8_t d9[] = {0xd9, wl, wh, 0, 0, hl, hh, 0, 0, 0x44, 0xe3, 0x52, 0xff, 0xbd, 0x1e, 0xe4, 0x26};
+        memcpy(out, d9, sizeof d9); return (int)sizeof d9;
+    }
+    case 0xdb: { /* the whole sensor description: every register, length-prefixed */
+        const uint8_t db[] = {
+            0xdb, 0x01, 0x02, 0x00,
+            0xd1, 0x81, 0x0d, 0x00,
+            0xd3, 0x01, 0x16, 0x1e, 0x03, 0x95, 0x00, 0x14, 0x1e, 0x62, 0x05, 0x00, 0x00, 0x10, 0x00,
+            0xd0, 0x02, 0x01, 0x00, 0x14, 0x01, 0x00, 0x1e, 0x00, 0x02, 0x14, 0x02, 0x01, 0x0e, 0x02, 0x00, 0x07, 0x00,
+            0xa1, 0x00, 0x00, 0x05, 0x00, 0xfc, 0x01, 0x11, 0x00,
+            0xd9, wl, wh, 0, 0, hl, hh, 0, 0, 0x44, 0xe3, 0x52, 0xff, 0xbd, 0x1e, 0xe4, 0x26,
+            0x7f, 0x00, 0x00, 0x00, 0x00,
+        };
+        memcpy(out, db, sizeof db); return (int)sizeof db;
+    }
+    default: return 0;
+    }
+}
+
+/* Feature report 1 was written with a register ID: remember the five-byte header the
+   guest reads back next, telling it how long that register's answer is. */
+static void tp_select(HvXhci *x, int reg) {
+    uint8_t scratch[80];
+    int n = tp_register(reg, scratch);
+    if (n <= 0) { x->tp_f1_len = 0; return; }
+    x->tp_f1[0] = 0x01;
+    x->tp_f1[1] = (uint8_t)reg;
+    x->tp_f1[2] = 0x00;
+    x->tp_f1[3] = (uint8_t)((n - 1) & 0xff);
+    x->tp_f1[4] = (uint8_t)(((n - 1) >> 8) & 0xff);
+    x->tp_f1_len = 5;
+}
 
 /* Answer a SETUP on endpoint 0. Returns the reply length (data to send for IN
    requests), or -1 to stall. */
-static int control(HvXhci *x, int d, const uint8_t setup[8], uint8_t *out, int max) {
-    HvXhciDev *dv = &x->dev[d];
-    int tab = d == TAB;
+static int control(HvXhci *x, int slot, const uint8_t setup[8], uint8_t *out, int max) {
+    const struct HvXhciDev *d = &devs[x->slots[slot].dev];
     uint8_t type = setup[0], req = setup[1];
     uint16_t value = (uint16_t)(setup[2] | setup[3] << 8);
     if (xlog()) fprintf(stderr, "xhci: request %02x %02x value %04x len %u\n", type, req, value, setup[6] | setup[7] << 8);
-    if (tab) {
+    int dev = x->slots[slot].dev;
+    if (dev == TAB) {
         char msg[96];
         snprintf(msg, sizeof msg, "request %02x %02x value %04x index %u length %u", type, req, value, setup[4] | setup[5] << 8,
                  setup[6] | setup[7] << 8);
-        tlog(x, d, msg);
+        tlog(x, dev, msg);
+    }
+    /* Every request the trackpad gets goes to the log, unconditionally: the guest's
+       driver handshake is exactly what we are trying to watch. Capped so a polling
+       driver cannot flood it. */
+    if (x->slots[slot].dev == 1 && x->tp_reqs < 80) {
+        x->tp_reqs++;
+        fprintf(stderr, "hengevm: xhci: tp request %02x %02x value %04x index %04x len %u\n",
+                type, req, value, setup[4] | setup[5] << 8, setup[6] | setup[7] << 8);
     }
     const uint8_t *src = NULL;
     int len = 0;
-    uint8_t tmp[64];
+    uint8_t tmp[HV_TP_REPORT_LEN + 8];
     if (type == 0x80 && req == 6) { /* GET_DESCRIPTOR (device) */
         uint8_t dt = value >> 8, idx = value & 0xff;
-        if (dt == 1) src = tab ? ptr_device_desc : device_desc, len = 18;
-        else if (dt == 2) src = tab ? ptr_config_desc : config_desc, len = 34;
+        if (dt == 1) src = d->device_desc, len = 18;
+        else if (dt == 2) src = d->config_desc, len = 34;
         else if (dt == 3) {
             if (idx == 0) {
                 tmp[0] = 4, tmp[1] = 3, tmp[2] = 0x09, tmp[3] = 0x04; /* English (US) */
                 src = tmp, len = 4;
-            } else if (idx < sizeof strings / sizeof strings[0]) {
-                const char *s = strings[idx];
+            } else if (idx < 4) {
+                const char *s = d->strings[idx];
                 int n = (int)strlen(s);
                 tmp[0] = (uint8_t)(2 + 2 * n), tmp[1] = 3;
                 for (int i = 0; i < n; i++) tmp[2 + 2 * i] = (uint8_t)s[i], tmp[3 + 2 * i] = 0;
@@ -273,11 +414,11 @@ static int control(HvXhci *x, int d, const uint8_t setup[8], uint8_t *out, int m
                 return -1;
         } else
             return -1; /* no device qualifier: full speed only */
-    } else if (type == 0x81 && req == 6) { /* GET_DESCRIPTOR (interface): HID, report; wIndex: the interface */
+    } else if (type == 0x81 && req == 6) { /* GET_DESCRIPTOR (interface): HID, report */
         if ((value >> 8) == 0x22) {
-            src = tab ? ptr_report_desc : report_desc, len = tab ? (int)sizeof ptr_report_desc : (int)sizeof report_desc;
-            if (tab) tmile(x, d, "macOS read the report descriptor");
-        } else if ((value >> 8) == 0x21) src = tab ? ptr_config_desc + 18 : config_desc + 18, len = 9;
+            src = d->report_desc, len = (int)d->report_desc_len;
+            if (dev == TAB) tmile(x, dev, "macOS read the report descriptor");
+        } else if ((value >> 8) == 0x21) src = d->config_desc + 18, len = 9;
         else return -1;
     } else if (type == 0x80 && req == 0) { /* GET_STATUS */
         tmp[0] = 0, tmp[1] = 0;
@@ -286,31 +427,67 @@ static int control(HvXhci *x, int d, const uint8_t setup[8], uint8_t *out, int m
         tmp[0] = 0, tmp[1] = 0;
         src = tmp, len = 2;
     } else if (type == 0x80 && req == 8) { /* GET_CONFIGURATION */
-        tmp[0] = (uint8_t)dv->configured;
+        tmp[0] = (uint8_t)x->slots[slot].configured;
         src = tmp, len = 1;
     } else if (type == 0x00 && req == 9) { /* SET_CONFIGURATION */
-        dv->configured = value & 0xff;
-        if (!tab && dv->configured) plug_after(x, 2000000000ull); /* the keyboard is set up: the driver is ready for another */
-        if (tab) {
+        x->slots[slot].configured = value & 0xff;
+        if (dev == HV_XHCI_KBD && x->slots[slot].configured) plug_after(x, 2000000000ull); /* the driver is ready for another */
+        if (dev == TAB) {
             char msg[64];
-            snprintf(msg, sizeof msg, "configuration %d set", dv->configured);
-            tmile(x, d, msg);
+            snprintf(msg, sizeof msg, "configuration %d set", x->slots[slot].configured);
+            tmile(x, dev, msg);
         }
         return 0;
     } else if (type == 0x81 && req == 10) { /* GET_INTERFACE */
         tmp[0] = 0;
         src = tmp, len = 1;
-    } else if (type == 0xa1 && req == 1) { /* GET_REPORT */
-        if (tab) src = x->pstate, len = 6;
-        else src = x->state, len = 8;
+    } else if (type == 0xa1 && req == 1) { /* GET_REPORT: wValue is (type << 8) | report ID */
+        if (x->slots[slot].dev == 0) src = x->state, len = 8;
+        else if (dev == TAB) src = x->pstate, len = 6;
+        else {
+            int rtype = value >> 8, rid = value & 0xff;
+            if (rtype == 3) { /* feature: the sensor-configuration registers */
+                if (rid == 0x01) { /* the header for the register just selected */
+                    if (!x->tp_f1_len) return -1;
+                    src = x->tp_f1;
+                    len = x->tp_f1_len;
+                } else if (rid == 0x00) {
+                    tmp[0] = 0x00; tmp[1] = 0x01;
+                    src = tmp; len = 2;
+                } else if (rid == 0x02) { /* multitouch mode: on */
+                    tmp[0] = 0x02; tmp[1] = 0x01;
+                    src = tmp; len = 2;
+                } else {
+                    len = tp_register(rid, tmp);
+                    if (!len) return -1;
+                    src = tmp;
+                }
+            } else if (rid == 0x02) { /* input: the current touch state */
+                pthread_mutex_lock(&x->mu);
+                len = tp_build_report(x, tmp);
+                pthread_mutex_unlock(&x->mu);
+                src = tmp;
+            } else if (rid == 0x3f) { /* the vendor data channel: nothing on it */
+                memset(tmp, 0, 16);
+                len = 16;
+            } else { /* 0x44 is a constant report: zeros, as far as we are concerned */
+                memset(out, 0, (size_t)max);
+                return max;
+            }
+        }
     } else if (type == 0xa1 && (req == 2 || req == 3)) { /* GET_IDLE, GET_PROTOCOL */
-        tmp[0] = req == 3 && !tab ? 1 : 0;
+        tmp[0] = req == 3 && dev != TAB ? 1 : 0; /* the tablet has no boot protocol */
         src = tmp, len = 1;
     } else if ((type & 0x60) == 0x20 || (type == 0x00 && (req == 1 || req == 3)) || (type == 0x01 && req == 11) ||
-               (type == 0x02 && (req == 1 || req == 3))) {
-        return 0; /* SET_IDLE, SET_PROTOCOL, SET_REPORT (LEDs), features, SET_INTERFACE: accepted */
+               (type == 0x02 && (req == 1 || req == 3)) ||
+               ((type & 0x60) == 0x40 && x->slots[slot].dev == 1)) {
+        /* SET_IDLE, SET_PROTOCOL, SET_REPORT (the trackpad's multitouch switch and friends): accepted.
+           Vendor requests to the trackpad too: stalling one may be what stops the guest's
+           driver handshake cold, and we cannot tell what it wants yet. */
+        return 0;
     } else {
-        if (x->m->log) fprintf(stderr, "hengevm: xhci: unhandled request %02x %02x value %04x\n", type, req, value);
+        if (x->m->log) fprintf(stderr, "hengevm: xhci: unhandled request %02x %02x value %04x (slot %d, device %d)\n",
+                               type, req, value, slot, x->slots[slot].dev);
         return -1;
     }
     if (len > max) len = max;
@@ -318,11 +495,9 @@ static int control(HvXhci *x, int d, const uint8_t setup[8], uint8_t *out, int m
     return len;
 }
 
-/* Run the control transfers queued on a device's endpoint 0. */
-static void run_ep0(HvXhci *x, int d) {
-    HvXhciDev *dv = &x->dev[d];
-    int slot = dv->slot;
-    HvXhciRing *r = &dv->ep[1];
+/* Run the control transfers queued on the device's endpoint 0. */
+static void run_ep0(HvXhci *x, int slot) {
+    HvXhciRing *r = &x->slots[slot].ep[1];
     uint32_t trb[4];
     uint64_t at;
     uint8_t setup[8], reply[256];
@@ -333,13 +508,13 @@ static void run_ep0(HvXhci *x, int d) {
         if (type == TRB_SETUP) {
             memcpy(setup, trb, 8);
             uint16_t wlen = (uint16_t)(setup[6] | setup[7] << 8);
-            reply_len = control(x, d, setup, reply, wlen < sizeof reply ? wlen : (int)sizeof reply);
+            reply_len = control(x, slot, setup, reply, wlen < sizeof reply ? wlen : (int)sizeof reply);
             stalled = reply_len < 0;
             ring_advance(r);
             if (stalled) {
                 transfer_event(x, at, CC_STALL, 0, slot, 1);
                 set_ep_state(x, slot, 1, 2); /* halted */
-                dv->ep_running[1] = 0;
+                x->slots[slot].ep_running[1] = 0;
                 return;
             }
             if (ioc) transfer_event(x, at, CC_SUCCESS, 0, slot, 1);
@@ -353,6 +528,19 @@ static void run_ep0(HvXhci *x, int d) {
                 if (n) wr(x, buf, reply, n);
             } else {
                 n = want; /* SET_REPORT and friends: take the data and ignore it */
+                if (x->slots[slot].dev == 1 && want >= 2) {
+                    uint8_t data[2];
+                    rd(x, buf, data, 2); /* the data lives in guest memory, at the TRB's pointer */
+                    if (data[0] == 0x02 && (data[1] & 1)) {
+                        x->tp_mt = 1; /* the guest switched the pad to multitouch */
+                        fprintf(stderr, "hengevm: xhci: trackpad: multitouch on\n");
+                    } else if (data[0] == 0x01) {
+                        tp_select(x, data[1]); /* the guest selected a sensor register to read */
+                        fprintf(stderr, "hengevm: xhci: trackpad: select register %02x (%d bytes)\n", data[1], x->tp_f1_len ? x->tp_f1[3] : 0);
+                    } else {
+                        fprintf(stderr, "hengevm: xhci: trackpad: set report %02x %02x\n", data[0], data[1]);
+                    }
+                }
             }
             ring_advance(r);
             int isp = (trb[3] >> 2) & 1;
@@ -367,74 +555,88 @@ static void run_ep0(HvXhci *x, int d) {
     }
 }
 
-/* Give waiting key reports to the interrupt IN endpoint's posted transfers. */
-static void run_ep_in(HvXhci *x) {
-    HvXhciDev *dv = &x->dev[KBD];
-    int slot = dv->slot;
-    if (!slot || !dv->ep_running[KBD_DCI_IN]) return;
-    HvXhciRing *r = &dv->ep[KBD_DCI_IN];
+/* Give the device's waiting reports to the interrupt IN endpoint's posted transfers. */
+static void run_ep_in(HvXhci *x, int slot) {
+    struct HvXhciSlot *s = &x->slots[slot];
+    int dci = -1;
+    for (int d = 2; d < HV_XHCI_EPS; d++) if (s->ep_running[d]) { dci = d; break; }
+    if (s->dev < 0 || dci < 0) return;
+    HvXhciRing *r = &s->ep[dci];
     uint32_t trb[4];
     uint64_t at;
     pthread_mutex_lock(&x->mu);
-    while (x->rhead != x->rtail && ring_peek(x, r, trb, &at)) {
-        int type = (trb[3] >> 10) & 0x3f;
-        ring_advance(r);
-        if (type != TRB_NORMAL) continue;
-        uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
-        uint32_t want = trb[2] & 0x1ffff;
-        uint32_t n = want < 8 ? want : 8;
-        wr(x, buf, x->reports[x->rhead % HV_XHCI_REPORTS], n);
-        x->rhead++;
-        x->delivered++;
-        transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, KBD_DCI_IN);
-    }
-    pthread_mutex_unlock(&x->mu);
-}
-
-/* The same for the absolute pointer's reports (HV_USB_TABLET=1). */
-static void run_ptr_in(HvXhci *x) {
-    HvXhciDev *dv = &x->dev[TAB];
-    int slot = dv->slot;
-    if (!slot || !x->tablet || !dv->ep_running[PTR_DCI_IN]) return;
-    HvXhciRing *r = &dv->ep[PTR_DCI_IN];
-    uint32_t trb[4];
-    uint64_t at;
-    pthread_mutex_lock(&x->mu);
-    while (x->phead != x->ptail && ring_peek(x, r, trb, &at)) {
-        int type = (trb[3] >> 10) & 0x3f;
-        ring_advance(r);
-        if (type != TRB_NORMAL) continue;
-        uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
-        uint32_t want = trb[2] & 0x1ffff;
-        uint32_t n = want < 6 ? want : 6;
-        wr(x, buf, x->preports[x->phead % HV_XHCI_REPORTS], n);
-        x->phead++;
-        uint64_t nd = ++x->pdelivered;
-        if (nd == 1 || nd == 100 || nd == 1000 || nd == 10000 || nd == 100000) {
-            char msg[64];
-            snprintf(msg, sizeof msg, "%llu reports read by macOS (after %u port resets)", (unsigned long long)nd, x->ptr_resets);
-            tmile(x, TAB, msg);
+    if (s->dev == TAB) {
+        while (x->phead != x->ptail && ring_peek(x, r, trb, &at)) {
+            int type = (trb[3] >> 10) & 0x3f;
+            ring_advance(r);
+            if (type != TRB_NORMAL) continue;
+            uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
+            uint32_t want = trb[2] & 0x1ffff;
+            uint32_t n = want < 6 ? want : 6;
+            wr(x, buf, x->preports[x->phead % HV_XHCI_REPORTS], n);
+            x->phead++;
+            uint64_t nd = ++x->pdelivered;
+            if (nd == 1 || nd == 100 || nd == 1000 || nd == 10000 || nd == 100000) {
+                char msg[64];
+                snprintf(msg, sizeof msg, "%llu reports read by macOS (after %u port resets)", (unsigned long long)nd, x->ptr_resets);
+                tmile(x, TAB, msg);
+            }
+            transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, dci);
         }
-        transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, PTR_DCI_IN);
+    } else if (s->dev == 0) {
+        while (x->rhead != x->rtail && ring_peek(x, r, trb, &at)) {
+            int type = (trb[3] >> 10) & 0x3f;
+            ring_advance(r);
+            if (type != TRB_NORMAL) continue;
+            uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
+            uint32_t want = trb[2] & 0x1ffff;
+            uint32_t n = want < 8 ? want : 8;
+            wr(x, buf, x->reports[x->rhead % HV_XHCI_REPORTS], n);
+            x->rhead++;
+            x->delivered++;
+            transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, dci);
+        }
+    } else {
+        while (x->tp_rhead != x->tp_rtail && ring_peek(x, r, trb, &at)) {
+            int type = (trb[3] >> 10) & 0x3f;
+            ring_advance(r);
+            if (type != TRB_NORMAL) continue;
+            uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
+            uint32_t want = trb[2] & 0x1ffff;
+            uint32_t len = x->tp_rlen[x->tp_rhead % HV_TP_REPORTS];
+            uint32_t n = want < len ? want : len;
+            const uint8_t *rep = x->tp_reports[x->tp_rhead % HV_TP_REPORTS];
+            wr(x, buf, rep, n);
+            x->tp_rhead++;
+            x->tp_delivered++;
+            if (x->tp_delivered <= 16) fprintf(stderr, "hengevm: xhci: trackpad: %u bytes to the guest (delivered %llu)\n", n, (unsigned long long)x->tp_delivered);
+            if (len >= 30 && x->tp_multi_logs < 40) { /* two fingers or more: dump the frame so we can watch them move */
+                x->tp_multi_logs++;
+                int nf = (int)((len - 12) / 9);
+                fprintf(stderr, "hengevm: xhci: trackpad: %d fingers:", nf);
+                for (int i = 0; i < nf; i++) {
+                    const uint8_t *b = rep + 12 + 9 * i;
+                    int xc = b[0] | ((b[1] & 0x1f) << 8); if (xc & 0x1000) xc -= 0x2000;
+                    int yc = ((b[1] >> 5) & 0x7) | (b[2] << 3) | ((b[3] & 0x3) << 11); if (yc & 0x1000) yc -= 0x2000;
+                    fprintf(stderr, " [id%d x%d y%d s%d]", b[8] & 0xf, xc, yc, (b[3] >> 5) & 7);
+                }
+                fprintf(stderr, "\n");
+            }
+            transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, dci);
+        }
     }
     pthread_mutex_unlock(&x->mu);
 }
 
 /* ---- commands ---- */
 
-static void init_ring_from_ctx(HvXhci *x, HvXhciDev *dv, int dci) {
-    uint64_t ctx = out_ctx(x, dv->slot) + 32ull * dci;
+static void init_ring_from_ctx(HvXhci *x, int slot, int dci) {
+    uint64_t ctx = out_ctx(x, slot) + 32ull * dci;
     uint64_t deq;
     rd(x, ctx + 8, &deq, 8);
-    dv->ep[dci].dequeue = deq & ~0xfull;
-    dv->ep[dci].ccs = (int)(deq & 1);
-    dv->ep_running[dci] = 1;
-}
-
-/* The device addressed in a slot, or NULL. */
-static HvXhciDev *slot_dev(HvXhci *x, int slot) {
-    if (slot < 1 || slot > HV_XHCI_SLOTS || !x->slot_dev[slot]) return NULL;
-    return &x->dev[x->slot_dev[slot] - 1];
+    x->slots[slot].ep[dci].dequeue = deq & ~0xfull;
+    x->slots[slot].ep[dci].ccs = (int)(deq & 1);
+    x->slots[slot].ep_running[dci] = 1;
 }
 
 static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
@@ -443,15 +645,15 @@ static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
     rd(x, input + 32, slot_ctx, 32);
     rd(x, input + 64, ep0, 32);
     int port = slot_ctx[6]; /* root hub port number, dword 1 bits 23:16 */
-    if (port == 2 || port < 1 || port > x->nports) {
+    int dev = port - 1;
+    if (dev == TAB || port < 1 || port > x->nports) {
         char msg[96];
         snprintf(msg, sizeof msg, "address device (slot %d, port %d, %s)%s", slot, port, bsr ? "no SET_ADDRESS yet" : "addressed",
                  port < 1 || port > x->nports ? ": no such port" : "");
         tmile(x, TAB, msg);
     }
-    if (port < 1 || port > x->nports || slot < 1 || slot > HV_XHCI_SLOTS) return CC_TRB_ERROR;
-    int d = port - 1;
-    HvXhciDev *dv = &x->dev[d];
+    if (dev < 0 || dev >= HV_XHCI_DEVICES || port > x->nports) return CC_TRB_ERROR;
+    x->slots[slot].dev = dev;
     uint32_t dw3 = (uint32_t)(bsr ? 1 : 2) << 27 | (uint32_t)(bsr ? 0 : slot); /* default or addressed; address = slot */
     memcpy(slot_ctx + 12, &dw3, 4);
     uint32_t e0 = 0;
@@ -460,33 +662,22 @@ static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
     memcpy(ep0, &e0, 4);
     wr(x, out, slot_ctx, 32);
     wr(x, out + 32, ep0, 32);
-    if (dv->slot && dv->slot != slot && x->slot_dev[dv->slot] == d + 1) x->slot_dev[dv->slot] = 0;
-    dv->slot = slot;
-    x->slot_dev[slot] = d + 1;
-    init_ring_from_ctx(x, dv, 1);
-
+    init_ring_from_ctx(x, slot, 1);
     return CC_SUCCESS;
 }
 
 static int configure_endpoints(HvXhci *x, int slot, uint64_t input, int deconfigure) {
-    HvXhciDev *dv = slot_dev(x, slot);
-    if (!dv) return CC_CONTEXT_STATE;
-    int d = (int)(dv - x->dev);
+    struct HvXhciSlot *s = &x->slots[slot];
     uint64_t out = out_ctx(x, slot);
     if (deconfigure) {
-        for (int dci = 2; dci < HV_XHCI_EPS; dci++) dv->ep_running[dci] = 0;
-        tmile(x, d, "endpoints deconfigured");
+        for (int dci = 2; dci < HV_XHCI_EPS; dci++) s->ep_running[dci] = 0;
+        tmile(x, s->dev, "endpoints deconfigured");
         return CC_SUCCESS;
     }
     uint32_t drop = rd32(x, input), add = rd32(x, input + 4);
-    if (d == TAB) {
-        char msg[80];
-        snprintf(msg, sizeof msg, "configure endpoints: drop %08x add %08x", drop, add);
-        tlog(x, d, msg);
-    }
     for (int dci = 2; dci < HV_XHCI_EPS; dci++) {
         if (drop & (1u << dci)) {
-            dv->ep_running[dci] = 0;
+            s->ep_running[dci] = 0;
             uint8_t zero[32] = {0};
             wr(x, out + 32ull * dci, zero, 32);
         }
@@ -498,8 +689,8 @@ static int configure_endpoints(HvXhci *x, int slot, uint64_t input, int deconfig
             e0 = (e0 & ~7u) | 1;
             memcpy(ep, &e0, 4);
             wr(x, out + 32ull * dci, ep, 32);
-            init_ring_from_ctx(x, dv, dci);
-            if (dci == PTR_DCI_IN) tmile(x, d, "report endpoint configured");
+            init_ring_from_ctx(x, slot, dci);
+            if (s->dev == TAB) tmile(x, TAB, "report endpoint configured");
         }
     }
     if (add & 1) { /* slot context: context entries and friends */
@@ -525,6 +716,11 @@ static void run_commands(HvXhci *x) {
         uint64_t ptr = ((uint64_t)trb[1] << 32 | trb[0]) & ~0xfull;
         int cc = CC_SUCCESS;
         if (xlog()) fprintf(stderr, "xhci: command %d slot %d ptr %llx dw3 %08x\n", type, slot, (unsigned long long)ptr, trb[3]);
+        /* The slot ID is the guest's to write (8 bits): every command but these two indexes x->slots with it. */
+        if (type != TRB_ENABLE_SLOT && type != TRB_NOOP_CMD && (slot < 1 || slot > HV_XHCI_SLOTS)) {
+            cmd_completion(x, at, CC_SLOT_NOT_ENABLED, slot);
+            continue;
+        }
         switch (type) {
         case TRB_ENABLE_SLOT: {
             int s = 1;
@@ -538,29 +734,15 @@ static void run_commands(HvXhci *x) {
             continue;
         }
         case TRB_DISABLE_SLOT:
-            if (slot_dev(x, slot)) {
-                HvXhciDev *dv = slot_dev(x, slot);
-                tmile(x, (int)(dv - x->dev), "slot disabled");
-                dv->slot = 0;
-                memset(dv->ep_running, 0, sizeof dv->ep_running);
-                x->slot_dev[slot] = 0;
+            if (slot >= 1 && slot <= HV_XHCI_SLOTS) {
+                if (x->slots[slot].dev == TAB) tmile(x, TAB, "slot disabled");
+                x->slot_used[slot] = 0;
+                x->slots[slot].dev = -1;
+                memset(x->slots[slot].ep_running, 0, sizeof x->slots[slot].ep_running);
             }
-            if (slot >= 1 && slot <= HV_XHCI_SLOTS) x->slot_used[slot] = 0;
             break;
         case TRB_ADDRESS_DEVICE:
             cc = address_device(x, slot, ptr, (trb[3] >> 9) & 1);
-            break;
-        }
-        HvXhciDev *dv = slot_dev(x, slot);
-        if (!dv && (type == TRB_CONFIGURE_EP || type == TRB_STOP_EP || type == TRB_SET_TR_DEQUEUE || type == TRB_RESET_DEVICE)) {
-            if (x->m->log) fprintf(stderr, "hengevm: xhci: command %d for slot %d, no device there\n", type, slot);
-            cmd_completion(x, at, CC_CONTEXT_STATE, slot);
-            continue;
-        }
-        switch (type) {
-        case TRB_ENABLE_SLOT:
-        case TRB_DISABLE_SLOT:
-        case TRB_ADDRESS_DEVICE:
             break;
         case TRB_CONFIGURE_EP:
             cc = configure_endpoints(x, slot, ptr, (trb[3] >> 9) & 1);
@@ -581,26 +763,26 @@ static void run_commands(HvXhci *x) {
         }
         case TRB_STOP_EP: {
             int dci = (trb[3] >> 16) & 0x1f;
-            dv->ep_running[dci] = 0;
+            x->slots[slot].ep_running[dci] = 0;
             set_ep_state(x, slot, dci, 3);
             /* The dequeue pointer goes back into the context for the driver to read. */
-            uint64_t deq = dv->ep[dci].dequeue | (uint64_t)dv->ep[dci].ccs;
+            uint64_t deq = x->slots[slot].ep[dci].dequeue | (uint64_t)x->slots[slot].ep[dci].ccs;
             wr(x, out_ctx(x, slot) + 32ull * dci + 8, &deq, 8);
             break;
         }
         case TRB_SET_TR_DEQUEUE: {
             int dci = (trb[3] >> 16) & 0x1f;
             uint64_t p = (uint64_t)trb[1] << 32 | trb[0];
-            dv->ep[dci].dequeue = p & ~0xfull;
-            dv->ep[dci].ccs = (int)(p & 1);
+            x->slots[slot].ep[dci].dequeue = p & ~0xfull;
+            x->slots[slot].ep[dci].ccs = (int)(p & 1);
             wr(x, out_ctx(x, slot) + 32ull * dci + 8, &p, 8);
             break;
         }
         case TRB_RESET_DEVICE: {
-            for (int dci = 2; dci < HV_XHCI_EPS; dci++) dv->ep_running[dci] = 0;
+            for (int dci = 2; dci < HV_XHCI_EPS; dci++) x->slots[slot].ep_running[dci] = 0;
             uint32_t dw3 = (uint32_t)1 << 27; /* default state, address 0 */
             wr(x, out_ctx(x, slot) + 12, &dw3, 4);
-            dv->configured = 0;
+            x->slots[slot].configured = 0;
             break;
         }
         case TRB_NOOP_CMD:
@@ -616,7 +798,18 @@ static void run_commands(HvXhci *x) {
 
 /* ---- ports ---- */
 
-#define PORT_CONNECTED (PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)SPEED_FULL << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT)
+/* Port 1 is the full-speed keyboard; port 2 is the high-speed trackpad, as the real
+   Magic Trackpad 2 is; port 3 the full-speed tablet, connected later (hv_xhci_poll). */
+static uint32_t port_connected(int p) {
+    return PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p == 1 ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
+}
+
+static void port_connect(HvXhci *x) {
+    for (int p = 0; p < 2; p++) {
+        x->portsc[p] = port_connected(p);
+        port_event(x, p);
+    }
+}
 
 static int reset_ms(void) {
     static int ms = -1;
@@ -628,35 +821,29 @@ static int reset_ms(void) {
     return ms;
 }
 
-/* At reset the keyboard's port is connected; the tablet's waits for hv_xhci_poll (ptr_plug_at). */
-static void port_connect(HvXhci *x) {
-    x->portsc[0] = PORT_CONNECTED;
-    port_event(x, 0);
-}
-
 static void port_write(HvXhci *x, int p, uint32_t v) {
     if (xlog()) fprintf(stderr, "xhci: portsc write %08x (was %08x)\n", v, x->portsc[p]);
-    if (p == 1 && x->ptr_plugged) { /* resets counted, said at the 1st, 2nd, 3rd, 10th, 100th...; other writes among the capped lines */
+    if (p == TAB_PORT && x->ptr_plugged) { /* resets counted, said at the 1st, 2nd, 3rd, 10th, 100th... */
         char msg[80];
         if (v & PORT_PR) {
             uint32_t n = ++x->ptr_resets;
             if (n <= 3 || n == 10 || n == 100 || n == 1000) {
-                snprintf(msg, sizeof msg, "port 2: reset number %u", n);
+                snprintf(msg, sizeof msg, "port 3: reset number %u", n);
                 tmile(x, TAB, msg);
             }
         } else if (x->ptr_resets < 3) {
-            snprintf(msg, sizeof msg, "port 2: write %08x (was %08x)", v, x->portsc[p]);
+            snprintf(msg, sizeof msg, "port 3: write %08x (was %08x)", v, x->portsc[p]);
             tlog(x, TAB, msg);
         }
     }
     uint32_t s = x->portsc[p];
     s &= ~(v & PORT_CHANGES); /* write 1 to clear */
     if (v & PORT_PED) s &= ~PORT_PED;
-    /* 0.3.64: the tablet's port takes its reset as hardware does: PR stays set for a while (HV_USB_RESET_MS, 20;
-       0: at once) and the port is enabled, with its change and event, when hv_xhci_poll finds it due. Answered
-       within the write, macOS reset the port 9546 times before it went on (the 0.3.63 logs). After 20 resets taken
-       this way it is at once again, as before: the device did come up that way. */
-    if ((v & PORT_PR) && p == 1 && x->ptr_plugged && reset_ms() > 0 && x->ptr_resets <= 20) {
+    /* Android 0.3.64: the tablet's port takes its reset as hardware does: PR stays set for a while
+       (HV_USB_RESET_MS, 20; 0: at once) and the port is enabled, with its change and event, when hv_xhci_poll finds
+       it due. Answered within the write, macOS reset the port thousands of times before it went on. After 20
+       resets taken this way it is at once again. */
+    if ((v & PORT_PR) && p == TAB_PORT && x->ptr_plugged && reset_ms() > 0 && x->ptr_resets <= 20) {
         if (!(s & PORT_PR)) x->ptr_reset_at = mono_ns() + (uint64_t)reset_ms() * 1000000ull;
         s = (s & ~PORT_PED) | PORT_PR;
         x->portsc[p] = s;
@@ -694,12 +881,26 @@ static void reset(HvXhci *x) {
     memset(x->intr, 0, sizeof x->intr);
     for (int i = 0; i < HV_XHCI_INTRS; i++) x->intr[i].pcs = 1;
     memset(x->slot_used, 0, sizeof x->slot_used);
-    memset(x->slot_dev, 0, sizeof x->slot_dev);
-    memset(x->dev, 0, sizeof x->dev);
+    memset(x->slots, 0, sizeof x->slots);
+    for (int s = 1; s <= HV_XHCI_SLOTS; s++) x->slots[s].dev = -1;
+    memset(x->reports, 0, sizeof x->reports);
+    x->rhead = x->rtail = 0;
+    memset(x->state, 0, sizeof x->state);
+    memset(x->tp_fingers, 0, sizeof x->tp_fingers);
+    x->tp_button = 0;
+    x->tp_ts = 0;
+    x->tp_rhead = x->tp_rtail = 0;
+    x->tp_mt = 0;
+    x->tp_delivered = 0;
+    x->tp_reqs = 0;
+    x->tp_db = 0;
+    x->tp_multi_logs = 0;
+    x->tp_f1_len = 0;
     x->ptr_posted = 0;
     x->ptr_plugged = 0, x->ptr_plug_at = 0; /* plugged in again once the driver runs (hv_xhci_poll) */
     x->ptr_reset_at = 0, x->ptr_resets = 0;
-    for (int p = 0; p < HV_XHCI_PORTS; p++) x->portsc[p] = p == 0 ? PORT_CONNECTED : PORT_PP;
+    x->phead = x->ptail = 0;
+    for (int p = 0; p < HV_XHCI_PORTS; p++) x->portsc[p] = p < 2 ? port_connected(p) : PORT_PP;
     update_irq(x);
 }
 
@@ -714,7 +915,7 @@ static uint64_t bar_read(HvPciDev *d, int bar, uint64_t off, unsigned size) {
     if (off < CAPLENGTH) {
         static const uint32_t cap[8] = {
             CAPLENGTH | 0x0100u << 16,                           /* CAPLENGTH, HCIVERSION 1.0 */
-            HV_XHCI_SLOTS | (uint32_t)HV_XHCI_INTRS << 8, /* slots, interrupters (ports below) */
+            HV_XHCI_SLOTS | (uint32_t)HV_XHCI_INTRS << 8,         /* slots, interrupters (ports below) */
             1u << 4,                                             /* ERST max 2 segments */
             0,
             1u | (uint32_t)(XECP / 4) << 16,                     /* 64-bit addressing, extended caps */
@@ -729,8 +930,8 @@ static uint64_t bar_read(HvPciDev *d, int bar, uint64_t off, unsigned size) {
         v = c[i];
         if (size == 8 && i + 1 < 8) v |= (uint64_t)c[i + 1] << 32;
         v >>= 8 * (off & 3);
-    } else if (off >= XECP && off < XECP + 16) { /* Supported Protocol: USB 2.0 on ports 1..nports */
-        const uint32_t ext[4] = {2u | 0x0200u << 16, 0x20425355, 1u | (uint32_t)x->nports << 8, 0};
+    } else if (off >= XECP && off < XECP + 16) { /* Supported Protocol: USB 2.0 on every port */
+        const uint32_t ext[4] = {2u | 0x0200u << 16, 0x20425355, 1u | (uint32_t)(x->nports == 2 ? 3 : x->nports) << 8, 0}; /* 3 for two ports, as on the iPhone */
         uint32_t i = (uint32_t)(off - XECP) / 4;
         v = ext[i];
         if (size == 8 && i + 1 < 4) v |= (uint64_t)ext[i + 1] << 32;
@@ -758,7 +959,7 @@ static uint64_t bar_read(HvPciDev *d, int bar, uint64_t off, unsigned size) {
         case 0x08: v = it->erstsz; break;
         case 0x10: v = size == 8 ? it->erstba : (uint32_t)it->erstba; break;
         case 0x14: v = it->erstba >> 32; break;
-        case 0x18: v = size == 8 ? it->erdp : (uint32_t)it->erdp; break;
+        case 0x18: v = it->erdp; break;
         case 0x1c: v = it->erdp >> 32; break;
         }
     }
@@ -856,28 +1057,29 @@ static void bar_write(HvPciDev *d, int bar, uint64_t off, uint64_t v, unsigned s
         if (slot == 0) {
             x->cmd_running = 1;
             run_commands(x);
-        } else if (slot_dev(x, slot)) {
-            HvXhciDev *dv = slot_dev(x, slot);
-            int d = (int)(dv - x->dev);
+        } else if (slot <= HV_XHCI_SLOTS && x->slots[slot].dev >= 0) {
             int dci = (int)(v & 0xff);
             if (dci < 1 || dci >= HV_XHCI_EPS) return;
+            if (x->slots[slot].dev == TAB && dci != 1 && !x->ptr_posted) {
+                x->ptr_posted = 1;
+                tmile(x, TAB, "macOS is reading reports: the Android pointer drives it");
+            }
+            if (x->slots[slot].dev == 1 && x->tp_db < 8) {
+                x->tp_db++;
+                fprintf(stderr, "hengevm: xhci: trackpad: doorbell dci %d\n", dci);
+            }
             /* A doorbell starts a stopped endpoint again (a halted one waits for Reset Endpoint). */
             uint32_t state = rd32(x, out_ctx(x, slot) + 32ull * dci) & 7;
             if (state == 2) return;
             if (state != 1) set_ep_state(x, slot, dci, 1);
-            dv->ep_running[dci] = 1;
-            if (dci == 1) run_ep0(x, d);
-            else if (d == KBD && dci == KBD_DCI_IN) run_ep_in(x);
-            else if (d == TAB && dci == PTR_DCI_IN) {
-                if (!x->ptr_posted) {
-                    x->ptr_posted = 1;
-                    tmile(x, d, "macOS is reading reports: the Android pointer drives it");
-                }
-                run_ptr_in(x);
-            }
+            x->slots[slot].ep_running[dci] = 1;
+            if (dci == 1) run_ep0(x, slot);
+            else run_ep_in(x, slot);
         }
     }
 }
+
+/* ---- the keyboard's reports ---- */
 
 void hv_xhci_key(HvXhci *x, uint8_t usage, int down) {
     if (!x || !usage) return;
@@ -930,6 +1132,137 @@ void hv_xhci_key_linux(HvXhci *x, uint16_t code, int down) {
     if (code < 256) hv_xhci_key(x, linux_to_hid[code], down);
 }
 
+/* ---- the Magic Trackpad 2's reports ---- */
+
+/* Build the current report into out: a 12-byte prefix (report ID 2, the press,
+   flags, the timestamp) plus nine bytes a finger. The finger's x and y are 13
+   bits, centred on the sensor, with y inverted; byte 3 then holds the finger
+   type and the 3-bit state (0 none, 3 near, 4 contact, 7 stop), then the touch
+   major and minor axes, size and pressure, and finally the touch ID and angle. */
+static int tp_build_report(HvXhci *x, uint8_t *out) {
+    int n = 0;
+    memset(out, 0, (size_t)(12 + 9 * HV_TP_FINGERS));
+    out[0] = 0x02;
+    out[1] = (uint8_t)(x->tp_button & 1);
+    out[8] = 0x31;
+    for (int i = 0; i < HV_TP_FINGERS; i++) {
+        const struct HvTpFinger *f = &x->tp_fingers[i];
+        if (!f->in) continue;
+        int16_t X = (int16_t)(f->x - HV_TP_SENSOR_X / 2);
+        int16_t Y = (int16_t)(-(f->y - HV_TP_SENSOR_Y / 2));
+        uint8_t off = f->state == 0 || f->state == 7; /* none and stop carry no touch data */
+        uint8_t b[9];
+        b[0] = (uint8_t)(X & 0xff);
+        b[1] = (uint8_t)(((X >> 8) & 0x1f) | ((Y & 0x7) << 5)); /* x's high five bits, then y's low three */
+        b[2] = (uint8_t)((Y >> 3) & 0xff);
+        b[3] = (uint8_t)(((Y >> 11) & 0x3) | (off ? 0 : (2u << 2)) | (f->state << 5));
+        b[4] = off ? 0 : 20;   /* touch major */
+        b[5] = off ? 0 : 20;   /* touch minor */
+        b[6] = off ? 0 : 10;   /* size */
+        b[7] = off ? 0 : (uint8_t)(x->tp_button ? 120 : 5); /* pressure */
+        b[8] = (uint8_t)((f->id & 0xf) | (4u << 5)); /* angle: straight */
+        memcpy(out + 12 + 9 * n, b, 9);
+        n++;
+    }
+    if (n || x->tp_button) out[7] = 0x03; else out[7] = 0x02; /* touch active */
+    out[9] = (uint8_t)((x->tp_ts << 3) | 4);
+    out[10] = (uint8_t)((x->tp_ts >> 5) & 0xff);
+    out[11] = (uint8_t)((x->tp_ts >> 13) & 0xff);
+    return 12 + 9 * n;
+}
+
+/* The report timestamp is milliseconds, as the real pad sends it: the guest divides
+   position deltas by timestamp deltas to get finger speed. It must be the touch sample's
+   own clock, not the moment we process it -- if several samples are handled in one burst,
+   wall-clock stamps them all ~1 ms apart and the guest reads a flick as enormous speed,
+   which is what sends scroll inertia flying on release. tp_now_ms is only the fallback
+   for the physical button, which has no sample clock. */
+static uint32_t tp_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000);
+}
+
+/* Queue the current state as a report, stamped with the touch sample's clock (ms);
+   ts_ms 0 falls back to the current time (the physical button). */
+static void tp_queue(HvXhci *x, uint32_t ts_ms) {
+    uint8_t r[HV_TP_REPORT_LEN];
+    /* Strictly increasing: two frames with the same timestamp would give the guest a
+       zero time delta (speed = distance / 0) and it can throw the frame away. */
+    uint32_t now = ts_ms ? ts_ms : tp_now_ms();
+    x->tp_ts = now > x->tp_ts ? now : x->tp_ts + 1;
+    int len = tp_build_report(x, r);
+    if (x->tp_rtail - x->tp_rhead < HV_TP_REPORTS) {
+        unsigned at = x->tp_rtail % HV_TP_REPORTS;
+        memcpy(x->tp_reports[at], r, (size_t)len);
+        x->tp_rlen[at] = (uint8_t)len;
+        x->tp_rtail++;
+    }
+}
+
+static struct HvTpFinger *tp_new_finger(HvXhci *x) {
+    for (int i = 0; i < HV_TP_FINGERS; i++) if (!x->tp_fingers[i].in) return &x->tp_fingers[i];
+    return NULL;
+}
+
+void hv_xhci_touch(HvXhci *x, int id, int phase, int px, int py, uint32_t ts_ms) {
+    if (!x || id < 1 || id > 15) return;
+    pthread_mutex_lock(&x->mu);
+    if (phase == 0) {
+        struct HvTpFinger *f = tp_new_finger(x);
+        if (f) {
+            f->in = 1;
+            f->id = id;
+            f->x = px;
+            f->y = py;
+            f->state = 4; /* contact: a touch, not a hover, so the guest tracks it at once */
+            tp_queue(x, ts_ms);
+        }
+    } else {
+        for (int i = 0; i < HV_TP_FINGERS; i++) {
+            struct HvTpFinger *f = &x->tp_fingers[i];
+            if (!f->in || f->id != id) continue;
+            if (phase == 1) {
+                f->x = px;
+                f->y = py;
+                if (f->state == 3) f->state = 4;
+                /* no report yet: the caller commits one frame holding every finger that
+                   moved, so the guest sees them move together instead of one at a time */
+            } else {
+                f->state = 7; /* stop */
+                tp_queue(x, ts_ms);
+                f->in = 0;
+                f->state = 0; /* none */
+                tp_queue(x, ts_ms);
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&x->mu);
+    hv_machine_wake(x->m);
+}
+
+/* Commit one frame with the current state of all the fingers: a move batch ends
+   here, so a gesture's fingers all land in the same report. */
+void hv_xhci_touch_frame(HvXhci *x, uint32_t ts_ms) {
+    if (!x) return;
+    pthread_mutex_lock(&x->mu);
+    tp_queue(x, ts_ms);
+    pthread_mutex_unlock(&x->mu);
+    hv_machine_wake(x->m);
+}
+
+void hv_xhci_touch_button(HvXhci *x, int down) {
+    if (!x) return;
+    pthread_mutex_lock(&x->mu);
+    if (x->tp_button != (down & 1)) {
+        x->tp_button = down & 1;
+        tp_queue(x, 0);
+    }
+    pthread_mutex_unlock(&x->mu);
+    hv_machine_wake(x->m);
+}
+
 void hv_xhci_pointer(HvXhci *x, int ax, int ay, int buttons) {
     if (!x || !x->tablet) return;
     ax = ax < 0 ? 0 : ax > 32767 ? 32767 : ax;
@@ -949,28 +1282,31 @@ void hv_xhci_pointer(HvXhci *x, int ax, int ay, int buttons) {
 }
 
 int hv_xhci_pointer_live(HvXhci *x) {
-    if (!x || !x->tablet) return 0;
-    HvXhciDev *dv = &x->dev[TAB];
-    return dv->slot && dv->ep_running[PTR_DCI_IN] && __atomic_load_n(&x->ptr_posted, __ATOMIC_RELAXED);
+    if (!x || !x->tablet || !__atomic_load_n(&x->ptr_posted, __ATOMIC_RELAXED)) return 0;
+    for (int slot = 1; slot <= HV_XHCI_SLOTS; slot++)
+        if (x->slots[slot].dev == TAB)
+            for (int dci = 2; dci < HV_XHCI_EPS; dci++)
+                if (x->slots[slot].ep_running[dci]) return 1;
+    return 0;
 }
 
 void hv_xhci_poll(HvXhci *x) {
     if (!x) return;
-    /* 0.3.62: the tablet plugged in after the driver is up, as a device is plugged into a running Mac. In 0.3.61 it
-       was there from the reset and macOS never so much as addressed it. */
+    /* Android 0.3.62: the tablet plugged in after the driver is up, as a device is plugged into a running Mac. There
+       from the reset, macOS never so much as addressed it. */
     if (x->tablet && !x->ptr_plugged && x->ptr_plug_at && (x->usbcmd & 1) && mono_ns() >= x->ptr_plug_at) {
         x->ptr_plugged = 1;
-        x->portsc[1] = PORT_CONNECTED;
-        tmile(x, TAB, "plugged in on port 2");
-        port_event(x, 1);
+        x->portsc[TAB_PORT] = port_connected(TAB_PORT);
+        tmile(x, TAB, "plugged in on port 3");
+        port_event(x, TAB_PORT);
     }
-    if (x->ptr_reset_at && (x->portsc[1] & PORT_PR) && mono_ns() >= x->ptr_reset_at) { /* the tablet's port reset is over */
+    if (x->ptr_reset_at && (x->portsc[TAB_PORT] & PORT_PR) && mono_ns() >= x->ptr_reset_at) { /* the tablet's port reset is over */
         x->ptr_reset_at = 0;
-        x->portsc[1] = (x->portsc[1] & ~(PORT_PR | 0xfu << PORT_PLS_SHIFT)) | PORT_PED | PORT_PRC;
-        port_event(x, 1);
+        x->portsc[TAB_PORT] = (x->portsc[TAB_PORT] & ~(PORT_PR | 0xfu << PORT_PLS_SHIFT)) | PORT_PED | PORT_PRC;
+        port_event(x, TAB_PORT);
     }
-    if (x->rhead != x->rtail) run_ep_in(x);
-    if (x->phead != x->ptail) run_ptr_in(x);
+    for (int slot = 1; slot <= HV_XHCI_SLOTS; slot++)
+        if (x->slots[slot].dev >= 0) run_ep_in(x, slot);
 }
 
 HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
@@ -979,7 +1315,7 @@ HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
     pthread_mutex_init(&x->mu, NULL);
     const char *tab = getenv("HV_USB_TABLET");
     x->tablet = tab && *tab == '1';
-    x->nports = x->tablet ? 2 : 1;
+    x->nports = x->tablet ? 3 : 2;
     /* QEMU's xHCI IDs. Class 0x0c0330 with revision 0: macOS's IOPCIClassMatch compares all 32 bits. */
     hv_pci_init(&x->pci, 0x1b36, 0x000d, 0x0c033000, 0x1af4, 0x1100);
     x->pci.opaque = x;

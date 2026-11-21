@@ -9,7 +9,7 @@ set -e
 IOS="$(cd "$(dirname "$0")/.." && pwd)"
 TROLLSTORE=false
 [ "$1" = "--trollstore" ] && TROLLSTORE=true
-OUT="$HOME/Desktop/Henge.ipa"
+OUT="${HENGE_IPA_OUT:-$HOME/Desktop/Henge.ipa}" # HENGE_IPA_OUT: somewhere else (a trial build that must not replace the one on the Desktop)
 [ "$TROLLSTORE" = true ] && OUT="$HOME/Desktop/Henge.tipa"
 [ -d "$IOS/deps/StikJIT.xcframework" ] || "$IOS/scripts/fetch_deps.sh"
 cd "$IOS"

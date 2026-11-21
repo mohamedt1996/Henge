@@ -1,4 +1,4 @@
-/* The xHCI keyboard, and with HV_USB_TABLET=1 the absolute pointer on port 2 (0.3.60: its own device), driven
+/* The xHCI keyboard, and with HV_USB_TABLET=1 the absolute pointer on port 3 (0.3.60: its own device; the trackpad has port 2), driven
    the way a guest's driver does: rings and contexts in guest memory, registers through the BAR, events read back. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -124,12 +124,12 @@ int main(void) {
     HvGic *gic = hv_gicv3_create(&m, 0x08000000, 0x080a0000);
     HvPcie *bus = hv_pcie_create(&m, gic, 0x50000000, 0x10000000, 0x60000000, 0x10000000, 35);
 
-    /* The keyboard alone (no HV_USB_TABLET): the configuration of before, one port. */
+    /* No HV_USB_TABLET: the keyboard and the trackpad, two ports. */
     unsetenv("HV_USB_TABLET");
     HvXhci *k = hv_xhci_create(&m, bus);
     uint32_t cn = 0, en = 0;
     controller_up(k);
-    CHECK((rd_bar(k, 4) >> 24) == 1, "keyboard alone: %u ports, 1 expected", rd_bar(k, 4) >> 24);
+    CHECK((rd_bar(k, 4) >> 24) == 2, "keyboard alone: %u ports, 2 expected", rd_bar(k, 4) >> 24);
     int slot = bring_up(k, 1, OUTCTX, EP0RING, &cn);
     int n = control_in(k, slot, &en, 0x80, 6, 0x0200, 0, 255);
     CHECK(n == 34 && at(BUF)[4] == 1, "keyboard alone: configuration %d bytes, %u interfaces", n, at(BUF)[4]);
@@ -138,36 +138,36 @@ int main(void) {
     int s2 = command(k, &cn, 0, 9u << 10);
     memset(at(INCTX), 0, 0x400);
     put32(INCTX + 4, 3);
-    at(INCTX + 32)[6] = 2;
+    at(INCTX + 32)[6] = 3;
     put64(DCBAA + 8ull * s2, OUTCTX2);
-    CHECK(command(k, &cn, INCTX, 11u << 10 | (uint32_t)s2 << 24) == -5, "keyboard alone: a device addressed on port 2");
+    CHECK(command(k, &cn, INCTX, 11u << 10 | (uint32_t)s2 << 24) == -5, "keyboard alone: a device addressed on port 3");
 
-    /* With the tablet: two ports; the keyboard on port 1 as before, the tablet its own device on port 2. */
+    /* With the tablet: three ports; the keyboard on port 1, the trackpad on 2, the tablet its own device on port 3. */
     setenv("HV_USB_TABLET", "1", 1);
     HvXhci *x = hv_xhci_create(&m, bus);
     cn = en = 0;
     controller_up(x);
-    CHECK((rd_bar(x, 4) >> 24) == 2 && !(rd_bar(x, 0x440 + 16) & 1), "tablet: %u ports, port 2 connected at once %u", rd_bar(x, 4) >> 24,
-          rd_bar(x, 0x440 + 16) & 1);
+    CHECK((rd_bar(x, 4) >> 24) == 3 && !(rd_bar(x, 0x440 + 32) & 1), "tablet: %u ports, port 3 connected at once %u", rd_bar(x, 4) >> 24,
+          rd_bar(x, 0x440 + 32) & 1);
     CHECK(x->ptr_plug_at != 0, "tablet: no time set to plug it in once the controller runs");
     x->ptr_plug_at = 1; /* due: plugged in at the next poll, as the driver would see a device plugged in */
     hv_xhci_poll(x);
     uint32_t pev[4];
     int pt, port2 = 0;
     while ((pt = next_event(pev)) >= 0)
-        if (pt == 34 && (pev[0] >> 24) == 2) port2 = 1;
-    CHECK((rd_bar(x, 0x440 + 16) & 1) && port2, "tablet: port 2 plugged in (connected %u, its change event %d)", rd_bar(x, 0x440 + 16) & 1, port2);
+        if (pt == 34 && (pev[0] >> 24) == 3) port2 = 1;
+    CHECK((rd_bar(x, 0x440 + 32) & 1) && port2, "tablet: port 3 plugged in (connected %u, its change event %d)", rd_bar(x, 0x440 + 32) & 1, port2);
     /* The tablet's port reset takes a while (0.3.64): PR stays set, then enabled with its change and an event. */
-    w(x, 0x440 + 16, 0x611, 4); /* PR, PP, full speed, CCS */
-    CHECK((rd_bar(x, 0x440 + 16) & 0x12) == 0x10, "tablet: a reset just asked for: PORTSC %08x (PR and not yet enabled expected)", rd_bar(x, 0x440 + 16));
+    w(x, 0x440 + 32, 0x611, 4); /* PR, PP, full speed, CCS */
+    CHECK((rd_bar(x, 0x440 + 32) & 0x12) == 0x10, "tablet: a reset just asked for: PORTSC %08x (PR and not yet enabled expected)", rd_bar(x, 0x440 + 32));
     hv_xhci_poll(x);
-    CHECK(rd_bar(x, 0x440 + 16) & 0x10, "tablet: the reset was over at once");
+    CHECK(rd_bar(x, 0x440 + 32) & 0x10, "tablet: the reset was over at once");
     x->ptr_reset_at = 1; /* due */
     hv_xhci_poll(x);
     port2 = 0;
     while ((pt = next_event(pev)) >= 0)
-        if (pt == 34 && (pev[0] >> 24) == 2) port2 = 1;
-    CHECK((rd_bar(x, 0x440 + 16) & 0x200012) == 0x200002 && port2, "tablet: after the reset: PORTSC %08x (enabled, PRC), event %d", rd_bar(x, 0x440 + 16), port2);
+        if (pt == 34 && (pev[0] >> 24) == 3) port2 = 1;
+    CHECK((rd_bar(x, 0x440 + 32) & 0x200012) == 0x200002 && port2, "tablet: after the reset: PORTSC %08x (enabled, PRC), event %d", rd_bar(x, 0x440 + 32), port2);
     int ks = bring_up(x, 1, OUTCTX, EP0RING, &cn);
     n = control_in(x, ks, &en, 0x80, 6, 0x0200, 0, 255);
     CHECK(n == 34 && at(BUF)[4] == 1, "tablet: the keyboard's configuration unchanged (%d bytes)", n);
@@ -176,7 +176,7 @@ int main(void) {
 
     uint32_t en2 = 0;
     ep0ring = EP0RING2;
-    slot = bring_up(x, 2, OUTCTX2, EP0RING2, &cn);
+    slot = bring_up(x, 3, OUTCTX2, EP0RING2, &cn);
     CHECK(slot != ks, "tablet: its own slot (%d, keyboard %d)", slot, ks);
     n = control_in(x, slot, &en2, 0x80, 6, 0x0100, 0, 18);
     CHECK(n == 18 && at(BUF)[8] == 0x27 && at(BUF)[9] == 0x06 && at(BUF)[10] == 1, "tablet: QEMU's tablet IDs");
@@ -187,7 +187,7 @@ int main(void) {
     CHECK(n == 74 && at(BUF)[0] == 0x05 && at(BUF)[3] == 0x02 && at(BUF)[n - 1] == 0xc0, "tablet: report descriptor %d bytes", n);
     n = control_in(x, slot, &en2, 0x81, 6, 0x2100, 0, 9);
     CHECK(n == 9 && at(BUF)[1] == 0x21 && at(BUF)[7] == 74, "tablet: HID descriptor");
-    n = control_in(x, slot, &en2, 0x80, 6, 0x0305, 0, 255);
+    n = control_in(x, slot, &en2, 0x80, 6, 0x0302, 0, 255);
     CHECK(n == 2 + 2 * 15 && at(BUF)[2] == 'Q', "tablet: product string (%d bytes)", n);
     ep0ring = EP0RING;
     n = control_in(x, ks, &en, 0x81, 6, 0x2200, 0, 255);

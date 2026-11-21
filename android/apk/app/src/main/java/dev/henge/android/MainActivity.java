@@ -250,9 +250,10 @@ public class MainActivity extends Activity {
         if (running) {
             hero.addView(primary("▶  Open Screen", true, v -> startActivity(new Intent(this, ScreenActivity.class))));
             hero.addView(gap(10));
-            hero.addView(secondary("Shut Down", BAD, v -> VmService.stop(this)));
+            hero.addView(secondary(VmService.instantResume(this) ? "Save & Stop" : "Shut Down", BAD, v -> VmService.stop(this)));
         } else {
-            hero.addView(primary("▶  Start", !busy, v -> launch("run")));
+            boolean saved = VmService.instantResume(this) && VmService.resumeFile(this).exists();
+            hero.addView(primary(saved ? "▶  Resume" : "▶  Start", !busy, v -> launch("run")));
         }
         page.addView(hero);
         page.addView(gap(10));
@@ -605,13 +606,30 @@ public class MainActivity extends Activity {
             }
         }
         c.addView(hairline());
-        c.addView(choiceRow("Touch", new String[]{"Direct", "Trackpad"}, "trackpad".equals(prefs.getString("touch", "direct")) ? 1 : 0,
-                i -> { prefs.edit().putString("touch", i == 0 ? "direct" : "trackpad").apply(); render(true); }));
-        TextView tnote = text("trackpad".equals(prefs.getString("touch", "direct"))
+        final String touch = prefs.getString("touch", "direct");
+        c.addView(choiceRow("Touch", new String[]{"Direct", "Trackpad", "Magic Trackpad"},
+                "trackpad".equals(touch) ? 1 : "magic".equals(touch) ? 2 : 0,
+                i -> { prefs.edit().putString("touch", i == 0 ? "direct" : i == 1 ? "trackpad" : "magic").apply(); render(true); }));
+        TextView tnote = text("magic".equals(touch)
+                ? "The screen is the Mac's own Magic Trackpad: every finger goes to macOS, so its gestures work as on a MacBook "
+                    + "(two-finger scroll with inertia, pinch to zoom, swipes between spaces and full-screen apps, Mission Control). "
+                    + "A quick tap clicks, a two-finger tap right-clicks, a finger held still drags. macOS's Trackpad settings apply."
+                : "trackpad".equals(touch)
                 ? "The screen is a trackpad: slide a finger to move the Mac's pointer, tap to click where it is, hold to drag, two fingers scroll."
                 : "The Mac's pointer goes where the finger is: tap to click there, hold to drag, two fingers scroll.", 13, DIM, false);
         tnote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(tnote);
+        c.addView(hairline());
+        final boolean resumeOn = VmService.instantResume(this);
+        c.addView(choiceRow("Instant resume", new String[]{"Off", "On"}, resumeOn ? 1 : 0,
+                i -> { prefs.edit().putString("instantResume", i == 1 ? "on" : "off").apply(); render(true); }));
+        TextView resumenote = text("Experimental. On: Save & Stop writes the running Mac to a file beside its disk (CPUs, memory and "
+                + "devices; a few seconds) and the next Start goes on from exactly there instead of booting. The file is used once "
+                + "and only by this build of the app with the same Mac, memory and CPUs; anything else boots as usual. "
+                + "The GPU renderer starts fresh: the screen may take a moment, or a few apps a relaunch, to draw again.",
+                13, DIM, false);
+        resumenote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(resumenote);
         c.addView(hairline());
         final boolean captured = "capture".equals(prefs.getString("mouse", "android"));
         c.addView(choiceRow("Mouse", new String[]{"Android's pointer", "Captured"}, captured ? 1 : 0,
@@ -838,12 +856,115 @@ public class MainActivity extends Activity {
         c.addView(infoRow("Engine", VmService.busy() ? "Running" : VmService.state));
         page.addView(c);
 
+        macApps(page);
         tablet(page);
         downloads(page);
 
         page.addView(heading("Log"));
         page.addView(logCard(40, true));
     }
+
+    // MARK: Mac apps
+
+    private static final int PICK_MAC_APP = 8;
+    private static volatile String bringing, bringError, broughtLast;
+    private static volatile long bringDone, bringTotal;
+
+    /** Mac apps from the tablet: a .dmg, .pkg or .zip copied into the folder the Mac shares with the tablet (host/share.c),
+     *  where macOS opens it as on any Mac. (Upstream's "Mac apps without macOS" runs apps on iOS's own frameworks, which
+     *  Android has not; here the Mac itself runs them.) */
+    private void macApps(LinearLayout page) {
+        page.addView(heading("Mac apps"));
+        LinearLayout c = card(22);
+        File dir = VmService.macAppsDir(this);
+        TextView how = text("Bring in a Mac app from the tablet: a .dmg, .pkg or .zip goes into the folder the Mac shares with "
+                + "the tablet. In macOS: Finder ▸ Go ▸ Connect to Server…, http://10.0.2.4 (Guest), open Mac Apps, then open the "
+                + "file there as on any Mac (drag the app to Applications). The folder is there while the Mac runs; a Mac "
+                + "started before this build needs a restart for it.", 13, DIM, false);
+        how.setPadding(dp(17), dp(12), dp(17), dp(12));
+        c.addView(how);
+        String[] have = dir.list();
+        if (have != null) {
+            java.util.Arrays.sort(have);
+            for (String n : have) {
+                if (n.endsWith(".part")) continue;
+                File f = new File(dir, n);
+                c.addView(hairline());
+                LinearLayout r = row();
+                r.setPadding(dp(17), dp(12), dp(17), dp(12));
+                r.addView(text(n, 15, TEXT, false), new LinearLayout.LayoutParams(0, -2, 1));
+                r.addView(text(bytes(f.length()) + "  ✕", 13, DIM, false));
+                r.setBackground(ripple());
+                r.setOnClickListener(v -> { // tap to remove it from the shared folder
+                    if (f.delete()) render(true);
+                });
+                c.addView(r);
+            }
+        }
+        c.addView(hairline());
+        if (bringing != null) {
+            LinearLayout r = column();
+            r.setPadding(dp(17), dp(12), dp(17), dp(12));
+            r.addView(text("Copying " + bringing + " · " + bytes(bringDone) + " of " + bytes(bringTotal), 14, TEXT, false));
+            r.addView(gap(8));
+            r.addView(bar(bringTotal > 0 ? bringDone / (double) bringTotal : 0, 7));
+            c.addView(r);
+        } else {
+            LinearLayout r = row();
+            r.setPadding(dp(17), dp(14), dp(17), dp(14));
+            r.addView(text("Bring in a .dmg, .pkg or .zip…", 16, ACCENT_LIGHT, false), new LinearLayout.LayoutParams(0, -2, 1));
+            r.setBackground(ripple());
+            r.setOnClickListener(v -> {
+                Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                i.addCategory(Intent.CATEGORY_OPENABLE);
+                i.setType("*/*");
+                startActivityForResult(i, PICK_MAC_APP);
+            });
+            c.addView(r);
+            String note = bringError != null ? bringError : broughtLast != null ? broughtLast + " is in Mac Apps." : null;
+            if (note != null) {
+                TextView e = text(note, 13, bringError != null ? BAD : DIM, false);
+                e.setPadding(dp(17), 0, dp(17), dp(12));
+                c.addView(e);
+            }
+        }
+        page.addView(c);
+    }
+
+    private void bringMacApp(Uri uri) {
+        String name = displayName(uri).replace('/', '_');
+        String low = name.toLowerCase(java.util.Locale.US);
+        if (!(low.endsWith(".dmg") || low.endsWith(".pkg") || low.endsWith(".mpkg") || low.endsWith(".zip") || low.endsWith(".app.zip"))) {
+            bringError = name + " is not a .dmg, .pkg or .zip.";
+            render(true);
+            return;
+        }
+        File dir = VmService.macAppsDir(this);
+        dir.mkdirs();
+        File to = new File(dir, name), part = new File(dir, name + ".part");
+        bringing = name; bringError = null; broughtLast = null; bringDone = 0; bringTotal = 0;
+        render(true);
+        new Thread(() -> {
+            try (android.os.ParcelFileDescriptor pfd = getContentResolver().openFileDescriptor(uri, "r");
+                 java.io.FileInputStream in = new java.io.FileInputStream(pfd.getFileDescriptor());
+                 java.io.FileOutputStream out = new java.io.FileOutputStream(part)) {
+                bringTotal = pfd.getStatSize();
+                in.getChannel().transferTo(0, Long.MAX_VALUE, out.getChannel());
+            } catch (Exception e) {
+                bringError = "Could not copy it: " + e.getMessage();
+            }
+            if (bringError == null && !part.renameTo(to)) bringError = "Could not save it in " + dir;
+            part.delete();
+            if (bringError == null) broughtLast = name;
+            bringing = null;
+            ui.post(() -> render(true));
+        }, "bring-mac-app").start();
+        ui.post(bringProgress = () -> {
+            bringDone = part.length();
+            if (bringing != null) { render(true); ui.postDelayed(bringProgress, 500); }
+        });
+    }
+    private Runnable bringProgress;
 
     // MARK: Downloads
 
@@ -938,6 +1059,10 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == PICK_MAC_APP) {
+            if (result == RESULT_OK && data != null && data.getData() != null) bringMacApp(data.getData());
+            return;
+        }
         if (request != PICK_IMAGE || result != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
         String name = displayName(uri);

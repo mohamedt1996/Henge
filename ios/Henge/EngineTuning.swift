@@ -1,7 +1,7 @@
 import Foundation
 
 /// Engine settings, without a rebuild. Defaults below, then the Performance settings,
-/// then Documents/henge-env.txt (KEY=VALUE per line, # comments) overrides them all.
+/// then Documents/henge-env.txt (KEY=VALUE per line, # comments; {Documents} in a value is that folder) overrides them all.
 /// Applied at launch and again before each Mac starts, so changes need no relaunch.
 enum EngineTuning {
     static let refreshKey = "henge.perf.hz"
@@ -21,7 +21,7 @@ enum EngineTuning {
     static func apply() {
         var env = defaults
         let d = UserDefaults.standard
-        if d.integer(forKey: refreshKey) == 120 { env["HV_HZ"] = "120" }
+        if [30, 120].contains(d.integer(forKey: refreshKey)) { env["HV_HZ"] = String(d.integer(forKey: refreshKey)) }
         if d.bool(forKey: superblocksKey) { env["HV_SUPERBLOCKS"] = "1" } else { unsetenv("HV_SUPERBLOCKS") }
         if d.bool(forKey: wfiSpinKey) { env["HV_WFI_SPIN"] = "50" }
         if d.object(forKey: fastFlushKey) as? Bool == false { env["HV_FLUSH"] = "0" }
@@ -34,7 +34,9 @@ enum EngineTuning {
                 let line = raw.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init)?
                     .trimmingCharacters(in: .whitespaces) ?? ""
                 guard let eq = line.firstIndex(of: "="), eq != line.startIndex else { continue }
-                env[String(line[..<eq]).trimmingCharacters(in: .whitespaces)] = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+                // {Documents} stands for this folder: its absolute path changes when Henge is reinstalled.
+                env[String(line[..<eq]).trimmingCharacters(in: .whitespaces)] = String(line[line.index(after: eq)...])
+                    .trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "{Documents}", with: docs.path)
             }
         }
         for (k, v) in env.sorted(by: { $0.key < $1.key }) {

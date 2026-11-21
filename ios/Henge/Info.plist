@@ -24,7 +24,7 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.2.0</string>
+	<string>0.3.0</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -37,7 +37,7 @@
 		</dict>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>100</string>
+	<string>101</string>
 	<key>LSApplicationQueriesSchemes</key>
 	<array>
 		<string>stikjit</string>
@@ -46,7 +46,13 @@
 		<string>apple-magnifier</string>
 		<string>localdevvpn</string>
 	</array>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.games</string>
 	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>LSSupportsGameMode</key>
+	<true/>
+	<key>GCSupportsGameMode</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
@@ -55,6 +61,8 @@
 		<string>_remotepairing-pairable-host._tcp</string>
 		<string>_remotepairing._tcp</string>
 	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>Henge can use the volume buttons as the trackpad's mouse buttons. Receiving those presses needs the camera active; no video is recorded, saved or shown.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Henge uses the local network to pair with this iPhone for JIT, without a computer.</string>
 	<key>UIApplicationSceneManifest</key>

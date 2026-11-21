@@ -122,6 +122,49 @@ void hv_jit_finish(HvJitRegion *region, uint32_t *start, size_t words) {
     if (start && words) sys_icache_invalidate(start, words * sizeof(uint32_t));
 }
 
+/* As sys_icache_invalidate does it (libsystem_platform: DSB, IC IVAU per 64-byte line with a DSB after every 20 for
+   the CPUs that need one, DSB, ISB), over both ranges. */
+static void ic_lines(uint32_t *start, size_t words, int *n) {
+    if (!start || !words) return;
+    uintptr_t a = (uintptr_t)start & ~(uintptr_t)63, end = (uintptr_t)(start + words);
+    for (; a < end; a += 64) {
+        __asm__ volatile("ic ivau, %0" ::"r"(a) : "memory");
+        if (++*n % 20 == 0) __asm__ volatile("dsb ish" ::: "memory");
+    }
+}
+
+void hv_jit_finish2(HvJitRegion *region, uint32_t *a, size_t na, uint32_t *b, size_t nb) {
+    (void)region;
+#ifdef __linux__
+    /* Linux/Android: the data cache cleaned to the point of unification first (DC CVAU), which Apple's cores do not
+       need and Arm's (and QEMU's alias tracking) do; the compiler's own __clear_cache does both. */
+    if (a && na) sys_icache_invalidate(a, na * sizeof(uint32_t));
+    if (b && nb) sys_icache_invalidate(b, nb * sizeof(uint32_t));
+    return;
+#endif
+#if TARGET_OS_OSX
+    if (!region->rw_diff) pthread_jit_write_protect_np(1);
+#endif
+    int n = 0;
+    __asm__ volatile("dsb ish" ::: "memory");
+    ic_lines(a, na, &n);
+    ic_lines(b, nb, &n);
+    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+}
+
+void hv_jit_finish_branch(HvJitRegion *region, uint32_t *word) {
+    (void)region;
+#ifdef __linux__
+    sys_icache_invalidate(word, sizeof(uint32_t)); /* the line cleaned first, as above */
+    return;
+#endif
+#if TARGET_OS_OSX
+    if (!region->rw_diff) pthread_jit_write_protect_np(1);
+#endif
+    /* The store first (so a refetch finds the new word), then the line, with no wait for every CPU's cache. */
+    __asm__ volatile("dsb ish\n\tic ivau, %0" ::"r"((uintptr_t)word & ~(uintptr_t)63) : "memory");
+}
+
 /* Any thread: an even number of words (blocks stay 8-byte aligned), taken atomically. */
 uint32_t *hv_jit_reserve(HvJitRegion *region, size_t words) {
     words = (words + 1) & ~(size_t)1;

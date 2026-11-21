@@ -331,6 +331,167 @@ int main(void) {
         }
     }
 
+    /* A big range TLBI (128 MB) of one address space: only the cached targets in it go, found through the 32 MB chunks
+       that hold any; the address space keeps its id (and so its other targets). */
+    {
+        hv_cpu_reset(&cpu, &m);
+        cpu.tcr_el1 = 0;
+        cpu.ttbr0_el1 = 7ull << 48;
+        hv_ijc_switch(&cpu);
+        uint64_t salt = cpu.ijc_salt[0];
+        uint16_t cid = cpu.asid_cid[7];
+        static const uint64_t vas[2] = {0x203004010ull, 0x210000020ull}; /* in the range (its 3rd chunk), past it */
+        uint64_t *ents[2];
+        static HvBlock fake[2];
+        for (int i = 0; i < 2; i++) {
+            fake[i] = (HvBlock){.va = vas[i], .flags = 0, .code = (uint32_t *)(uintptr_t)0x1234};
+            hv_ijc_fill(&cpu, &fake[i]);
+            ents[i] = m.percpu[0].ijc + (size_t)hv_ijc_index(vas[i] ^ salt) * 2;
+        }
+        hv_ijc_drop_range(&cpu, 0x200000000ull, 128ull << 20, 7);
+        checks += 3;
+        if (ents[0][0] == (vas[0] ^ salt)) printf("  FAIL big range kept a target in it\n"), failures++;
+        if (ents[1][0] != (vas[1] ^ salt)) printf("  FAIL big range dropped a target past it\n"), failures++;
+        if (cpu.asid_cid[7] != cid) printf("  FAIL big range dropped the whole address space\n"), failures++;
+    }
+
+    /* A code change drops the cached branch targets into its page (HV_IJC_PAGES): noted under one VA page when they
+       were cached, just that page's; noted under none, none (only the return predictions); under several, all. */
+    {
+        hv_cpu_reset(&cpu, &m);
+        cpu.tcr_el1 = 0;
+        cpu.ttbr0_el1 = 7ull << 48;
+        hv_ijc_switch(&cpu);
+        HvCpu *self = hv_self;
+        hv_self = &cpu;
+        int knob = hv_knob[HV_K_IJCPAGES];
+        hv_knob[HV_K_IJCPAGES] = 1;
+        HvRam *r = &m.ram[0];
+        const uint64_t P = 0x100004000ull, Q = 0x100008000ull;
+        static HvBlock fb[2];
+        struct { uint64_t note; int p_kept, q_kept; const char *what; } cases[] = {
+            {P | 2, 0, 1, "noted at P"}, {0, 1, 1, "noted nowhere"}, {~0ull, 0, 0, "noted at several"}};
+        for (int c = 0; c < 3; c++) {
+            uint64_t salt = cpu.ijc_salt[0];
+            uint64_t *ents[2];
+            for (int i = 0; i < 2; i++) {
+                fb[i] = (HvBlock){.va = (i ? Q + 0x20 : P + 0x10), .flags = 0, .code = (uint32_t *)(uintptr_t)0x1234};
+                hv_ijc_fill(&cpu, &fb[i]);
+                ents[i] = m.percpu[0].ijc + (size_t)hv_ijc_index(fb[i].va ^ salt) * 2;
+            }
+            r->code_pages[10] = 1;
+            r->ijc_va[10] = cases[c].note;
+            hv_invalidate_code(&m, r->pa + (10ull << 14));
+            for (int i = 0; i < 2; i++) {
+                int kept = ents[i][0] == (fb[i].va ^ salt) && cpu.ijc_salt[0] == salt;
+                checks++;
+                if (kept != (i ? cases[c].q_kept : cases[c].p_kept)) {
+                    printf("  FAIL code change %s: the target in %s %s\n", cases[c].what, i ? "Q" : "P", kept ? "kept" : "dropped");
+                    failures++;
+                }
+            }
+            checks++;
+            if (r->ijc_va[10] != 0) printf("  FAIL code change left the page's note\n"), failures++;
+        }
+        hv_knob[HV_K_IJCPAGES] = knob;
+        hv_self = self;
+    }
+
+
+    /* Another CPU's big range TLBI (64 user pages of ASID 5: over the 32 done from here by default). With HV_RANGE_DROP it is done from here in one pass:
+       the second CPU's TLB slots and stashed entries in the range go, the rest stay, nothing is queued for it.
+       Without, it is queued for that CPU to do (as before) and only happens when it does. */
+    {
+        static HvCpu cpu2;
+        hv_cpu_reset_index(&cpu2, &m, 1);
+        cpu2.sctlr_el1 = cpu.sctlr_el1, cpu2.tcr_el1 = cpu.tcr_el1, cpu2.mair_el1 = cpu.mair_el1;
+        cpu2.ttbr0_el1 = 5ull << 48 | (cpu.ttbr0_el1 & 0x0000fffffffffffeull); /* running ASID 5: its live entries are that one's */
+        HvPerCpu *p2 = cpu2.pc_state;
+        const uint64_t base = 0x100000000ull;
+        const int32_t ks[6] = {0, 1, 32, 63, 64, 100};
+        for (int knob = 1; knob >= 0; knob--) {
+            hv_knob[HV_K_RANGEDROP] = knob ? 1024 : 0;
+            hv_tlb_flush(&cpu2);
+            for (int k = 0; k < 6; k++) {
+                uint64_t va = base + ((uint64_t)ks[k] << 14);
+                HvTlbEntry *t = hv_tlb_ent(&cpu2, (va >> 14) & (HV_TLB_SIZE - 1), 0);
+                t->read_tag = va - HV_TLB_ADJ;
+                t->addend = 0;
+            }
+            /* a stashed (switched-out) address space of ASID 5: one page inside the range, one past it */
+            HvTlbStash *st = &p2->stash[0];
+            st->ttbr0 = 5ull << 48 | 0x4000;
+            st->n = 2;
+            st->ent[0] = (HvTlbEntry){.read_tag = base + (40ull << 14) - HV_TLB_ADJ, .write_tag = HV_TLB_INVALID, .exec_tag = HV_TLB_INVALID};
+            st->ent[1] = (HvTlbEntry){.read_tag = base + (200ull << 14) - HV_TLB_ADJ, .write_tag = HV_TLB_INVALID, .exec_tag = HV_TLB_INVALID};
+            p2->nreq = 0, p2->req_flags = 0;
+            cpu.el = 1;
+            cpu.x[1] = 5ull << 48 | 2ull << 46 | 0ull << 44 | 31ull << 39 | ((base >> 14) & 0x1fffffffffull); /* (31+1) << 1 = 64 pages */
+            hv_sysreg_sys(&cpu, 0xd5088221u, 0); /* tlbi rvae1is, x1 */
+            int queued = p2->nreq != 0 || p2->req_flags != 0;
+            checks++;
+            if (queued == knob) {
+                printf("  FAIL remote range, HV_RANGE_DROP %d: %s\n", knob ? 1024 : 0, queued ? "queued for the other CPU" : "not queued");
+                failures++;
+            }
+            if (!knob) hv_cpu_process_requests(&cpu2); /* what it does when it next runs */
+            for (int k = 0; k < 6; k++) {
+                uint64_t va = base + ((uint64_t)ks[k] << 14);
+                int dropped = hv_tlb_ent(&cpu2, (va >> 14) & (HV_TLB_SIZE - 1), 0)->read_tag == HV_TLB_INVALID;
+                checks++;
+                if (dropped != (ks[k] < 64)) {
+                    printf("  FAIL remote range (knob %d), page %d: %s\n", knob, ks[k], dropped ? "dropped" : "kept");
+                    failures++;
+                }
+            }
+            if (knob) { /* the stash is the dropping CPU's job only on this path; the target's own TLBI handles it otherwise */
+                checks += 2;
+                if (st->ent[0].read_tag != HV_TLB_INVALID) printf("  FAIL remote range kept a stashed page in the range\n"), failures++;
+                if (st->ent[1].read_tag == HV_TLB_INVALID) printf("  FAIL remote range dropped a stashed page past the range\n"), failures++;
+            }
+            st->ttbr0 = 0, st->n = 0;
+        }
+        hv_knob[HV_K_RANGEDROP] = 0;
+        /* A target in the middle of a page walk (of a page in the range): raced, so it is queued instead. */
+        hv_tlb_flush(&cpu2);
+        p2->walk_page[(p2->walk_seq >> 1) & 7] = base + (3ull << 14);
+        __atomic_store_n(&p2->walk_seq, p2->walk_seq | 1, __ATOMIC_SEQ_CST);
+        checks++;
+        if (hv_tlbi_drop_remote_range(&cpu2, base, 64, 5) != 0) printf("  FAIL remote range ignored a page walk in progress\n"), failures++;
+        __atomic_store_n(&p2->walk_seq, p2->walk_seq + 1, __ATOMIC_SEQ_CST);
+    }
+
+    /* HV_WALK_LOG: a drop races only a walk of one of its pages, or a process switch's (any page); a walk of another
+       page is let through. Walks under way, set up as walk_begin does (the page logged, then walk_seq odd). */
+    {
+        static HvCpu cpu3;
+        hv_cpu_reset_index(&cpu3, &m, 1);
+        HvPerCpu *p3 = cpu3.pc_state;
+        const uint64_t P = 0x100004000ull, Q = 0x100008000ull;
+        struct { const char *what; uint64_t walked; int knob, range, want; } cases[] = {
+            {"a walk of another page", Q, 1, 0, 1},       {"a walk of the page", P + 0x10, 1, 0, 0},
+            {"a process switch", ~0ull, 1, 0, 0},         {"a walk of another page, knob off", Q, 0, 0, 0},
+            {"a range with the walked page in it", Q, 1, 1, 0}, {"a range without it", Q + (8ull << 14), 1, 1, 1},
+            {"a tagged walk of another page", 0x5a00000000000000ull | Q, 1, 0, 1},
+            {"a tagged walk of the page", 0x5a00000000000000ull | P, 1, 0, 0},
+        };
+        for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+            hv_knob[HV_K_WALKLOG] = cases[c].knob;
+            uint32_t seq = __atomic_load_n(&p3->walk_seq, __ATOMIC_SEQ_CST) & ~1u;
+            uint64_t pg = cases[c].walked == ~0ull ? ~0ull : cases[c].walked & 0x00ffffffffffc000ull;
+            p3->walk_page[(seq >> 1) & 7] = pg;
+            __atomic_store_n(&p3->walk_seq, seq + 1, __ATOMIC_SEQ_CST);
+            int r = cases[c].range ? hv_tlbi_drop_remote_range(&cpu3, P, 2, 5) : hv_tlbi_drop_remote_va(&cpu3, P, 5);
+            __atomic_store_n(&p3->walk_seq, seq + 2, __ATOMIC_SEQ_CST);
+            checks++;
+            if ((r == 1) != cases[c].want) {
+                printf("  FAIL remote drop during %s: %s\n", cases[c].what, r == 1 ? "done" : "raced");
+                failures++;
+            }
+        }
+        hv_knob[HV_K_WALKLOG] = 1;
+    }
+
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;
 }

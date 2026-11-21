@@ -22,17 +22,49 @@ double henge_install_progress(void);
 /* Writes a blank auxiliary storage file (what VZMacAuxiliaryStorage makes). 0 or -1. */
 int henge_make_aux(const char *path);
 
-/* 0 not started, 1 running, 2 stopped. */
+/* Instant resume (../host/snapshot.h). henge_vm_suspend stops a running Mac where it is and writes it to path; it
+   stays paused (state 4) until henge_vm_continue runs it on, or henge_vm_stop ends it. 0 if saved; -1 with a
+   reason if not (the Mac then still runs, unless it stopped by itself meanwhile). henge_vm_resume is henge_vm_boot
+   from a saved Mac: the same settings, and the disk exactly as it was saved, or it fails and nothing runs. ident is
+   what the file is valid for (the app's build, the Mac, its disk). henge_vm_saved_ok: 0 if path is a whole saved
+   Mac for ident, and its size and save time. */
+int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errlen);
+/* The two halves of henge_vm_suspend. Pausing needs the GPU (what only it holds goes back into the Mac's memory), which
+   iOS refuses an app in the background: pause when Henge stops being active, save once it is in the background. */
+int henge_vm_pause(char *err, size_t errlen);
+int henge_vm_save(const char *path, const char *ident, char *err, size_t errlen);
+int henge_vm_continue(void);
+int henge_vm_resume(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
+                    int cpus, const char *path, const char *ident, char *err, size_t errlen);
+int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int64_t *saved_at);
+
+/* 0 not started, 1 running, 2 stopped, 3 starting/stopping, 4 paused (saved, or being saved).
+   Normal guests are fully released before state 2; installer sessions retain
+   their restore stack and can_start stays false. */
 int henge_vm_state(void);
-/* Why it stopped (an HV_EXIT_* name), once state is 2. */
+/* A new generation starts with each successful boot, even in the same view. */
+uint64_t henge_vm_generation(void);
+int henge_vm_can_start(void);
+/* Human-readable terminal reason, once state is 2. */
 const char *henge_vm_exit_reason(void);
+/* Terminal outcome after state == 2. Generic HALT alone does not prove a
+   guest shutdown (it also covers reset, host stop and guest panic). */
+enum HengeVmOutcome {
+    HENGE_VM_OUTCOME_ERROR, HENGE_VM_OUTCOME_SHUTDOWN, HENGE_VM_OUTCOME_RESTART,
+    HENGE_VM_OUTCOME_HOST_STOP, HENGE_VM_OUTCOME_PANIC
+};
+int henge_vm_exit_outcome(void);
 void henge_vm_stop(void);
 /* Testing: sets a translation knob (core/machine.h) in the running machine; nonzero if it exists. */
 int henge_vm_knob(const char *name, int value);
+/* The memory balloon (only with HV_BALLOON set before boot): asks the guest to hand over target_mb (when >= 0)
+   and returns how many MB it has handed over, or -1 without a balloon. */
+long henge_vm_balloon(long target_mb);
 
 /* Progress, for the session screen. */
 uint64_t henge_vm_blocks(void);            /* blocks the CPUs entered */
 uint64_t henge_vm_net_frames(int sent);    /* Ethernet frames out (sent = 1) and in */
+uint64_t henge_vm_dns(int which);          /* guest DNS queries answered through iOS's resolver (0), handed to libslirp (1), unanswered in time (2) */
 int henge_vm_cpus_on(void);                /* CPUs the guest has started */
 int henge_vm_guest_el0(void);              /* any CPU running user code right now */
 
@@ -46,6 +78,11 @@ long henge_share_agent_seen(void);
 
 /* The size macOS is told its screen is. Before henge_vm_boot. */
 void henge_vm_set_display(uint32_t width, uint32_t height);
+/* What the guest's About This Mac says, for the next boot (NULL leaves the vmapple
+   identity): the chip's name, the product name, and — experimental — the model
+   identifier (hw.model). The chip goes through the config region; the other two
+   are fixed up in the guest's device tree while iBoot runs (host/dt_fixup.c). */
+void henge_vm_set_identity(const char *soc_name, const char *product_name, const char *model_id);
 /* The panel's physical size; 0, 0 for the default (a ~122 ppi, 1x screen). Before boot. */
 void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm);
 void henge_vm_key(uint16_t code, int down);
@@ -54,18 +91,26 @@ void henge_vm_mouse_move(int dx, int dy);
 void henge_vm_mouse_button(int button, int down);
 /* Wheel units: dy > 0 up, dx > 0 right. */
 void henge_vm_mouse_scroll(int dx, int dy);
+/* The Magic Trackpad 2 the Mac sees on its USB bus: a finger on it. phase: 0 down, 1 move, 2 up;
+   finger a stable 1..15 per touch; x, y sensor units 0..8134, 0..5206. ts_ms is the touch
+   sample's own clock in ms, so the guest computes finger speed from real sample timing. */
+void henge_vm_touch(int finger, int phase, int x, int y, uint32_t ts_ms);
+void henge_vm_touch_frame(uint32_t ts_ms); /* commit one frame with every finger that moved */
+void henge_vm_touch_button(int down); /* the pad's full press (a click) */
 /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
 int henge_vm_pointer(int *x, int *y);
 /* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */
 int henge_vm_snapshot(uint8_t *bgra, int width, int height);
 
 /* The boot framebuffer (Apple logo and progress bar), 32-bit BGRA, or -1 if
-   the kernel has not got that far. The pixels are the guest's live memory. */
+   the kernel has not got that far. A successful call returns an owned copy;
+   release it with henge_vm_free_display after use. */
 /// Where the Mac's GPU frames go: a CAMetalLayer. Keep it alive while the machine runs.
 void henge_vm_set_display_layer(void *layer);
 /// How many frames have gone to it.
 uint64_t henge_vm_gpu_frames(void);
 int henge_vm_boot_display(const uint8_t **pixels, int *width, int *height, int *stride);
+void henge_vm_free_display(const uint8_t *pixels);
 
 /* The largest single mapping the address space takes right now, in MB (the
    increased virtual addressing entitlement raises it). */

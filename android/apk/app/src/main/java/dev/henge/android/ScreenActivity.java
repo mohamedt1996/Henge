@@ -58,6 +58,7 @@ public class ScreenActivity extends Activity {
         view.overlay = vulkan;
         view.macPointer = vulkan && "reims".equals(gpuMode);
         view.trackpad = "trackpad".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("touch", "direct"));
+        view.magic = "magic".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("touch", "direct"));
         // Settings > Mouse: Android's pointer (the default): a mouse moves Android's own pointer, drawn by the
         // display at its own rate with the Mac's glyph, and the Mac's goes exactly there (the engine's USB
         // absolute pointer, HV_USB_TABLET). Captured: the mouse's raw movement drives the Mac's pointer.
@@ -223,6 +224,17 @@ public class ScreenActivity extends Activity {
            the Mac's cursor back. */
         boolean trackpad;
         private float lastX, lastTouchY;
+        /* Settings, Touch: Magic Trackpad. The screen is the Mac's own Magic Trackpad 2 (devices/xhci.c, messages 252
+           and 253): every finger goes to macOS as it is, so its own gestures work (two-finger scroll with inertia,
+           pinch, swipes between spaces, Mission Control). A quick tap clicks, a quick two-finger tap right-clicks,
+           a finger held still presses the button so moving it drags, as on the iPhone (ios/Henge/Trackpad.swift). */
+        boolean magic;
+        private static final int TP_W = 8134, TP_H = 5206; // the pad's sensor, its own units (HV_TP_SENSOR_*)
+        private final int[] tpId = new int[16];             // Android pointer id -> the report's touch id (0: none)
+        private int tpMost;
+        private float tpTravel;
+        private long tpStarted;
+        private boolean tpHolding;
 
         /* The window's size, landscape, for Mac screen: Half at the next start (VmService.halfScreen). */
         @Override protected void onSizeChanged(int w, int h, int ow, int oh) {
@@ -620,6 +632,7 @@ public class ScreenActivity extends Activity {
                 else pointer(buttons, e.getX(), e.getY());
                 return true;
             }
+            if (magic) return magicTouch(e);
             switch (e.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
                 downX = e.getX(); downY = e.getY(); downAt = e.getEventTime();
@@ -668,6 +681,122 @@ public class ScreenActivity extends Activity {
                     pointer(0, e.getX(), e.getY());
                 }
                 return true;
+            }
+            return true;
+        }
+
+        // ---- Magic Trackpad ----
+
+        /* Where a finger is on the pad's sensor: one scale for both axes, the view mapped onto the middle of the
+           sensor (the view and the pad are different shapes; stretched, a finger would move the pointer further
+           one way than the other). */
+        private int tpX(float x) {
+            float w = Math.max(getWidth(), 1), h = Math.max(getHeight(), 1), sc = Math.min(TP_W / w, TP_H / h);
+            return Math.max(0, Math.min(TP_W, Math.round((x - w / 2) * sc + TP_W / 2f)));
+        }
+
+        private int tpY(float y) {
+            float w = Math.max(getWidth(), 1), h = Math.max(getHeight(), 1), sc = Math.min(TP_W / w, TP_H / h);
+            return Math.max(0, Math.min(TP_H, Math.round((y - h / 2) * sc + TP_H / 2f)));
+        }
+
+        /* The sample's own clock: macOS reads finger speed from the timestamps, so a burst handled at once must not
+           look like one enormous flick. */
+        private void tpSend(int id, int phase, int x, int y, long ms) {
+            int t = (int) ms;
+            sendAsync(new byte[]{(byte) 252, (byte) id, (byte) phase, (byte) (x >> 8), (byte) x, (byte) (y >> 8), (byte) y,
+                    (byte) (t >> 24), (byte) (t >> 16), (byte) (t >> 8), (byte) t});
+        }
+
+        private void tpFrame(long ms) {
+            int t = (int) ms;
+            sendAsync(new byte[]{(byte) 253, (byte) (t >> 24), (byte) (t >> 16), (byte) (t >> 8), (byte) t});
+        }
+
+        private int tpFreeId() {
+            for (int id = 1; id <= 15; id++) {
+                boolean used = false;
+                for (int v : tpId) if (v == id) { used = true; break; }
+                if (!used) return id;
+            }
+            return 0;
+        }
+
+        private int tpFingers() {
+            int n = 0;
+            for (int v : tpId) if (v != 0) n++;
+            return n;
+        }
+
+        private final Runnable tpHold = () -> {
+            if (tpFingers() == 1 && tpTravel < 12) {
+                tpHolding = true;
+                relative(1, 0, 0); // the button down: moving now drags
+                performHapticFeedback(0);
+            }
+        };
+
+        private void tpClick(int mask) {
+            relative(mask, 0, 0);
+            relative(0, 0, 0);
+            performHapticFeedback(0);
+        }
+
+        private boolean magicTouch(MotionEvent e) {
+            int act = e.getActionMasked(), idx = e.getActionIndex();
+            long ms = e.getEventTime();
+            switch (act) {
+            case MotionEvent.ACTION_DOWN:
+                java.util.Arrays.fill(tpId, 0);
+                tpMost = 0; tpTravel = 0; tpStarted = ms; tpHolding = false;
+                // fall through: the first finger
+            case MotionEvent.ACTION_POINTER_DOWN: {
+                int pid = e.getPointerId(idx), id = tpFreeId();
+                if (pid >= tpId.length || id == 0) return true;
+                tpId[pid] = id;
+                tpSend(id, 0, tpX(e.getX(idx)), tpY(e.getY(idx)), ms);
+                tpMost = Math.max(tpMost, tpFingers());
+                if (tpFingers() >= 2) {
+                    removeCallbacks(tpHold);
+                    if (tpHolding) { tpHolding = false; relative(0, 0, 0); } // a drag becomes a gesture
+                } else {
+                    postDelayed(tpHold, 400);
+                }
+                return true;
+            }
+            case MotionEvent.ACTION_MOVE: {
+                boolean moved = false;
+                for (int i = 0; i < e.getPointerCount(); i++) {
+                    int pid = e.getPointerId(i);
+                    if (pid >= tpId.length || tpId[pid] == 0) continue;
+                    if (e.getHistorySize() > 0)
+                        tpTravel += Math.abs(e.getX(i) - e.getHistoricalX(i, 0)) + Math.abs(e.getY(i) - e.getHistoricalY(i, 0));
+                    tpSend(tpId[pid], 1, tpX(e.getX(i)), tpY(e.getY(i)), ms);
+                    moved = true;
+                }
+                if (tpTravel >= 12 && !tpHolding) removeCallbacks(tpHold);
+                if (moved) tpFrame(ms); // one report with every finger that moved: a gesture's fingers move together
+                return true;
+            }
+            case MotionEvent.ACTION_POINTER_UP:
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL: {
+                if (act == MotionEvent.ACTION_CANCEL) {
+                    for (int pid = 0; pid < tpId.length; pid++) if (tpId[pid] != 0) { tpSend(tpId[pid], 2, 0, 0, ms); tpId[pid] = 0; }
+                } else {
+                    int pid = e.getPointerId(idx);
+                    if (pid < tpId.length && tpId[pid] != 0) { tpSend(tpId[pid], 2, 0, 0, ms); tpId[pid] = 0; }
+                }
+                if (tpFingers() > 0) return true; // fingers still down: the gesture goes on
+                removeCallbacks(tpHold);
+                boolean quick = ms - tpStarted < 300, still = tpTravel < 12;
+                if (tpHolding) { tpHolding = false; relative(0, 0, 0); } // let go of the drag
+                else if (quick && still && act != MotionEvent.ACTION_CANCEL) {
+                    if (tpMost == 1) tpClick(1);      // a tap is a left click
+                    else if (tpMost == 2) tpClick(4); // a two-finger tap is a right click (RFB's right button)
+                }
+                return true;
+            }
             }
             return true;
         }

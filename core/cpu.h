@@ -6,6 +6,11 @@
 
 struct HvMachine;
 
+enum HvHaltReason {
+    HV_HALT_NONE, HV_HALT_SHUTDOWN, HV_HALT_RESET, HV_HALT_HOST, HV_HALT_PANIC,
+    HV_HALT_SAVE /* stopped to be saved (instant resume): it can run on, or be saved and resumed later */
+};
+
 /* One software TLB entry. host = guest VA + addend. The exec tag is the guest
    VA of the 16 KB page. The read and write tags are that minus HV_TLB_ADJ, so
    translated code checks "same page, and the access ends in it" for any access
@@ -87,6 +92,9 @@ typedef struct HvCpu {
     uint64_t ijc_tab[16];    /* 0x440: each flags value's branch-cache table (ijc + flags * table size) */
     uint64_t gaddend[4];     /* 0x4c0: host addends of the pages groups of accesses on one base register were checked in (translate_mem) */
     uint64_t xjump_thunk;    /* 0x4e0: hv_xjump_thunk */
+    uint64_t tcr_el1;        /* 0x4e8: here, in reach of one load, for translated MRS (xnu reads it ~17K times a second at login) */
+    uint64_t par_el1;        /* 0x4f0: likewise, read after each AT */
+    uint64_t cntvoff;        /* 0x4f8: the virtual counter is the host's less this (m->cntvoff), read inline */
     /* 0x500: what tags in the return tables (ret_tab) are xored with, [0] user, [1] kernel.
        Bits 63..48, as ijc_salt; a new value empties that half of the tables. */
     uint64_t ret_salt[2] __attribute__((aligned(128)));
@@ -109,13 +117,11 @@ typedef struct HvCpu {
        compare-and-swap against the value the LDXR saw, the way QEMU does it, so
        another CPU's store in between makes it fail. */
 
-    uint64_t tcr_el1;
     uint64_t ttbr0_el1;
     uint64_t ttbr1_el1;
     uint64_t mair_el1;
     uint64_t amair_el1;
     uint64_t vbar_el1;
-    uint64_t par_el1;
     uint64_t afsr0_el1, afsr1_el1;
     uint64_t contextidr_el1;
     uint64_t cpacr_el1;
@@ -148,19 +154,22 @@ typedef struct HvCpu {
        are cleared. */
     uint16_t asid_cid[65536];
     uint16_t cid_asid[65536]; /* --stats: the ASID a user id was given to (to tell live tags from dead ones) */
+    /* The translation table base asid_cid[ASID] was given under: an ASID back with another table (xnu gives one hardware
+       ASID to more than one address space, and may follow a switch between them with a whole-TLB flush rather than one
+       by ASID) gets a fresh id, as the TLB stashes are keyed by the whole TTBR0. */
+    uint64_t asid_base[65536];
     uint32_t next_cid, kernel_gen;
     uint64_t ttbr0_changed_at; /* --stats: host time of the last TTBR0 change */
 
     /* Generic timer: physical and virtual. The counter is host time scaled to 24 MHz. */
     uint64_t cntv_ctl, cntv_cval;
     uint64_t cntp_ctl, cntp_cval;
-    uint64_t cntvoff;
 
     uint64_t mpidr;
     uint32_t index;          /* which CPU: m->percpu[index] holds its caches and interrupt lines */
     struct HvPerCpu *pc_state;
     uint64_t icount;         /* blocks entered, for tests and stats */
-    int halted;              /* SYSTEM_OFF / SYSTEM_RESET / guest panic: the machine stops */
+    _Atomic int halted;      /* HvHaltReason; published across CPU and UI threads */
     int off;                 /* PSCI: powered off (a secondary not started yet, or CPU_OFF) until CPU_ON */
     int parked_off;          /* off, and its thread is waiting (so CPU_ON may reset it) */
 } HvCpu;
@@ -210,6 +219,9 @@ typedef struct HvCpu {
 #define HV_CPU_RET_SALT    0x500
 #define HV_CPU_GADDEND     0x4c0
 #define HV_CPU_XJUMP_THUNK 0x4e0
+#define HV_CPU_TCR_EL1     0x4e8
+#define HV_CPU_PAR_EL1     0x4f0
+#define HV_CPU_CNTVOFF     0x4f8
 
 /* Indirect-branch cache: one table per block-flags value, 64K entries of 16 bytes,
    indexed by ((va ^ va >> 16) >> 2) so code at the same offset in different pages spreads out. */
@@ -231,6 +243,9 @@ _Static_assert(offsetof(HvCpu, helper_routine) == HV_CPU_HELPER, "HvCpu layout")
 _Static_assert(offsetof(HvCpu, helper_ret) == HV_CPU_HELPER_RET, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, tlb) == HV_CPU_TLB, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, ret_salt) == HV_CPU_RET_SALT, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, tcr_el1) == HV_CPU_TCR_EL1, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, cntvoff) == HV_CPU_CNTVOFF, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, par_el1) == HV_CPU_PAR_EL1, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, ret_tab) == HV_CPU_RET_TAB, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, gaddend) == HV_CPU_GADDEND, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, xjump_thunk) == HV_CPU_XJUMP_THUNK, "HvCpu layout");

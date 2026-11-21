@@ -5,6 +5,9 @@ JIT instead of hardware virtualization, so the same engine can run on iOS, where
 apps have no hypervisor access. The engine is built and tested on the Mac
 (`build/hengevm`) and linked into the iPhone app (`make ios-lib`).
 
+The guest's terminal power requests and iOS session cleanup are described in
+[Guest shutdown](guest-shutdown.md).
+
 ## Layout
 
 - `core/`: guest CPU state, the block translator, the software MMU, and exceptions.
@@ -56,6 +59,18 @@ macOS draws through Apple's paravirtual GPU. iOS has no ParavirtualizedGraphics
 framework, so `devices/pvg_lite.c` takes the guest's command streams and
 `devices/pvg_metal.m` replays them with Metal.
 
+## The trackpad
+
+The device's screen is the Mac's trackpad. It is presented to the guest as a
+Magic Trackpad 2 on the xHCI USB bus (`devices/xhci.c`): Apple's vendor-defined
+multitouch format, report ID 2 with a 12-byte prefix and nine bytes a finger,
+in the pad's 8134 x 5206 sensor units. Because the guest's own multitouch
+engine sees a real Apple pad, it does the pointing, the scrolling and the
+gestures itself — the app sends only finger positions. Clicking is the volume
+buttons' job on iPhone (`VolumeClicks.swift`): up left, down right, hold to drag.
+The format follows the Linux kernel's
+`hid-magicmouse` MT2 support and VoodooInput's Magic Trackpad II emulation.
+
 ## The boot ROM
 
 The first code a virtual Mac runs is Apple's AVPBooter, which starts macOS or, for an
@@ -64,6 +79,29 @@ encrypted, but the one in Apple's macOS 14.6.1 restore image is not, and its ROM
 versions. `ios/Henge/BootROM.swift` fetches it from Apple: the file is part of one
 compressed block of that image, so one request of under a megabyte gets all of it. It then
 checks the result against a SHA-256 hash. Nothing is decrypted.
+
+## The guest's identity
+
+`devices/cfg.c` holds the strings the boot ROM passes to the guest: the serial, a
+model number and the SoC name — "About This Mac" reads the SoC name as its chip,
+through `/product/product-soc-name` in the device tree (XNU's brand string). Two
+more strings are hardcoded in the firmware's device tree: `/product/product-name`
+("Apple Virtual Machine 1", the About title and System Information's Model Name)
+and the root `model` (`VirtualMac2,1`, `hw.model`). When a Mac reports its host
+(the app's *About This Mac* setting, or `--soc-name`/`--product-name`/`--model-id`),
+`host/dt_fixup.c` rewrites those two in guest RAM while iBoot runs: iBoot verifies
+the tree once at load and then fixes it up in place itself (serial, MACs, memory —
+the firmware's placeholders are sized for that), so the kernel takes the edited
+tree as it takes iBoot's own fixups. Nothing on disk changes. The tree is found by
+the address `boot_args` names (`DeviceTreeP`, a virtual address: physical is
+vaddr − virtBase + physBase) and by the product-name string itself, re-patched every
+tick until the guest's GPU has drawn — by then the kernel has the tree in its registry.
+The tree is Apple's ADT — no FDT magic: nodes of property and child counts, properties
+of a 32-byte name, a size and a value (m1n1's adt.py documents it). The fixup rewrites
+`product-name` and `model` by property name, leaving `compatible` (driver matching)
+alone. The model identifier is opt-in: the app snaps it to the newest iPhone the guest
+macOS recognises, same variant, so the About artwork follows (`DeviceIdentity.swift`);
+macOS keys some hardware decisions off `hw.model`.
 
 ## Sharing
 

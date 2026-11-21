@@ -52,7 +52,7 @@ typedef struct {
     uint64_t site;      /* guest PC of the instruction that branches out of line */
     uint32_t retry;     /* loads and stores: where their translation starts, to run again after a refill */
     uint32_t rflags;    /* hv_tlb_refill's flags for it (0: no refill, straight to the helper) */
-    uint8_t plain;      /* exits: an ordinary branch (see put_branch_exit) */
+    uint8_t plain;      /* exits: an ordinary branch (see put_branch_exit); 2: one whose exit_req check is done already */
 } Ool;
 
 /* Loads and stores on one base register, close together in a block: the first
@@ -198,8 +198,35 @@ static void link_here(Emit *e, uint32_t at, int from_cold) {
     plink(e, at, from_cold, e->n, e->in_cold);
 }
 
-/* ldr xR, =value */
+/* xR = value with MOVZ or MOVN and then MOVKs, if that takes at most max instructions. */
+static int put_mov_imm(Emit *e, int reg, uint64_t value, int max) {
+    int zeros = 0, ones = 0;
+    for (int i = 0; i < 4; i++) {
+        uint16_t h = (uint16_t)(value >> 16 * i);
+        zeros += h == 0, ones += h == 0xffff;
+    }
+    int inverted = ones > zeros; /* kernel addresses: start from all ones */
+    int n = 4 - (inverted ? ones : zeros);
+    if ((n ? n : 1) > max) return 0;
+    uint16_t skip = inverted ? 0xffff : 0;
+    int first = 1;
+    for (uint32_t i = 0; i < 4; i++) {
+        uint16_t h = (uint16_t)(value >> 16 * i);
+        if (h == skip) continue;
+        if (first) put(e, (inverted ? 0x92800000u : 0xd2800000u) | i << 21 | (uint32_t)(inverted ? (uint16_t)~h : h) << 5 | (uint32_t)reg);
+        else put(e, 0xf2800000u | i << 21 | (uint32_t)h << 5 | (uint32_t)reg); /* movk */
+        first = 0;
+    }
+    if (first) put(e, (inverted ? 0x92800000u : 0xd2800000u) | (uint32_t)reg); /* 0 or all ones */
+    return 1;
+}
+
+/* ldr xR, =value. The pool sits after the cold code, so a hot block's literal is a load from a line the data
+   cache rarely holds (5% of translated-code samples on the Mac): values that take at most three MOVZ/MOVN/MOVK
+   (nearly all addresses, user and kernel) can be built in the register instead, in as many words: HV_MOVIMM=1
+   (off: no measured gain on the Mac mix, 2026-11-08). */
 static void put_lit(Emit *e, int reg, uint64_t value) {
+    if (hv_knob[HV_K_MOVIMM] && put_mov_imm(e, reg, value, 3)) return;
     e->pool[e->npool] = value;
     e->fix[e->nfix++] = (LitFix){e->n, FIX_LDR, e->npool++, (uint8_t)(e->in_cold && !e->flat)};
     put(e, 0x58000000u | reg);
@@ -397,7 +424,7 @@ static int use_xjump(void) {
 }
 
 static void put_branch_exit(Emit *e, uint64_t target, int plain) {
-    int check = !(plain && target > e->cur_pc && !check_exits_always());
+    int check = !(plain && (target > e->cur_pc || plain == 2) && !check_exits_always());
     int p0 = e->in_cold;
     e->site_direct = 0;
     uint32_t slot_index = ~0u;
@@ -800,6 +827,38 @@ static void put_return(Emit *e) {
     if (!p0) cold_off(e);
 }
 
+/* HV_HOIST_CHECK: a conditional branch back (a loop's) tests exit_req before it, in the hot part, where the test is
+   one load and a branch not taken; its exit then needs none, so chaining takes the guest's branch straight to the
+   target block, one taken branch an iteration (as forward ones are) where the exit's own test made it two. Asked to
+   leave: the branch's condition again, and out to the dispatcher at whichever PC it picks. bare: the branch
+   instruction with no offset, x15 free. */
+static int hoist_check(Emit *e, uint64_t target, uint64_t pc) {
+    return hv_knob[HV_K_HOIST] && target <= pc && !check_exits_always() && !e->no_ijc;
+}
+
+static void put_exit_to(Emit *e, uint64_t va) { /* to the dispatcher at va, guest x0/x1 kept */
+    put(e, STP_X(0, 1, 28, 0));
+    put_lit(e, 0, va);
+    put(e, STR_X(0, 28, HV_CPU_PC));
+    put(e, LDR_X(1, 28, HV_CPU_EXIT));
+    put(e, BR_X(1));
+}
+
+static void put_hoisted_check(Emit *e, uint32_t bare, uint64_t target, uint64_t pc) {
+    put(e, 0xb9400000u | (HV_CPU_EXIT_REQ / 4) << 10 | 28 << 5 | 15); /* ldr w15, [x28, #exit_req] */
+    uint32_t to_req = e->n;
+    put(e, 0x35000000u | 15);                                         /* cbnz w15, asked (below) */
+    int p0 = e->in_cold;
+    if (!p0) cold_on(e);
+    link_here(e, to_req, p0);
+    uint32_t to_taken = e->n;
+    put(e, bare);                                                     /* the guest's condition: taken? */
+    put_exit_to(e, pc + 4);
+    patch_branch(&e->w[to_taken], (int64_t)e->n - to_taken);
+    put_exit_to(e, target);
+    if (!p0) cold_off(e);
+}
+
 /* Ends the block (returns 1), or 0 for a conditional branch the block goes on past. */
 static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
     if ((insn & 0x7c000000) == 0x14000000) { /* B, BL */
@@ -818,8 +877,10 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
             put_branch_exit(e, target, 1);
             return 1;
         }
+        int hoist = hoist_check(e, target, pc);
+        if (hoist) put_hoisted_check(e, 0x54000000u | cond, target, pc);
         put(e, 0x54000000u | cond);
-        put_ool(e, (Ool){.kind = OOL_EXIT, .pc = target, .plain = 1});
+        put_ool(e, (Ool){.kind = OOL_EXIT, .pc = target, .plain = (uint8_t)(hoist ? 2 : 1)});
         if (superblocks() && go_on(e, pc)) return 0;
         put_branch_exit(e, pc + 4, 1);
         return 1;
@@ -830,8 +891,10 @@ static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
     uint32_t bare = tb ? insn & ~(0x3fffu << 5) : insn & ~(0x7ffffu << 5);
     int rt = insn & 0x1f;
     if (!is_stolen(rt)) {
+        int hoist = hoist_check(e, target, pc);
+        if (hoist) put_hoisted_check(e, bare, target, pc);
         put(e, bare);
-        put_ool(e, (Ool){.kind = OOL_EXIT, .pc = target, .plain = 1});
+        put_ool(e, (Ool){.kind = OOL_EXIT, .pc = target, .plain = (uint8_t)(hoist ? 2 : 1)});
         if (superblocks() && go_on(e, pc)) return 0;
         put_branch_exit(e, pc + 4, 1);
         return 1;
@@ -1077,8 +1140,8 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     /* hv_tlb_refill's flags: bit 9 set (so never 0), bit 0 write, bits 2..1 the table, 8..3 bytes - 1 */
     uint32_t rflags = can_refill ? 1u << 9 | (uint32_t)(op.store ? 1 : 0) | (uint32_t)el_idx << 1 | (op.bytes - 1) << 3 : 0;
     put_ool(e, (Ool){.kind = OOL_SLOW, .pc = pc, .insn = insn, .nrestore = 3, .restore = {A, T, U},
-                     /* The exact recheck for a page's last 15 bytes costs 6 words in every access's slow path; without it
-                        (HV_RECHECK=0, the default) such an access takes the refill, which sends it to the helper. */
+                     /* The exact recheck for a page's last 15 bytes costs 6 words in every access's slow path (on by default,
+                        see machine.c); with HV_RECHECK=0 such an access takes the refill, which sends it to the helper. */
                      .recheck = hv_knob[HV_K_RECHECK] && !(op.align && op.bytes > 1) && op.bytes <= HV_TLB_ADJ + 1, .addr = (uint8_t)addr,
                      .t = (uint8_t)T, .u = (uint8_t)U, .bytes = (uint8_t)op.bytes,
                      .tag_off = tlb + (op.store ? 8 : 0), .retry = retry, .rflags = rflags});
@@ -1430,9 +1493,10 @@ static int translate_msr_inline(Emit *e, uint32_t insn, uint64_t pc) {
     return 0;
 }
 
-/* The guest's counter is the host's mach_absolute_time (CNTVOFF is 0): the
-   counter register the commpage names plus the commpage's offset, read the way
-   libsystem does. EL0 reads check CNTKCTL_EL1's enables and trap through the
+/* The guest's physical counter is the host's mach_absolute_time: the counter
+   register the commpage names plus the commpage's offset, read the way libsystem
+   does; its virtual counter is that less the CPU's CNTVOFF (the count when the
+   machine started). EL0 reads check CNTKCTL_EL1's enables and trap through the
    helper when they are off. */
 #define COMMPAGE_TIMEBASE_OFFSET 0xfffffc088ull
 #define COMMPAGE_TIMEBASE_TYPE   0xfffffc090ull
@@ -1466,6 +1530,10 @@ static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical) 
         put_lit(e, 6, COMMPAGE_TIMEBASE_OFFSET);
         put(e, LDR_X(6, 6, 0));
         put(e, ADD_LSL(r, r, 6, 0));
+    }
+    if (!physical) { /* the virtual counter less CNTVOFF (instant resume moves it on) */
+        put(e, LDR_X(6, 28, HV_CPU_CNTVOFF));
+        put(e, SUB_X(r, r, 6));
     }
     if (r != rt) put(e, STR_X(r, 28, slot_of(rt)));
     if (el0) e->ool[slow].join = e->n;
@@ -1519,6 +1587,15 @@ static int translate_sysreg_inline(Emit *e, uint32_t insn, uint64_t pc) {
         put_load_field(e, rt, off);
         return 1;
     }
+    case SR(3, 0, 2, 0, 2): /* TCR_EL1, PAR_EL1: reads (writes change translation; PAR is written by AT) */
+    case SR(3, 0, 7, 4, 0):
+        if (!read || !el1) return 0;
+        put_load_field(e, rt, reg == SR(3, 0, 2, 0, 2) ? HV_CPU_TCR_EL1 : HV_CPU_PAR_EL1);
+        return 1;
+    case SR(3, 0, 4, 2, 3): /* PAN: a block is translated for one PAN state (HV_BLOCK_PAN) and every write ends it */
+        if (!read || !el1) return 0;
+        put_const_to(e, rt, (e->flags & HV_BLOCK_PAN) ? HV_PSTATE_PAN : 0);
+        return 1;
     case SR(3, 0, 4, 1, 0): /* SP_EL0: only while it is banked (SPSel = 1) */
         if (!el1 || !spx) return 0;
         if (read) put_load_field(e, rt, HV_CPU_SP_EL0);
@@ -1947,7 +2024,7 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
     e->flat = hv_knob[HV_K_TEST2];
     e->overflow = 0;
     e->flags = b->flags;
-    e->slow_mem = m->slow_mem;
+    e->slow_mem = m->slow_mem || hv_knob[HV_K_PREDSTAT]; /* HV_PREDSTAT (measuring): every access through hv_mem_emulate */
     e->page = b->va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
     e->no_ijc = !m->chain;
     e->m = m;
@@ -2110,9 +2187,8 @@ int hv_translate_place(HvMachine *m, HvBlock *b) {
         hv_jit_write(&m->jit, dst, e->hot, e->nhot * 4);
         hv_jit_write(&m->jit, cold, e->cold, e->pool_at * 4);
         hv_jit_write(&m->jit, cold + e->pool_at, e->pool, e->npool * 8);
-        hv_jit_finish(&m->jit, cold, e->ncold);
     }
-    hv_jit_finish(&m->jit, dst, e->nhot);
+    hv_jit_finish2(&m->jit, dst, e->nhot, e->flat ? NULL : cold, e->flat ? 0 : e->ncold); /* one wait for both parts */
     b->code = dst;
     for (uint32_t k = 0; k < e->nsite; k++) {
         m->slot_site[e->site[k].slot] = hv_slot_at(m, (e->site[k].cold ? cold : dst) + e->site[k].at);

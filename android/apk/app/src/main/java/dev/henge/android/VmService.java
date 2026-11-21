@@ -33,6 +33,9 @@ public class VmService extends Service {
     private PowerManager.WakeLock wake;
 
     public static File macDir(Context c) { return new File(c.getFilesDir(), "mac"); }
+    /** The folder the Mac shares with the tablet (host/share.c), and in it what Settings > Mac apps brings in. */
+    public static File shareDir(Context c) { return new File(c.getFilesDir(), "share"); }
+    public static File macAppsDir(Context c) { return new File(shareDir(c), "Mac Apps"); }
     /** Shader captures go where a computer can copy them over USB: Android/data/dev.henge.android/files/shaders. */
     public static File shaderDir(Context c) {
         File ext = c.getExternalFilesDir(null);
@@ -410,6 +413,17 @@ public class VmService extends Service {
             final String coreKeptNow = coreKept;
             // The Mac's disk: the data is flushed at each of macOS's flushes (fdatasync), not the file's times too.
             pb.environment().put("HV_FLUSH", "2");
+            // Settings > Instant resume: Shut Down saves the running Mac (SIGUSR1, android/runner.c) and the next Start
+            // goes on from it. Valid for this build, this Mac, its RAM and CPUs; the engine checks the disk too.
+            if (!install) { // the shared folder, at http://10.0.2.4 in macOS (android/runner.c)
+                macAppsDir(this).mkdirs();
+                pb.environment().put("HV_SHARE_DIR", shareDir(this).getPath());
+                pb.environment().put("HV_SHARE_SOCKET", new File(files, "share.sock").getPath());
+            }
+            if (!install && !gunyah() && instantResume(this)) {
+                pb.environment().put("HV_RESUME_FILE", resumeFile(this).getPath());
+                pb.environment().put("HV_RESUME_IDENT", "henge-android " + build);
+            }
             // Graphics: reims: the Mac's screen size (Settings), every pixel of which is copied on this driver.
             // Settings > Mouse: Android's pointer: the Mac gets a USB absolute pointer beside its keyboard
             // (devices/xhci.c), which Android's pointer drives (ScreenActivity, message 251).
@@ -1154,15 +1168,25 @@ public class VmService extends Service {
     }
     static String sq(String s) { return "'" + s.replace("'", "'\\''") + "'"; }
 
-    /** SIGTERM: the engine stops the Mac at the next block and flushes its disks. */
+    /** Settings > Instant resume (off unless asked). */
+    static boolean instantResume(Context c) {
+        return "on".equals(c.getSharedPreferences("henge", MODE_PRIVATE).getString("instantResume", "off"));
+    }
+
+    /** Where a saved Mac waits for the next start: beside its disk (it is only good with that disk as it is). */
+    static File resumeFile(Context c) { return new File(macDir(c), "instant-resume.henge"); }
+
+    /** SIGTERM: the engine stops the Mac at the next block and flushes its disks. With Instant resume, SIGUSR1:
+     *  it is paused and saved first (a few seconds for the RAM), then stops. */
     public static void stop(Context c) {
         try {
             String pid = new String(Files.readAllBytes(new File(c.getFilesDir(), "engine.pid").toPath())).trim();
+            int sig = !gunyah() && instantResume(c) && "running".equals(state) ? 10 : 15;
             if (gunyah() || new File(c.getFilesDir(), "engine.root").exists()) { // a root process: only root may signal it
-                new ProcessBuilder("su", "-c", "kill -15 " + Integer.parseInt(pid)).start();
+                new ProcessBuilder("su", "-c", "kill -" + sig + " " + Integer.parseInt(pid)).start();
                 return;
             }
-            android.os.Process.sendSignal(Integer.parseInt(pid), 15);
+            android.os.Process.sendSignal(Integer.parseInt(pid), sig);
         } catch (Exception e) {
             Process p = process;
             if (p != null) p.destroy();

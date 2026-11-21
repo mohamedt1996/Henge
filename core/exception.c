@@ -141,11 +141,10 @@ static uint64_t psci(HvCpu *cpu, uint64_t fn) {
     case 0x84000006: return 2;                               /* MIGRATE_INFO_TYPE: no trusted OS */
     case 0x84000008:                                         /* SYSTEM_OFF */
     case 0x84000009:                                         /* SYSTEM_RESET */
-        for (int i = 0; i < cpu->m->ncpus; i++) /* the whole machine stops */
-            if (cpu->m->cpus[i]) cpu->m->cpus[i]->halted = (uint32_t)fn == 0x84000008 ? 1 : 2;
-        hv_machine_kick_all(cpu->m);
-        for (int i = 0; i < cpu->m->ncpus; i++) /* those asleep in WFI too: they may sleep 250 ms now (wait_for_interrupt) */
-            if (cpu->m->cpus[i] && cpu->m->cpus[i] != cpu) hv_cpu_wake(cpu->m->cpus[i]);
+        if (cpu->m->log)
+            fprintf(stderr, "hengevm: guest requested %s on cpu %u\n",
+                    (uint32_t)fn == 0x84000008 ? "shutdown" : "restart", cpu->index);
+        hv_machine_halt(cpu->m, (uint32_t)fn == 0x84000008 ? HV_HALT_SHUTDOWN : HV_HALT_RESET);
         return 0;
     case 0x8400000a: {                                       /* PSCI_FEATURES */
         uint32_t q = (uint32_t)cpu->x[1];
@@ -164,6 +163,7 @@ static uint64_t psci(HvCpu *cpu, uint64_t fn) {
         /* Still on its way out of CPU_OFF (or not parked yet). Bounded: a CPU with no thread to run it must
            fail the call, not hang the caller in here forever. */
         for (uint32_t spins = 0; !__atomic_load_n(&t->parked_off, __ATOMIC_SEQ_CST); spins++) {
+            if (cpu->halted || t->halted) return (uint64_t)-3; /* DENIED: machine is stopping */
             if (spins < 1000) { sched_yield(); continue; }
             if (spins > 1000 + 2000) {                       /* ~2 s */
                 fprintf(stderr, "hengevm: CPU_ON: cpu %u never parked (no thread running it?)\n", t->index);
@@ -177,6 +177,10 @@ static uint64_t psci(HvCpu *cpu, uint64_t fn) {
            waits on wake_mu, so it cannot see the CPU half reset. */
         pthread_mutex_lock(&t->pc_state->wake_mu);
         HvPerCpu *pcs = t->pc_state;
+        if (cpu->halted || t->halted) {
+            pthread_mutex_unlock(&pcs->wake_mu);
+            return (uint64_t)-3;
+        }
         hv_cpu_reset_index(t, cpu->m, t->index);
         t->mpidr = mpidr;
         t->pc = entry;

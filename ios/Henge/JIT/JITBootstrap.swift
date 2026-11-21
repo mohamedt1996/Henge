@@ -60,12 +60,20 @@ enum JITBootstrap {
     /// The one region HengeVM's translator gets for the whole session (it flushes and starts over when full,
     /// never asks for more). 1 GB takes about 1.5 s to prepare, and a first boot through Setup makes that much code; a full flush drops all of it.
     static let codeCacheKey = "henge.perf.codeCacheMB"
-    /// 1 GB, or 1.5 GB (Settings > Performance > Code cache; without a choice there, 1.5 GB where the memory limit
-    /// has room for it: about 6 GB on 12 GB iPhones). A bigger cache fills and empties less often (macOS 27 filled
-    /// 1 GB about once a minute) and costs more memory (its blocks' records come to about 0.75 of its size). Fixed for
-    /// the launch: the region is claimed once.
-    static let defaultCodeCacheMB: Int = Entitlements.memoryLimitAtLaunch >= 5_500 << 20 ? 1536 : 1024
-    static let jitBytes: Int = ((UserDefaults.standard.object(forKey: codeCacheKey) as? Int) ?? defaultCodeCacheMB) == 1536 ? 1536 << 20 : 1024 << 20
+    /// 512 MB, 1 GB or 1.5 GB (Settings > Performance > Code cache; without a choice there, by the memory limit: 1.5 GB
+    /// with about 6 GB, as on 12 GB iPhones; 512 MB under 3.5 GB, as on 6 GB devices without the increased memory limit,
+    /// where 1 GB and its records left a 2 GB Mac too little room in Setup, #70). A bigger cache fills and empties less
+    /// often (macOS 27 filled 1 GB about once a minute) and costs more memory (its blocks' records come to about 0.75 of
+    /// its size). Fixed for the launch: the region is claimed once.
+    static let defaultCodeCacheMB: Int = Entitlements.memoryLimitAtLaunch >= 5_500 << 20 ? 1536
+        : Entitlements.memoryLimitAtLaunch >= 3_500 << 20 ? 1024 : 512
+    static let jitBytes: Int = {
+        switch (UserDefaults.standard.object(forKey: codeCacheKey) as? Int) ?? defaultCodeCacheMB {
+        case 1536: return 1536 << 20
+        case 512: return 512 << 20
+        default: return 1024 << 20
+        }
+    }()
 
     /// True once the region is held. The memory budget needs this: after a
     /// prewarm the JIT is already counted in the footprint, so subtracting it
@@ -185,14 +193,40 @@ enum JITBootstrap {
     /// True once this process has told StikDebug to let go.
     nonisolated(unsafe) static private(set) var detached = false
 
+    /// Henge's built-in helper (StikJIT's script, which answers the detach brk) was started this launch.
+    nonisolated(unsafe) static var helperMayBeAttached = false
+    nonisolated(unsafe) static private var lingeringTries = 0
+
+    /// A debugger still on after the one that gave the region was let go: another helper that attached once the first
+    /// detached. With one attached every trap stops Henge until it answers (a phone run went 1.5-2x slower). Told to let
+    /// go too, if it is the built-in helper's (StikJIT's script answers the detach brk; a debugger that does not, Xcode's
+    /// say, would stop at it). Cheap: one sysctl. Called before a Mac starts and every 10 s while one runs; three tries.
+    static func releaseLingeringDebugger() {
+        guard detached, !keepDebuggerAttached, helperMayBeAttached, lingeringTries < 3, isTraced else { return }
+        lingeringTries += 1
+        HengeLog.log("jit", "a debugger is still attached after the JIT region was held (a second helper?); detaching it")
+        henge_ios_jit_detach()
+        HengeLog.log("jit", isTraced ? "still traced after the detach request" : "debugger detached")
+    }
+
+    /// Whether a debugger traces this process right now (P_TRACED; CS_DEBUGGED stays set after a detach).
+    static var isTraced: Bool {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0 else { return false }
+        return (info.kp_proc.p_flag & P_TRACED) != 0
+    }
+
     /// Release the debugger once the JIT region is held. It is no longer
     /// needed for anything, and leaving it attached is what froze the app.
     private static func detachIfDone() {
         guard prewarmed, !detached, !keepDebuggerAttached else { return }
         HengeLog.log("jit", "JIT region held; detaching StikDebug so a suspended "
-                         + "debugger cannot stall the process later")
+                         + "debugger cannot stall the process later (traced: \(isTraced ? "yes" : "no"))")
         henge_ios_jit_detach()
         detached = true
+        HengeLog.log("jit", "after the detach request, traced: \(isTraced ? "yes" : "no")")
     }
 
     /// Whether this device enforces TXM, so that only a trap servicer can grant

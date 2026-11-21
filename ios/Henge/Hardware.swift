@@ -38,7 +38,8 @@ enum Device {
     static var suggestedRAMGB: Int {
         let mb = ProcessInfo.processInfo.physicalMemory >> 20
         // m4 fork: an 8 GB iPad (7.4 GB usable) thrashes and kills the Mac at 6 GB: 16 GB devices only.
-        return mb >= 14_000 ? 8 : mb >= 10_000 ? 6 : 4
+        // A 6 GB device (5.7 GB usable) could not build a 4 GB Mac, and installed a 3 GB one (#70); 4 GB devices, 2.
+        return mb >= 14_000 ? 8 : mb >= 10_000 ? 6 : mb >= 7_000 ? 4 : mb >= 5_000 ? 3 : 2
     }
 
     /// The choices for a Mac's memory, in GB.
@@ -61,6 +62,19 @@ enum Device {
     }()
 
     static let chipTooOldText = "macOS won't run on this \(name). Henge needs an A14 or M1 chip or newer."
+
+    /// What this device is called and the chip it has, for a Mac that reports its host
+    /// (MacSettingsView → About This Mac). The table and the icon-snapping live in
+    /// DeviceIdentity.swift (pure Foundation, so the Mac tests can compile it).
+    static var modelIdentifier: String { HengeLog.deviceModel }
+    static var marketingName: String { DeviceIdentity.name(modelIdentifier) }
+    static var chipName: String? { DeviceIdentity.chip(modelIdentifier) }
+
+    /// The model identifier to report for a matching icon: the real one when the guest
+    /// macOS knows it, else the newest equivalent it recognises (see DeviceIdentity).
+    static func snappedModelIdentifier(forOS osName: String?) -> String {
+        DeviceIdentity.snappedIdentifier(modelIdentifier, forOS: osName)
+    }
 }
 
 /// A keyboard attached to the device. iOS reports each key going down and coming up by its HID usage,
@@ -155,7 +169,8 @@ final class HardwareMouse {
 
     private var observers: [NSObjectProtocol] = []
     private var mice: [GCMouse] = []
-    private var buttonsDown: Set<Int32> = []
+    private var buttons = PhysicalMouseButtons(swapsRightAndMiddle: false)
+    private var buttonsLogged = 0
     private var restX: Float = 0, restY: Float = 0
     private var speed: Float = 1
     private var reverse = false
@@ -166,6 +181,11 @@ final class HardwareMouse {
         let defaults = UserDefaults.standard
         speed = defaults.object(forKey: Self.speedKey) == nil ? 1 : Float(defaults.double(forKey: Self.speedKey))
         reverse = defaults.bool(forKey: Self.reverseKey)
+        releaseButtons()
+        let swapButtons = defaults.bool(forKey: PhysicalMouseButtons.swapKey)
+        buttons = PhysicalMouseButtons(swapsRightAndMiddle: swapButtons)
+        buttonsLogged = 0
+        HengeLog.log("input", "physical mouse: swap right/middle \(swapButtons ? "on" : "off")")
         lastScrollFirst = 0
         lastScrollSecond = 0
         GCMouse.mice().forEach(attach)
@@ -178,7 +198,9 @@ final class HardwareMouse {
             self.mice.removeAll { $0 === mouse }
         })
         observers.append(NotificationCenter.default.addObserver(forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main) { note in
-            let locked = (note.object as? UIScene)?.pointerLockState?.isLocked ?? false
+            // The scene comes in the user info: the notification's object isn't it.
+            let scene = note.userInfo?[UIPointerLockState.sceneUserInfoKey] as? UIScene
+            let locked = scene?.pointerLockState?.isLocked ?? false
             HengeLog.log("input", "pointer lock: \(locked ? "on" : "off")")
         })
         PointerLock.set(true)
@@ -201,8 +223,7 @@ final class HardwareMouse {
     }
 
     func releaseButtons() {
-        for button in buttonsDown { henge_vm_mouse_button(button, 0) }
-        buttonsDown.removeAll()
+        for button in buttons.releaseAll() { henge_vm_mouse_button(button, 0) }
     }
 
     private func attach(_ mouse: GCMouse) {
@@ -227,14 +248,14 @@ final class HardwareMouse {
         henge_vm_mouse_move(Int32(x), Int32(y))
     }
 
-    private func button(_ button: Int32, _ pressed: Bool) {
-        henge_vm_mouse_button(button, pressed ? 1 : 0)
-        if pressed {
-            buttonsDown.insert(button)
-        } else {
-            buttonsDown.remove(button)
-            StickyKeys.shared.releaseAll()
+    private func button(_ physicalButton: Int32, _ pressed: Bool) {
+        guard let guestButton = buttons.event(physicalButton, pressed: pressed) else { return }
+        if buttonsLogged < 32 {
+            buttonsLogged += 1
+            HengeLog.log("input", "physical mouse button: raw=\(physicalButton) guest=\(guestButton) \(pressed ? "down" : "up")")
         }
+        henge_vm_mouse_button(guestButton, pressed ? 1 : 0)
+        if !pressed { StickyKeys.shared.releaseAll() }
     }
 
     /// GameController puts vertical motion on the first axis and horizontal on the second.
