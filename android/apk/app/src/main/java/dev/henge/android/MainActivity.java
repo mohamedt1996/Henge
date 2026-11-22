@@ -1178,7 +1178,12 @@ public class MainActivity extends Activity {
             new Thread(() -> {
                 String s = DeviceCheck.sh(true, VmService.sq(bin) + " status; echo; tail -n 3 /data/local/tmp/henge-gunyah-reserve.txt 2>/dev/null; "
                         + "[ -f /data/adb/henge-gunyah/reserve.conf ] && echo \"at boot: $(cat /data/adb/henge-gunyah/reserve.conf) MB\" || echo 'at boot: off'", 10);
-                reserveStatus = s == null ? "(no root answer)" : s.trim();
+                s = s == null ? "(no root answer)" : s.trim();
+                // "reserved MB HUGE PID" from henge-reserve, in words
+                java.util.regex.Matcher m = java.util.regex.Pattern.compile("^reserved (\\d+) (\\d+) (\\d+)").matcher(s);
+                if (m.find()) s = "Reserved: " + m.group(1) + " MB, " + m.group(2) + " MB of it in 2 MB pieces" + s.substring(m.end());
+                else if (s.startsWith("none")) s = "Reserved: nothing" + s.substring(4);
+                reserveStatus = s;
                 ui.post(() -> { if (!isFinishing()) render(true); });
             }, "reserve-status").start();
             st = "…";
@@ -1186,6 +1191,15 @@ public class MainActivity extends Activity {
         TextView t = text(st, 11, DIM, false, Typeface.MONOSPACE);
         t.setTextIsSelectable(true);
         c.addView(t);
+        c.addView(gap(8));
+        final String copied = st;
+        c.addView(link("Copy", v -> {
+            getSystemService(android.content.ClipboardManager.class)
+                    .setPrimaryClip(android.content.ClipData.newPlainText("Henge Gunyah memory", copied));
+            android.widget.Toast.makeText(this, "Copied", android.widget.Toast.LENGTH_SHORT).show();
+        }));
+        c.addView(gap(8));
+        c.addView(link("Refresh", v -> { reserveStatus = null; render(true); }));
         c.addView(gap(10));
         c.addView(secondary("Reserve " + mb + " MB now", ACCENT_LIGHT, v -> shReserve(VmService.sq(bin) + " release >/dev/null 2>&1; sleep 1; setsid nohup " + VmService.sq(bin)
                 + " start " + mb + " >/dev/null 2>&1 & sleep 20")));

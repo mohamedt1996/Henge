@@ -10,15 +10,15 @@
    What it needs comes from the hand-over page, a device page of Henge's: every read there is an MMIO exit Henge
    answers (gunyah.c, HANDOFF_*), and every store to its second half is a report Henge logs.
 
-   The hand-over page (8-byte words):
-     T[0] "HNGEHAND", T[1] pieces, T[2 + 3i] handle, gpa, size of piece i
+   The hand-over pages (8-byte words, 16 KB of them):
+     T[0] "HNGEHAND", T[1] pieces, T[128 + 3i] handle, gpa, size of piece i (up to 640)
      T[64 + r], r: 0-30 x0-x30, 31 SP_EL1, 32 PC, 33 SPSR (the PSTATE to return to), 34 SCTLR, 35 TTBR0, 36 TTBR1,
        37 TCR, 38 MAIR, 39 AMAIR, 40 VBAR, 41 CONTEXTIDR, 42 TPIDR_EL0, 43 TPIDRRO_EL0, 44 TPIDR_EL1, 45 SP_EL0,
        46 CPACR, 47 CNTKCTL, 48 FPCR, 49 FPSR, 50 MDSCR
-   Reports (+0x800 + 8 n): 0 phase, 1 MIDR, 2 MPIDR, 3 ISAR1, 4 SCTLR as Gunyah started it, 5 queue found,
+   Reports (+0x4000 + 8 n): 0 phase, 1 MIDR, 2 MPIDR, 3 ISAR1, 4 SCTLR as Gunyah started it, 5 queue found,
      6/7 its send/receive capabilities, 8 the piece being accepted, 9 MSGQ_SEND, 10 the reply's error (-1 none),
      11 ESR, 12 ELR, 13 FAR of an exception taken here, 14 APIAKeyLo (read under a guard), 15 that read ran;
-     +0xff8: the jump (the Mac runs from here).
+     +0x4ff8: the jump (the Mac runs from here).
    Phases: 1 started, 2 queue found, 3 pieces accepted, 4 state loading, 0xdead: stopped (a report says why).
 
    Only single, naturally aligned loads and stores at the page: Gunyah can hand Henge only those (no LDP). Memory is
@@ -30,7 +30,7 @@ hv_gunyah_shim_start:
     adr  x1, hv_gunyah_shim_params
     ldr  x10, [x1]                      /* the hand-over page */
     ldr  x20, [x1, #8]                  /* the VM's device tree (as the resource manager wrote it back) */
-    add  x9, x10, #0x800                /* its reports */
+    add  x9, x10, #0x4000               /* its reports */
     adr  x1, shim_vectors
     msr  vbar_el1, x1
     isb
@@ -61,7 +61,7 @@ hv_gunyah_shim_start:
 
     ldr  x21, [x10, #0x08]              /* pieces */
     mov  x22, #0
-    add  x23, x10, #0x10
+    add  x23, x10, #0x400               /* T[128]: the pieces */
 1:  cmp  x22, x21
     b.hs 2f
     str  x22, [x9, #0x40]
@@ -126,7 +126,7 @@ hv_gunyah_shim_start:
     msr  vbar_el1, x0                   /* the Mac's vectors: from here an exception is the Mac's */
     isb
     mov  x0, #1
-    str  x0, [x10, #0xff8]              /* the jump */
+    str  x0, [x9, #0xff8]               /* the jump */
     ldr  x0, [x30, #0 * 8]
     ldr  x1, [x30, #1 * 8]
     ldr  x2, [x30, #2 * 8]
@@ -385,7 +385,7 @@ shim_vectors:
     eret
 1:  adr  x1, hv_gunyah_shim_params
     ldr  x10, [x1]
-    add  x9, x10, #0x800
+    add  x9, x10, #0x4000
     mrs  x1, esr_el1
     str  x1, [x9, #0x58]
     mrs  x1, elr_el1

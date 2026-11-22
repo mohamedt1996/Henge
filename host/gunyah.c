@@ -9,8 +9,9 @@
    - The VM: its own 2 MB region at BOOT_PA, just under the Mac's RAM (lent: the shim and the resource manager's
      device tree), the Mac's RAM shared into it after it starts through DroidVM's /dev/gunyah_share (the
      gunyah-host-share module) in 2 MB pages, and accepted by the guest itself (host/gunyah_shim.S). Both work on the
-     tablet (0.3.72-0.3.74); a parcel of 4 KB pages reset it, so the RAM must be all in 2 MB pages (henge-reserve
-     holds it so, android/tools/henge_reserve.c).
+     tablet (0.3.72-0.3.74). Runs of 2 MB pages go in pieces of up to 256 MB, runs of 4 KB pages in pieces of 8 MB (a
+     64 MB parcel of them reset the tablet, 8 MB did not); henge-reserve holds the RAM in 2 MB pages from boot
+     (android/tools/henge_reserve.c), so there are few of the small ones.
    - The shim loads CPU 0's state from the hand-over page (HANDOFF_PA: reads there come back here) and returns to the
      Mac where the JIT stopped. Nothing below 0x70000000 is the VM's memory: the ROM and the config window are not
      used past this point (0.3.75's log says whether anything still reads them; each read would come here as an MMIO
@@ -89,8 +90,9 @@ struct ghsm_share_blob { int32_t vm_fd; uint32_t label, flags, mem_handle; uint6
 #define BOOT_SIZE 0x200000ull
 #define DTB_OFF 0x10000ull
 #define HANDOFF_PA 0x6f000000ull /* a page with nothing behind it: the shim's reads and reports come here */
-#define SHARE_CHUNK (256ull << 20)
-#define MAX_PIECES 64
+#define SHARE_CHUNK (256ull << 20)  /* a piece of 2 MB pages */
+#define SMALL_CHUNK (8ull << 20)    /* a piece of 4 KB pages: 8 MB of them shared fine, 64 MB reset the tablet (0.3.75) */
+#define MAX_PIECES 640
 #define SPI_LOW_FIRST 32        /* UART, RTC, GPIO, AES, graphics: INTIDs 33..63 */
 #define SPI_LOW_LAST 67         /* and PCIe INTx 64..67 */
 #define NIRQ 160
@@ -110,8 +112,8 @@ static pthread_t vcpu_thread_id[HV_MAX_CPUS];
 static volatile uint64_t mmio_exits[HV_MAX_CPUS];
 static int irq_fd[NIRQ];
 static volatile uint8_t irq_level[NIRQ];
-static uint64_t handoff[256];   /* the hand-over page's first half, as the shim reads it */
-static uint64_t shim_rep[256];  /* its reports */
+static uint64_t handoff[2048];  /* the hand-over pages, as the shim reads them (16 KB) */
+static uint64_t shim_rep[512];  /* its reports (+0x4000) */
 static volatile int mac_runs;   /* the shim jumped to the Mac */
 
 /* ---- a minimal flattened device tree writer ---- */
@@ -585,15 +587,43 @@ static int ram_ready(void) {
             fprintf(stderr, "gunyah:   after collapsing: %llu MB in 2 MB pages\n", (unsigned long long)h);
         }
     }
-    const char *min = getenv("HV_GUNYAH_MIN_HUGE"); /* percent; 100 by default: 4 KB pages have reset the tablet */
-    uint64_t need = mb * (uint64_t)(min && *min ? atoi(min) : 100) / 100;
+    /* 0.3.76: what is not in 2 MB pages is shared in 8 MB pieces of 4 KB pages (the tablet took 8 MB of them;
+       64 MB in one piece reset it). HV_GUNYAH_MIN_HUGE=percent: refuse below it (default 0). */
+    const char *min = getenv("HV_GUNYAH_MIN_HUGE");
+    uint64_t need = mb * (uint64_t)(min && *min ? atoi(min) : 0) / 100;
     if (h < need) {
-        fprintf(stderr, "gunyah: only %llu of %llu MB in 2 MB pages: not handed over (a parcel of 4 KB pages reset the "
-                        "tablet). Turn on Settings > Gunyah memory > Reserve at boot and restart the tablet\n",
+        fprintf(stderr, "gunyah: only %llu of %llu MB in 2 MB pages, under HV_GUNYAH_MIN_HUGE: not handed over\n",
                 (unsigned long long)h, (unsigned long long)mb);
         return -1;
     }
     return 0;
+}
+
+/* Which 2 MB pieces of the Mac's RAM are one 2 MB page each (1) or 4 KB pages (0): their first page's frame from
+   /proc/self/pagemap (root sees frames), a transparent huge page there by /proc/kpageflags (KPF_THP), whole and
+   aligned. Without either file every piece counts as 4 KB pages: shared 8 MB at a time, which is safe. */
+static uint64_t pfn_of(int pm, const uint8_t *va) {
+    uint64_t e = 0;
+    if (pread(pm, &e, 8, (off_t)(((uintptr_t)va >> 12) * 8)) != 8 || !(e >> 63)) return 0;
+    return e & ((1ull << 55) - 1);
+}
+static void classify(uint8_t *kind, uint64_t nchunks) {
+    memset(kind, 0, nchunks);
+    int pm = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC), kf = open("/proc/kpageflags", O_RDONLY | O_CLOEXEC);
+    if (pm < 0 || kf < 0) {
+        fprintf(stderr, "gunyah: page frames unreadable (%s): every piece shared as 4 KB pages\n", strerror(errno));
+        if (pm >= 0) close(pm);
+        if (kf >= 0) close(kf);
+        return;
+    }
+    for (uint64_t c = 0; c < nchunks; c++) {
+        const uint8_t *va = B->ram + (c << 21);
+        uint64_t first = pfn_of(pm, va), last = pfn_of(pm, va + (2u << 20) - 4096), flags = 0;
+        if (!first || (first & 511) || last != first + 511) continue;
+        if (pread(kf, &flags, 8, (off_t)(first * 8)) == 8 && (flags >> 22 & 1)) kind[c] = 1;
+    }
+    close(pm);
+    close(kf);
 }
 
 /* ---- the hand-over page ---- */
@@ -622,9 +652,9 @@ static const char *phase_name(uint64_t p) {
 
 /* A store of the shim's to the page's second half. */
 static void shim_report(uint64_t off, uint64_t v) {
-    unsigned i = (unsigned)(off / 8) & 255;
+    unsigned i = (unsigned)(off / 8) & 511;
     shim_rep[i] = v;
-    if (off == 0x7f8) { /* +0xff8: the jump */
+    if (off == 0xff8) { /* +0x4ff8: the jump */
         mac_runs = 1;
         fprintf(stderr, "gunyah: the Mac runs on Gunyah now (CPU 0 at pc %#llx)\n", (unsigned long long)handoff[64 + 32]);
         return;
@@ -676,13 +706,13 @@ static void *vcpu_thread(void *arg) {
             uint64_t pa = r->mmio.phys_addr;
             unsigned len = r->mmio.len > 8 ? 8 : r->mmio.len;
             mmio_exits[id]++;
-            if (pa >= HANDOFF_PA && pa < HANDOFF_PA + 0x1000) {
+            if (pa >= HANDOFF_PA && pa < HANDOFF_PA + 0x5000) {
                 uint64_t off = pa - HANDOFF_PA, v = 0;
                 if (r->mmio.is_write) {
                     memcpy(&v, r->mmio.data, len);
-                    if (off >= 0x800) shim_report(off - 0x800, v);
+                    if (off >= 0x4000) shim_report(off - 0x4000, v);
                 } else {
-                    if (off < 0x800) v = handoff[off / 8];
+                    if (off < 0x4000) v = handoff[off / 8];
                     memset(r->mmio.data, 0, sizeof r->mmio.data);
                     memcpy(r->mmio.data, &v, len);
                 }
@@ -877,9 +907,19 @@ int hv_gunyah_run(void) {
 
     /* The Mac's RAM, shared into the running VM 256 MB a piece (DroidVM's way: a memparcel the guest accepts exists
        only once the VM does), each piece's handle for the shim. */
-    int pieces = 0;
+    int pieces = 0, big = 0;
+    uint64_t nch = (B->ram_size + (2u << 20) - 1) >> 21, huge_bytes = 0;
+    uint8_t *kind = calloc(nch, 1);
+    if (!kind) return HV_EXIT_UNSUPPORTED;
+    classify(kind, nch);
     for (uint64_t done = 0; done < B->ram_size && pieces < MAX_PIECES; pieces++) {
-        uint64_t n = B->ram_size - done < SHARE_CHUNK ? B->ram_size - done : SHARE_CHUNK;
+        /* A run of the same kind: 2 MB pages up to 256 MB a piece, 4 KB pages up to 8 MB. */
+        uint64_t c = done >> 21;
+        int k = kind[c];
+        uint64_t cap = k ? SHARE_CHUNK : SMALL_CHUNK, n = 0;
+        while (done + n < B->ram_size && n < cap && kind[(done + n) >> 21] == k) n += 2u << 20;
+        if (done + n > B->ram_size) n = B->ram_size - done;
+        if (k) huge_bytes += n, big++;
         struct ghsm_share_blob sb = {.vm_fd = vm_fd, .label = 0x4000u + (uint32_t)pieces, .flags = GH_MEM_R | GH_MEM_W | GH_MEM_X,
                                      .guest_phys_addr = VMAPPLE_MEM + done, .memory_size = n,
                                      .userspace_addr = (uintptr_t)B->ram + done};
@@ -889,13 +929,20 @@ int hv_gunyah_run(void) {
                     strerror(errno), pieces);
             return HV_EXIT_UNSUPPORTED;
         }
-        handoff[2 + 3 * pieces] = sb.mem_handle, handoff[3 + 3 * pieces] = VMAPPLE_MEM + done, handoff[4 + 3 * pieces] = n;
+        handoff[128 + 3 * pieces] = sb.mem_handle, handoff[129 + 3 * pieces] = VMAPPLE_MEM + done, handoff[130 + 3 * pieces] = n;
         done += n;
+    }
+    free(kind);
+    if (pieces >= MAX_PIECES && handoff[129 + 3 * (pieces - 1)] + handoff[130 + 3 * (pieces - 1)] < VMAPPLE_MEM + B->ram_size) {
+        fprintf(stderr, "gunyah: the Mac's RAM needs more than %d pieces (too much of it in 4 KB pages): reserve it at boot\n", MAX_PIECES);
+        return HV_EXIT_UNSUPPORTED;
     }
     handoff[0] = 0x444e414845474e48ull; /* "HNGEHAND" */
     handoff[1] = (uint64_t)pieces;
     fill_state(c0);
-    fprintf(stderr, "gunyah: the Mac's RAM shared as %d pieces; the shim accepts them\n", pieces);
+    fprintf(stderr, "gunyah: the Mac's RAM shared as %d pieces: %llu MB in 2 MB pages (%d pieces), %llu MB in 4 KB pages (%d pieces "
+                    "of up to 8 MB); the shim accepts them\n", pieces, (unsigned long long)(huge_bytes >> 20), big,
+            (unsigned long long)((B->ram_size - huge_bytes) >> 20), pieces - big);
 
     long sz = ioctl(vcpu_fd[0], GH_VCPU_MMAP_SIZE, 0);
     if (sz < 0) sz = ioctl(dev, GH_VCPU_MMAP_SIZE, 0);

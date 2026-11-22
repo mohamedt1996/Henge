@@ -50,14 +50,13 @@ final class GunyahTest {
             {"Share 512 MB (may reset the tablet)", "--lend --base 70000000 --gic 10000000 --image-mb 16 --share-window 512", "40", "info"},
             // 0.3.74/0.3.75: Henge runs the boot ROM and iBoot itself and hands the CPUs to Gunyah at the jump into the
             // kernel (base 0x6fe00000 and memory at 0x70000000 work). Steps 7 and 9 also say whether PAC instructions
-            // run and whether every vCPU signs alike. Can the Mac's RAM be had in 2 MB pages (harder compaction now;
-            // with the reserve on, it holds that memory already):
-            {"2 GB in 2 MB pages (made only, not shared)", "--share-window 2048 --window-at 70000000 --window-only", "90", "info"},
-            {"3 GB in 2 MB pages (made only, not shared)", "--share-window 3072 --window-at 70000000 --window-only", "120", "info"},
+            // run and whether every vCPU signs alike. Can the Mac's RAM be had in 2 MB pages (0.3.76: the reserve's own count,
+            // taking no memory; what is not in 2 MB pages is shared 8 MB at a time):
+            {"The memory reserved for the Mac (Settings > Gunyah memory)", "--reserve-status", "10", "info"},
             // Optional: whether 4 KB pages are safe in a small amount (64 MB of them reset the tablet in 0.3.71).
             {"Optional: share 8 MB in 4 KB pages (may reset the tablet)", "--lend --base 70000000 --gic 10000000 --image-mb 16 --share-window 8 --window-4k", "15", "info"},
     };
-    private static final int VERSION = 14; // of STEPS: progress saved by another list starts over
+    private static final int VERSION = 15; // of STEPS: progress saved by another list starts over
 
     static volatile boolean running;
 

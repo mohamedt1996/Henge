@@ -937,6 +937,14 @@ Magisk module v2) and the kernel is pushed to compact harder. The stage log name
 stage. The Gunyah test now says whether PAC instructions run on Gunyah's vCPUs and whether each vCPU signs alike,
 and has an optional 8 MB share of 4 KB pages.
 
+0.3.76 (2026-11-22): 0.3.75's Gunyah test: PAC instructions run on Gunyah's vCPUs and sign alike on all four (the
+same keys, APIAKey 0), MPIDR 0x80000000 as Henge's CPU 0, and 8 MB of 4 KB pages shared and accepted without a reset
+(64 MB of them reset the tablet in 0.3.71). So the hand-over no longer needs all of the Mac's RAM in 2 MB pages: each
+2 MB piece is classed by its page frame (pagemap, kpageflags' THP flag), runs of 2 MB pages go in pieces of up to
+256 MB and runs of 4 KB pages in pieces of 8 MB, up to 640 pieces (the hand-over table is 16 KB now). The 2 and 3 GB
+test steps, made beside a 3 GB reserve, had Android kill the app; they are replaced by the reserve's own count
+(--reserve-status), which takes no memory. The Gunyah memory card says what is reserved in words, with Copy.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

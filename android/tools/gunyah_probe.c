@@ -103,6 +103,9 @@
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <stddef.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
@@ -602,8 +605,46 @@ static int share(int vm, uint32_t *label, uint64_t pa, uint8_t *host, uint64_t s
     return 0;
 }
 
+/* --reserve-status (0.3.76): what henge-reserve holds for the Mac (android/tools/henge_reserve.c), asked over its
+   socket: no memory is taken here (0.3.75's 2 GB step, made beside a 3 GB reserve, had Android kill the app). */
+static int reserve_status(void) {
+    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un a = {.sun_family = AF_UNIX};
+    static const char name[] = "henge-gunyah-ram";
+    memcpy(a.sun_path + 1, name, sizeof name - 1);
+    socklen_t len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + sizeof name);
+    char reply[128] = {0};
+    unsigned long long mb = 0, huge = 0;
+    int pid = 0;
+    if (s >= 0 && connect(s, (struct sockaddr *)&a, len) == 0) {
+        (void)!write(s, "status\n", 7);
+        ssize_t n = read(s, reply, sizeof reply - 1);
+        if (n > 0) reply[n] = 0;
+    }
+    if (s >= 0) close(s);
+    FILE *f = fopen("/data/local/tmp/henge-gunyah-reserve.txt", "r");
+    if (f) { /* its last lines */
+        char lines[6][256];
+        int n = 0;
+        while (fgets(lines[n % 6], sizeof lines[0], f)) n++;
+        fclose(f);
+        for (int i = n > 6 ? n - 6 : 0; i < n; i++) printf("  %s", lines[i % 6]);
+    }
+    if (sscanf(reply, "reserved %llu %llu %d", &mb, &huge, &pid) != 3) {
+        printf("RESULT: FAIL nothing is reserved (Settings > Gunyah memory: Reserve at boot, then restart the tablet)\n");
+        return 1;
+    }
+    printf("reserved               %llu MB, %llu MB of it in 2 MB pages (henge-reserve, pid %d)\n", mb, huge, pid);
+    int ok = huge * 100 >= mb * 99;
+    printf("RESULT: %s %llu of %llu MB in 2 MB pages (%s)\n", ok ? "PASS" : "FAIL", huge, mb,
+           ok ? "Gunyah takes it in big pieces" : "the rest goes in 8 MB pieces of 4 KB pages: slower to hand over, maybe too many");
+    return !ok;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--reserve-status")) return reserve_status();
     static Layout layout;
     Layout *L = &layout;
     layout = SMALL;
