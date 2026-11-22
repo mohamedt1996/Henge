@@ -514,6 +514,12 @@ static void serve(Client *c) {
                 if (recv_all(c->fd, b, 4)) return;
                 hv_vm_touch_frame(get32(b));
                 break;
+            case 254: /* Henge's app, the screen's 🎈: how much of its RAM macOS is to give back, in MB (the balloon,
+                         Settings > Give memory back; 0 gives it all back to the Mac) */
+                if (recv_all(c->fd, b, 4)) return;
+                fprintf(stderr, "hengevm: balloon: the app asks for %u MB back%s\n", get32(b),
+                        hv_vm_balloon(get32(b)) < 0 ? ", but this Mac has no balloon (Settings > Give memory back, then a restart)" : "");
+                break;
             case 6: /* ClientCutText */
                 if (recv_all(c->fd, b, 7)) return;
                 for (uint32_t n = get32(b + 3); n; n--)

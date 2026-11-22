@@ -118,6 +118,8 @@ static void host_state(FILE *out) {
         }
         fclose(f);
         if (total > 0 && avail >= 0) fprintf(out, " | tablet: %lld of %lld MB of memory available", avail >> 10, total >> 10);
+        long back = hv_vm_balloon(-1);
+        if (back >= 0) fprintf(out, ", %ld MB given back by the Mac (balloon)", back);
         /* Settings > Huge pages: how much shared memory (the Mac's RAM is nearly all of it) lies in 2 MB pages,
            and how much of that a process maps as such, which is what spares the TLB. Shown while asked for,
            0 included: "0 MB" is the answer where the kernel gave none (the tablet, build 57, On: no figure). */

@@ -415,6 +415,10 @@ public class VmService extends Service {
             pb.environment().put("HV_FLUSH", "2");
             // Settings > Instant resume: Shut Down saves the running Mac (SIGUSR1, android/runner.c) and the next Start
             // goes on from it. Valid for this build, this Mac, its RAM and CPUs; the engine checks the disk too.
+            // Settings > Give memory back: the memory balloon (devices/virtio_balloon.c), asking for nothing at start;
+            // the screen's 🎈 sets how much (VNC message 254).
+            if (!install && !gunyah() && "on".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("balloon", "off")))
+                pb.environment().put("HV_BALLOON", "0");
             if (!install) { // the shared folder, at http://10.0.2.4 in macOS (android/runner.c)
                 macAppsDir(this).mkdirs();
                 pb.environment().put("HV_SHARE_DIR", shareDir(this).getPath());

@@ -841,6 +841,20 @@ plug-in have no counterpart here, see the section below):
   without leaving the app's process, macOS 12 Monterey booting to Setup. DNS through Apple's resolver (dns_proxy.c)
   is stubbed: libslirp's own, as before.
 
+0.3.68, from the 0.3.67 log (2026-11-22): translating took 1-3.8 s of the four CPUs' 120 s per 30 s, while the
+engine waited on swap 200-620 thousand times per 30 s with 530-1070 MB of the tablet's 7.5 GB available and swap
+nearly full. Memory, not the JIT, is what the tablet is short of.
+
+- **Settings > Give memory back** (off; HV_BALLOON=0): upstream's memory balloon (devices/virtio_balloon.c), and the
+  screen's 🎈 asks macOS for 512, 1024 or 1536 MB back while it runs (VNC message 254, `hv_vm_balloon`). The
+  Mac's RAM in memory (a memfd) is now the balloon's file (`b->ram_fd`), so a page handed back is a hole punched
+  in it: freed in the engine's and the renderer's mappings at once, with nothing left in swap (madvise on a shared
+  mapping would only have unmapped it). With Zero-copy: a udmabuf pins its pages until it goes, and it goes with
+  the Metal object over them (reims-vgpu `dma_buf.rs`: "an import goes with its buffer"), which macOS cannot give
+  back while it holds it; a dma-buf made later takes the file's pages as they are then. The heartbeat: "N MB given
+  back by the Mac (balloon)"; the balloon's own lines say what macOS lists and gives. macOS's AppleVirtIOBalloon
+  has not been seen on a tablet (nor on upstream's phone): the log says whether it binds.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

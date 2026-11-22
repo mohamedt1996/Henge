@@ -631,6 +631,17 @@ public class MainActivity extends Activity {
         resumenote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(resumenote);
         c.addView(hairline());
+        final boolean balloonOn = "on".equals(prefs.getString("balloon", "off"));
+        c.addView(choiceRow("Give memory back", new String[]{"Off", "On"}, balloonOn ? 1 : 0,
+                i -> { prefs.edit().putString("balloon", i == 1 ? "on" : "off").apply(); render(true); }));
+        TextView bnote = text("Experimental, from the next start. On: the Mac's screen has a 🎈 button that asks macOS to hand "
+                + "back 512, 1024 or 1536 MB of its memory while it runs (the memory balloon), and the tablet frees it at once, "
+                + "with no copy left in swap. Use it when the tablet is short of memory (the heartbeat's \"waiting for swap\" "
+                + "count is high); macOS then works within less, as with a smaller Memory setting. Works with Zero-copy.",
+                13, DIM, false);
+        bnote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(bnote);
+        c.addView(hairline());
         final boolean captured = "capture".equals(prefs.getString("mouse", "android"));
         c.addView(choiceRow("Mouse", new String[]{"Android's pointer", "Captured"}, captured ? 1 : 0,
                 i -> { prefs.edit().putString("mouse", i == 0 ? "android" : "capture").apply(); render(true); }));

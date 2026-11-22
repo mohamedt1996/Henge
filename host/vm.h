@@ -90,6 +90,9 @@ uint64_t hv_vm_resume_counter(uint64_t counter, int64_t wall_ns);
 int64_t hv_vm_paused_wall_ns(void);
 /* After a resume (or a long pause): the network link down for 2 s, 1.5 s from now. */
 void hv_vm_link_flap(void);
+/* The memory balloon (HV_BALLOON set at start): ask macOS to give back `mb` MB of its RAM (0: all of it back to
+   the Mac). Returns the MB it holds back now, or -1 with no balloon. Any thread. */
+long hv_vm_balloon(long mb);
 void hv_vm_flush_disks(void);
 /* The disk and auxiliary storage files as they are now (inode, size, last change): a saved machine resumes only onto these. */
 int hv_vm_disk_identity(char *out, size_t n);

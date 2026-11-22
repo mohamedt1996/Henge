@@ -473,6 +473,15 @@ void hv_vm_link_flap(void) {
 #define st_mtimespec st_mtim
 #endif
 
+long hv_vm_balloon(long mb) {
+    if (!machine_created || !board.balloon) return -1;
+    if (mb >= 0) {
+        hv_virtio_balloon_set_target(board.balloon, (uint64_t)mb << 20);
+        hv_machine_wake(&m); /* CPU 0's poll hands it to the driver */
+    }
+    return (long)(hv_virtio_balloon_actual(board.balloon) >> 20);
+}
+
 int hv_vm_disk_identity(char *out, size_t n) {
     struct stat a, b;
     if (disk.fd < 0 || aux.fd < 0 || fstat(disk.fd, &a) != 0 || fstat(aux.fd, &b) != 0) return -1;

@@ -394,6 +394,12 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
             if (b->ram == MAP_FAILED) b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         }
         if (b->ram != MAP_FAILED) {
+            /* The memory balloon (Settings > Give memory back) punches holes in it: a page macOS hands back is
+               freed at once, in both processes' mappings and with no copy left in swap. A dma-buf of the pages
+               (Zero-copy) pins the pages it holds until it goes, but it goes with the Metal object over them,
+               and macOS can give back only pages no object holds (reims-vgpu's dma_buf.rs: "an import goes with
+               its buffer"); the next dma-buf is made of the file's pages as they are then. */
+            b->ram_fd = fd;
             static char name[64];
             snprintf(name, sizeof name, "/proc/%d/fd/%d", (int)getpid(), fd); /* the fd stays open: it is the name */
             setenv("HV_RAM_FILE", name, 1);

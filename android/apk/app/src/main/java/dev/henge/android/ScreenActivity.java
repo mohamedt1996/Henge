@@ -133,10 +133,31 @@ public class ScreenActivity extends Activity {
         bar.addView(barButton("↑", v -> view.tapKey(0xff52, false)));
         bar.addView(barButton("↓", v -> view.tapKey(0xff54, false)));
         bar.addView(barButton("→", v -> view.tapKey(0xff53, false)));
+        if ("on".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("balloon", "off")))
+            bar.addView(barButton("🎈", v -> balloonMenu()));
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.END);
         root.addView(bar, lp);
         setContentView(root);
+    }
+
+    /* Settings > Give memory back: how much of its RAM macOS hands back to the tablet (VNC message 254). */
+    private int balloonMb;
+
+    private void balloonMenu() {
+        final int[] mb = {0, 512, 1024, 1536};
+        String[] labels = {"Nothing (all of it to the Mac)", "512 MB", "1 GB", "1.5 GB"};
+        int at = 0;
+        for (int i = 0; i < mb.length; i++) if (mb[i] == balloonMb) at = i;
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Give memory back to the tablet")
+                .setSingleChoiceItems(labels, at, (d, which) -> {
+                    balloonMb = mb[which];
+                    int n = balloonMb;
+                    view.sendAsync(new byte[]{(byte) 254, (byte) (n >> 24), (byte) (n >> 16), (byte) (n >> 8), (byte) n});
+                    d.dismiss();
+                })
+                .show();
     }
 
     private Button barButton(String t, View.OnClickListener l) {
