@@ -93,8 +93,7 @@ struct ghsm_share_blob { int32_t vm_fd; uint32_t label, flags, mem_handle; uint6
    1.9 MB from 64 KB had the second piece refused, NORESOURCE: the resource manager's own room in the VM's region?). */
 #define DTB_OFF 0x100000ull
 /* The shim's reads and reports come here: 20 KB with nothing behind them, beside vmapple's UART (0x20010000, where
-   the probe's report page has always exited); 0.3.77's 0x6f000000, just under the VM's base, never exited once. Only
-   until the jump: Henge's own devices after it. */
+   the probe's report page has always exited); 0.3.77's 0x6f000000, just under the VM's base, never exited once. */
 #define HANDOFF_PA 0x20020000ull
 #define SHARE_CHUNK (256ull << 20)  /* a piece of 2 MB pages */
 #define SMALL_CHUNK (8ull << 20)    /* a piece of 4 KB pages: 8 MB of them shared fine, 64 MB reset the tablet (0.3.75) */
@@ -803,7 +802,9 @@ static void *vcpu_thread(void *arg) {
             if (mmio_exits[id]++ == 0) say("gunyah: vCPU %d runs (its first exit: %s %#llx)\n", id, r->mmio.is_write ? "a store to" : "a load from",
                                            (unsigned long long)pa);
             note_page(id, pa, r->mmio.is_write);
-            if (!mac_runs && pa >= HANDOFF_PA && pa < HANDOFF_PA + 0x5000) {
+            /* Always the hand-over page's (vmapple has nothing there): the shim loads x0-x30 from it after it reports
+               the jump, and 0.3.80 sent those 31 loads to Henge's devices, which answered 0: the kernel got all zeros. */
+            if (pa >= HANDOFF_PA && pa < HANDOFF_PA + 0x5000) {
                 uint64_t off = pa - HANDOFF_PA, v = 0;
                 if (r->mmio.is_write) {
                     memcpy(&v, r->mmio.data, len);

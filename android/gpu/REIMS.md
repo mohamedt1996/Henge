@@ -976,6 +976,12 @@ pieces, load CPU 0's state and jump into the kernel. The tablet reset soon after
 engine wrote only on unusual events). Now every device page the Mac touches first, and every second for a minute (then
 every ten) each vCPU's exits and last access, are forced to storage, so the log's end says how far the kernel got.
 
+0.3.81 (2026-11-22): 0.3.80's log showed why the Mac went nowhere after the jump: the shim reports the jump and then
+loads x0-x30 from the hand-over page, and the engine had stopped answering that page at the report, so those 31
+loads (0x20020200-0x200202f0) went to Henge's devices, which answered 0. The kernel started with every register zero
+(x0 should be boot_args), made no more exits for 30 s, and did not reset the tablet this time. The page is now the
+hand-over's for the whole run.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
