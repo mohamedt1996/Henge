@@ -44,6 +44,16 @@ def main() -> None:
         if toml.exists():
             total += widen(toml)
 
+    # reims-vgpu's own Linux dependencies but the video backends (VA-API, NVIDIA): from 2026-11 its
+    # graphics device's Vulkan side and hardware video (`graphics::vulkan`) use them on Android too.
+    toml = reims / 'crates' / 'reims-vgpu' / 'Cargo.toml'
+    t = toml.read_text()
+    if 'reims-vgpu-video-vulkan.workspace = true' in t and 'target_os = "android"' not in t:
+        t += ('\n# Henge\'s Android port: the Vulkan platform and its video, without the Linux video backends.\n'
+              '[target.\'cfg(target_os = "android")\'.dependencies]\nreims-vgpu-vulkan.workspace = true\n'
+              'reims-vgpu-video-vulkan.workspace = true\nmetal2vulkan-runtime.workspace = true\nash.workspace = true\n')
+        toml.write_text(t)
+
     # The window crate: the Vulkan platform on Android too (its clock), without SDL3, and the stub.
     win = reims / 'crates' / 'reims-vgpu-window'
     toml = win / 'Cargo.toml'
