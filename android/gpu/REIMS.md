@@ -971,6 +971,11 @@ NORESOURCE (2), both times. The probe's 12 pieces were all accepted with its tre
 megabyte; the engine's took 1.9 MB of it from 64 KB on. The engine now lays the region out as the probe does, and the
 shim tries a refused piece four times before it stops.
 
+0.3.80 (2026-11-22): the Mac ran on Gunyah for the first time (0.3.79): the layout fix let the shim accept all 12
+pieces, load CPU 0's state and jump into the kernel. The tablet reset soon after, with nothing more in the log (the
+engine wrote only on unusual events). Now every device page the Mac touches first, and every second for a minute (then
+every ten) each vCPU's exits and last access, are forced to storage, so the log's end says how far the kernel got.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

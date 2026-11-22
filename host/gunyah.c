@@ -724,6 +724,40 @@ static void shim_report(uint64_t off, uint64_t v) {
    A signal every HV_GUNYAH_KICK_MS (2 by default; 0: none) brings each vCPU's GH_VCPU_RUN back, and the thread yields
    before going in again. The app's Gunyah test (--spin, --kick) says whether the driver lets signals through. */
 static int kick_ms = 2;
+/* 0.3.80: the Mac ran on Gunyah (0.3.79) and the tablet reset soon after with nothing more in the log. After the jump,
+   each device page the Mac touches first (up to 96) and, every second for a minute, every vCPU's exit count and last
+   access are forced to storage: the log's end then says how far the kernel got. */
+static volatile uint64_t last_pa[HV_MAX_CPUS], last_write[HV_MAX_CPUS];
+static uint64_t seen_pages[96];
+static int nseen;
+static pthread_mutex_t seen_mu = PTHREAD_MUTEX_INITIALIZER;
+static void note_page(int id, uint64_t pa, int write) {
+    last_pa[id] = pa, last_write[id] = write;
+    if (!mac_runs) return;
+    uint64_t pg = pa >> 12;
+    pthread_mutex_lock(&seen_mu);
+    int seen = 0;
+    for (int i = 0; i < nseen; i++) seen |= seen_pages[i] == pg;
+    int say_it = !seen && nseen < 96;
+    if (say_it) seen_pages[nseen++] = pg;
+    pthread_mutex_unlock(&seen_mu);
+    if (say_it) say("gunyah: the Mac's vCPU %d first touches %#llx (%s)\n", id, (unsigned long long)pa, write ? "store" : "load");
+}
+static void *watch_thread(void *arg) {
+    (void)arg;
+    while (!stop_req && !mac_runs) usleep(10000);
+    for (int s = 1; !stop_req && s <= 600; s++) {
+        sleep(1);
+        if (s > 60 && s % 10) continue;
+        char line[512];
+        int n = snprintf(line, sizeof line, "gunyah: %d s on Gunyah:", s);
+        for (int i = 0; i < nvcpu && n < (int)sizeof line - 64; i++)
+            n += snprintf(line + n, sizeof line - (size_t)n, " vcpu%d %llu exits (last %s %#llx)", i, (unsigned long long)mmio_exits[i],
+                          last_write[i] ? "store" : "load", (unsigned long long)last_pa[i]);
+        say("%s\n", line);
+    }
+    return NULL;
+}
 static uint64_t kicks_back[HV_MAX_CPUS];
 static void *kick_thread(void *arg) {
     (void)arg;
@@ -768,6 +802,7 @@ static void *vcpu_thread(void *arg) {
             unsigned len = r->mmio.len > 8 ? 8 : r->mmio.len;
             if (mmio_exits[id]++ == 0) say("gunyah: vCPU %d runs (its first exit: %s %#llx)\n", id, r->mmio.is_write ? "a store to" : "a load from",
                                            (unsigned long long)pa);
+            note_page(id, pa, r->mmio.is_write);
             if (!mac_runs && pa >= HANDOFF_PA && pa < HANDOFF_PA + 0x5000) {
                 uint64_t off = pa - HANDOFF_PA, v = 0;
                 if (r->mmio.is_write) {
@@ -798,6 +833,7 @@ static void *vcpu_thread(void *arg) {
             }
         } else if (r->exit_reason == GH_VCPU_EXIT_STATUS) {
             uint32_t reason = 0;
+            say("gunyah: vCPU %d: the VM's status changed\n", id);
             memcpy(&reason, r->status.reason, r->status.reason_size < 4 ? r->status.reason_size : 4);
             fprintf(stderr, "gunyah: the VM stopped (seen by vCPU %d): status %u (1 load failed, 2 exited, 3 crashed), "
                             "type %u, reason %#x\n", id, r->status.status, r->status.type, reason);
@@ -1026,6 +1062,8 @@ int hv_gunyah_run(void) {
     pthread_create(&t, NULL, device_thread, NULL);
     pthread_detach(t);
     pthread_create(&t, NULL, pac_thread, NULL);
+    pthread_detach(t);
+    pthread_create(&t, NULL, watch_thread, NULL);
     pthread_detach(t);
     pthread_attr_t attr;
     pthread_attr_init(&attr);
