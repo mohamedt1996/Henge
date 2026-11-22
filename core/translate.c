@@ -35,7 +35,7 @@ typedef struct {
     uint8_t cold; /* the instruction is in the cold part */
 } LitFix;
 
-enum { OOL_EXIT, OOL_SLOW, OOL_SYS, OOL_MRS, OOL_GROUP };
+enum { OOL_EXIT, OOL_SLOW, OOL_SYS, OOL_MRS, OOL_GROUP, OOL_MSR };
 
 typedef struct {
     uint32_t at;        /* the branch that jumps here */
@@ -1409,6 +1409,33 @@ static void put_pstate_bit(Emit *e, int rt, int bit, int read) {
     unspill(e, s, 3);
 }
 
+/* MSR SCTLR_EL1, Xt at EL1 (xnu writes it at process switches, ~850/s: the pointer-authentication enables).
+   The value with the bits sysreg.c forces (ITD and SED set, CP15BEN clear: | 0x180, & ~0x20) is
+   stored inline where none of the bits translation depends on (M, WXN, E0E, EE) changes; otherwise the helper
+   writes it (it flushes the TLB and sets exit_req), and the block leaves after if exit_req is set. */
+static void put_sctlr_write(Emit *e, int rt, uint32_t insn, uint64_t pc) {
+    if (rt == 31) put(e, 0xd2800006u);                                  /* movz x6, #0 */
+    else if (is_stolen(rt)) put(e, LDR_X(6, 28, slot_of(rt)));
+    else put(e, MOV_X(6, rt));
+    put(e, 0xd2800007u | 0x180u << 5);                                  /* movz x7, #0x180 */
+    put(e, 0xaa000000u | 7 << 16 | 6 << 5 | 6);                         /* orr x6, x6, x7 */
+    put(e, 0xd2800007u | 0x20u << 5);                                   /* movz x7, #0x20 */
+    put(e, 0x8a200000u | 7 << 16 | 6 << 5 | 6);                         /* bic x6, x6, x7 */
+    put(e, LDR_X(7, 28, HV_CPU_SCTLR_EL1));
+    put(e, 0xca000000u | 6 << 16 | 7 << 5 | 7);                         /* eor x7, x7, x6: what changes */
+    put(e, 0xd280000fu | 0x0001u << 5);                                 /* movz x15, #0x0001 */
+    put(e, 0xf2a0000fu | 0x0308u << 5);                                 /* movk x15, #0x0308, lsl #16: M, WXN, E0E, EE */
+    put(e, 0xea000000u | 15 << 16 | 7 << 5 | 31);                       /* tst x7, x15 */
+    put(e, 0x54000001u);                                                /* b.ne helper (patched) */
+    put_ool(e, (Ool){.kind = OOL_MSR, .pc = pc, .insn = insn});
+    uint32_t slow = e->nool - 1;
+    put(e, STR_X(6, 28, HV_CPU_SCTLR_EL1));
+    e->ool[slow].join = e->n;
+    put(e, 0xb9400000u | (HV_CPU_EXIT_REQ / 4) << 10 | 28 << 5 | 6);   /* ldr w6, [x28, #exit_req] */
+    put(e, 0x35000000u | 6);                                            /* cbnz w6, leave */
+    put_ool(e, (Ool){.kind = OOL_EXIT, .pc = pc + 4});
+}
+
 /* The commonest PSTATE writes, at EL1, without the helper. DAIF: a masked
    interrupt let through is taken before the next instruction (leave if either
    line is up; the dispatcher sorts out masking). SPSel: the guest SP is the
@@ -1467,6 +1494,13 @@ static int translate_msr_inline(Emit *e, uint32_t insn, uint64_t pc) {
             e->flags = flags;
         }
         return 2;
+    }
+    if (imm_form && field == 003) { /* UAO: the bit alone (nothing translated reads it) */
+        put(e, LDR_X(6, 28, HV_CPU_PSTATE_EXTRA));
+        put(e, 0xd2a01007u);                                                         /* movz x7, #0x80, lsl #16: UAO */
+        put(e, ((imm & 1) ? 0xaa000000u : 0x8a200000u) | 7 << 16 | 6 << 5 | 6);
+        put(e, STR_X(6, 28, HV_CPU_PSTATE_EXTRA));
+        return 1;
     }
     if (imm_form && (field == 005 || field == 004)) { /* SPSel, PAN */
         uint32_t flags = e->flags, bit = field == 005 ? HV_BLOCK_SPX : HV_BLOCK_PAN, on = imm & 1;
@@ -1579,14 +1613,28 @@ static int translate_sysreg_inline(Emit *e, uint32_t insn, uint64_t pc) {
         else put_store_field(e, rt, off);
         return 1;
     }
-    case SR(3, 0, 1, 0, 0): /* SCTLR_EL1, ESR_EL1, FAR_EL1: reads (writes have side effects or are rare) */
+    case SR(3, 0, 1, 0, 0): /* SCTLR_EL1, ESR_EL1, FAR_EL1: reads; SCTLR writes where translation does not change */
     case SR(3, 0, 5, 2, 0):
     case SR(3, 0, 6, 0, 0): {
-        if (!read || !el1) return 0;
+        if (!el1) return 0;
+        if (!read && reg == SR(3, 0, 1, 0, 0)) {
+            put_sctlr_write(e, rt, insn, pc);
+            return 1;
+        }
+        if (!read) return 0;
         uint32_t off = reg == SR(3, 0, 1, 0, 0) ? HV_CPU_SCTLR_EL1 : reg == SR(3, 0, 5, 2, 0) ? HV_CPU_ESR_EL1 : HV_CPU_FAR_EL1;
         put_load_field(e, rt, off);
         return 1;
     }
+    case SR(3, 0, 13, 0, 1): /* CONTEXTIDR_EL1: plain storage (xnu writes it at every process switch) */
+        if (!el1) return 0;
+        if (read) put_load_field(e, rt, HV_CPU_CONTEXTIDR_EL1);
+        else put_store_field(e, rt, HV_CPU_CONTEXTIDR_EL1);
+        return 1;
+    case SR(3, 0, 4, 2, 4): /* UAO: one bit of PSTATE; unprivileged loads and stores do not read it here */
+        if (!el1) return 0;
+        put_pstate_bit(e, rt, 23, read);
+        return 1;
     case SR(3, 0, 2, 0, 2): /* TCR_EL1, PAR_EL1: reads (writes change translation; PAR is written by AT) */
     case SR(3, 0, 7, 4, 0):
         if (!read || !el1) return 0;
@@ -1875,7 +1923,7 @@ static void emit_ool(Emit *e) {
                 e->site[e->nsite - 1].cond_at = site_at;
             }
         } else {
-            put_helper(e, o->pc, o->insn, o->kind == OOL_SYS ? HV_OP_SYS : o->kind == OOL_MRS ? HV_OP_MRS : HV_OP_MEM);
+            put_helper(e, o->pc, o->insn, o->kind == OOL_SYS ? HV_OP_SYS : o->kind == OOL_MRS ? HV_OP_MRS : o->kind == OOL_MSR ? HV_OP_MSR : HV_OP_MEM);
             put(e, B_OP);
             plink(e, e->n - 1, 1, o->join, 0);
         }

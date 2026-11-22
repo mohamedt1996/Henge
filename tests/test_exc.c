@@ -1,4 +1,5 @@
 #include "harness.h"
+#include "translate.h"
 
 #include <mach/mach_time.h>
 #include <stdlib.h>
@@ -8,6 +9,7 @@ DECLARE_PROGRAM(p_brk_undef);
 DECLARE_PROGRAM(p_dabt);
 DECLARE_PROGRAM(p_el0);
 DECLARE_PROGRAM(p_sysregs);
+DECLARE_PROGRAM(p_sysregs_inline);
 DECLARE_PROGRAM(p_irq);
 DECLARE_PROGRAM(p_fptrap);
 DECLARE_PROGRAM(p_psci);
@@ -119,6 +121,23 @@ int main(void) {
         check("sysregs", "VBAR", c.x[18], c.vbar_el1);
         check("sysregs", "CNTV_CVAL", c.x[21], 0x123);
         check("sysregs", "CNTV_CTL ISTATUS", c.x[23], 5);
+    }
+    static const TestProgram sri = TEST_PROGRAM(p_sysregs_inline);
+    uint64_t si = m.stats_interval, msr0;
+    m.stats_interval = 1; /* count helper calls */
+    msr0 = m.stats.helper[HV_OP_MSR];
+    int sri_failed = run(&sri, &c, 0);
+    check("sysregs inline", "MSR helper calls: only SETUP's VBAR_EL1", m.stats.helper[HV_OP_MSR] - msr0, 1);
+    m.stats_interval = si;
+    if (!sri_failed) {
+        check("sysregs inline", "CONTEXTIDR_EL1 write/read", c.x[2], 0x1234);
+        check("sysregs inline", "UAO set (imm)", c.x[3], 1u << 23);
+        check("sysregs inline", "UAO cleared (reg)", c.x[5], 0);
+        check("sysregs inline", "SCTLR EnIA flipped", c.x[8], c.x[6] ^ (1ull << 31));
+        check("sysregs inline", "SCTLR back", c.x[10], c.x[6]);
+        check("sysregs inline", "SCTLR CP15BEN forced clear", c.x[12], c.x[6]);
+        check("sysregs inline", "CONTEXTIDR_EL1 zeroed", c.x[13], 0);
+        check("sysregs inline", "CONTEXTIDR_EL1 in the CPU", c.contextidr_el1, 0);
     }
     mach_timebase_info_data_t tb;
     mach_timebase_info(&tb);

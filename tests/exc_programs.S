@@ -166,6 +166,31 @@ PROGRAM p_sysregs
     mrs x23, cntv_ctl_el0      // enabled and already expired: ISTATUS set
 END p_sysregs
 
+// Translated inline at EL1 (0.3.69): CONTEXTIDR_EL1, UAO, and SCTLR_EL1 writes that keep the MMU as it is.
+PROGRAM p_sysregs_inline
+    SETUP
+    movz x1, #0x1234
+    msr contextidr_el1, x1
+    mrs x2, contextidr_el1
+    msr uao, #1
+    mrs x3, s3_0_c4_c2_4        // UAO: bit 23
+    mov x4, xzr
+    msr s3_0_c4_c2_4, x4        // UAO, Xt
+    mrs x5, s3_0_c4_c2_4
+    mrs x6, sctlr_el1
+    eor x7, x6, #(1 << 31)      // EnIA flipped: stored inline
+    msr sctlr_el1, x7
+    mrs x8, sctlr_el1
+    msr sctlr_el1, x6           // and back
+    mrs x10, sctlr_el1
+    orr x11, x6, #(1 << 5)      // CP15BEN: forced clear
+    msr sctlr_el1, x11
+    mrs x12, sctlr_el1
+    msr sctlr_el1, x6
+    msr contextidr_el1, xzr
+    mrs x13, contextidr_el1
+END p_sysregs_inline
+
 // The test raises the IRQ line before running; it is masked until DAIFClr.
 PROGRAM p_irq
     SETUP

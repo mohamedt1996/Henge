@@ -99,6 +99,7 @@ typedef struct HvCpu {
        Bits 63..48, as ijc_salt; a new value empties that half of the tables. */
     uint64_t ret_salt[2] __attribute__((aligned(128)));
     uint64_t helper_came_from; /* 0x510: where hv_helper_entry was called from, to tell if it goes back there */
+    uint64_t contextidr_el1;   /* 0x518: in reach of one load: xnu writes it at every process switch (~5K/s), translated inline */
     /* 0x580: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
        so toggling PAN (the kernel does it around every user copy) flushes nothing.
        [slot][EL0, EL1, EL1 with PAN, unused]: a slot's three in one 128-byte cache line. */
@@ -123,7 +124,6 @@ typedef struct HvCpu {
     uint64_t amair_el1;
     uint64_t vbar_el1;
     uint64_t afsr0_el1, afsr1_el1;
-    uint64_t contextidr_el1;
     uint64_t cpacr_el1;
     uint64_t mdscr_el1;
     uint64_t csselr_el1;
@@ -222,6 +222,7 @@ typedef struct HvCpu {
 #define HV_CPU_TCR_EL1     0x4e8
 #define HV_CPU_PAR_EL1     0x4f0
 #define HV_CPU_CNTVOFF     0x4f8
+#define HV_CPU_CONTEXTIDR_EL1 0x518
 
 /* Indirect-branch cache: one table per block-flags value, 64K entries of 16 bytes,
    indexed by ((va ^ va >> 16) >> 2) so code at the same offset in different pages spreads out. */
@@ -245,6 +246,7 @@ _Static_assert(offsetof(HvCpu, tlb) == HV_CPU_TLB, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, ret_salt) == HV_CPU_RET_SALT, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, tcr_el1) == HV_CPU_TCR_EL1, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, cntvoff) == HV_CPU_CNTVOFF, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, contextidr_el1) == HV_CPU_CONTEXTIDR_EL1, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, par_el1) == HV_CPU_PAR_EL1, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, ret_tab) == HV_CPU_RET_TAB, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, gaddend) == HV_CPU_GADDEND, "HvCpu layout");
