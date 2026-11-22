@@ -1,0 +1,76 @@
+name: Gunyah host modules (Magisk)
+# DroidVM's two host modules for android14-6.1 (Droid-VM/gunyah_host_mod, GPL-2.0), built as DroidVM builds them
+# (its ddk-min image, then `make M=... modules`), packed as a Magisk module that loads them at boot:
+#   - gunyah-host-share: /dev/gunyah_share, which shares memory into a running Gunyah VM (GHSM_SHARE_BLOB). The
+#     resource manager takes one memory region at a VM's creation; the rest of the Mac's memory gets in this way,
+#     the guest accepting it itself (android/tools/gunyah_probe.c --share-window, host/gunyah.c).
+#   - gunyah-kvcalloc: guests over 2 GB without an out-of-memory failure at creation (upstream b6ff6203e4bc).
+# With modversions the kernel compares symbol versions, not the release string, so one build serves android14-6.1
+# kernels of any sublevel, the Xiaomi Pad 7's stock one and Henge's udmabuf one alike.
+on:
+  workflow_dispatch:
+  push:
+    branches: [android-port]
+    paths: ['.github/workflows/gunyah-modules.yml', 'android/magisk/henge-gunyah/**']
+permissions:
+  contents: write
+env:
+  SRC_REPO: https://github.com/Droid-VM/gunyah_host_mod
+  SRC_COMMIT: 44e8ae5a088a3a35290a5cacb205640cff187b99
+  DDK: ghcr.io/ylarod/ddk-min:android14-6.1
+jobs:
+  modules:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: DroidVM's module sources
+        run: |
+          git clone -q "$SRC_REPO" src
+          git -C src checkout -q "$SRC_COMMIT"
+          git -C src log -1 --format='%H %s'
+      - name: Build
+        run: |
+          set -e
+          mkdir -p out
+          build() { # srcdir srcfile module
+            docker run --rm -v "$PWD/src/$1:/src:ro" -v "$PWD/out:/out" -e MOD="$3" -e SRCFILE="$2" "$DDK" bash -lc '
+              set -e
+              K=/opt/ddk/kdir/$(ls /opt/ddk/kdir)
+              export PATH=$(ls -d /opt/ddk/clang/clang-*)/bin:$PATH
+              B=/tmp/build; mkdir -p "$B"
+              cp "/src/$SRCFILE" "$B/$MOD.c"
+              cp /src/*.h "$B/" 2>/dev/null || true
+              printf "obj-m += %s.o\n" "$MOD" > "$B/Makefile"
+              make -C "$K" -j"$(nproc)" M="$B" ARCH=arm64 LLVM=1 LLVM_IAS=1 modules
+              llvm-strip -d "$B/$MOD.ko"
+              cp "$B/$MOD.ko" "/out/$MOD.ko"
+              modinfo "/out/$MOD.ko" | grep -E "^(vermagic|name|license)" || true'
+          }
+          build gunyah_host_share/GKI6.1 gunyah_share_mod.c gunyah-host-share-gki-6.1
+          build gunyah_kvcalloc/GKI6.1 gunyah_kvcalloc_mod.c gunyah-kvcalloc-gki-6.1
+          ls -la out
+      - name: The Magisk module
+        run: |
+          set -e
+          M=magisk
+          cp -r android/magisk/henge-gunyah "$M"
+          cp out/*.ko "$M/"
+          sed -i "s/@SRC_COMMIT@/$SRC_COMMIT/" "$M/module.prop"
+          (cd "$M" && zip -qr9 ../henge-gunyah-modules.zip .)
+          unzip -l henge-gunyah-modules.zip
+          sha256sum henge-gunyah-modules.zip | tee SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: henge-gunyah-modules
+          path: henge-gunyah-modules.zip
+      - name: Publish
+        if: github.ref == 'refs/heads/android-port'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete gunyah-modules -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create gunyah-modules -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "Gunyah host modules for Henge (Magisk, android14-6.1, untested)" \
+            --notes "Install henge-gunyah-modules.zip in Magisk and reboot: it loads DroidVM's gunyah-host-share (/dev/gunyah_share) and gunyah-kvcalloc at boot, which Henge's Gunyah test steps 10-13 and its Gunyah engine need. Built from $SRC_REPO at $SRC_COMMIT (GPL-2.0; the source is there). Untested on the Xiaomi Pad 7: keep a way to boot without Magisk modules (Magisk's safe mode) at hand. The log of each boot's load is /data/local/tmp/henge-gunyah.txt." \
+            henge-gunyah-modules.zip SHA256SUMS.txt

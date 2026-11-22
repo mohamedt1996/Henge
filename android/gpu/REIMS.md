@@ -886,6 +886,18 @@ no word of where. A fault in the engine's own code (not in translated code) now 
 (thread T)" and its frames as offsets from the engine's start ("hengevm+0x..."); the CI's symbols artifact keeps the
 unstripped engine (hengevm-android) they resolve against (addr2line -fe hengevm-android 0x...).
 
+0.3.71 (2026-11-22): Gunyah, phase 2b, after DroidVM (github.com/Droid-VM), whose crosvm boots VMs on Gunyah on a
+Redmi Note 14 Pro+ (SM7635) with the tablet's own kernel, 6.1.138-android14-11. The resource manager takes one
+memory region at a VM's creation (what the probe found in 0.3.41); DroidVM's "pseudo-unprotected" VMs get the rest
+in after the start: the host shares a memfd through /dev/gunyah_share (DroidVM's gunyah-host-share module), and the
+guest accepts it itself with the resource manager's MEM_ACCEPT over its rm-rpc channel.
+- gunyah-probe --share-window MB [--window-at ADDR]: the probe's guest accepts such a window, stores a mark in it
+  and reads back the host's; the report says whether both sides see the same pages. The app's Test Gunyah has four
+  new steps (4 MB; 64 MB at the Mac's base 0x70000000; 2 MB at the boot ROM's place, below the base; 512 MB).
+- .github/workflows/gunyah-modules.yml builds DroidVM's gunyah-host-share and gunyah-kvcalloc for android14-6.1
+  and packs them as a Magisk module (release gunyah-modules), loaded at boot.
+The engine (host/gunyah.c) moves to this way once the steps pass.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

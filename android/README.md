@@ -30,7 +30,7 @@ there and builds, and no run has shown it working (or failing).
 | Sound | **Works** | Played through the app since 0.3.16. |
 | Install macOS on the device | **Unconfirmed here** | Downloads the restore image and restores it, as the iOS app does. Takes hours; needs about 45 GB free. |
 | Vulkan driver: Turnip | **Unconfirmed** | Bundled since 0.3.15. It took the app down on 0.3.16; fixes went in after, and the logged runs since used the system's driver. |
-| CPU engine: Gunyah | **Broken: resets the tablet** | Starting the Mac on it panics the Xiaomi Pad 7. No crash record has been recovered yet (`/sys/fs/pstore` was empty). |
+| CPU engine: Gunyah | **Broken: resets the tablet** (0.3.71: Test Gunyah steps 10-13 try DroidVM's way in, with the Magisk module of release `gunyah-modules`) | Starting the Mac on it panics the Xiaomi Pad 7. No crash record has been recovered yet (`/sys/fs/pstore` was empty). |
 | Gunyah with Graphics: reims | **Not done** | The engine switches reims off under Gunyah. |
 | Graphics: Vulkan (the older renderer) | **Partial** | Clears, copies and the pointer; no draws. Superseded by reims. |
 | Video decoding, camera, USB devices | **Not done** | |

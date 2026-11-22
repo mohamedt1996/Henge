@@ -53,6 +53,12 @@
      --rm-call       --rm-rpc, and the guest then parses its tree for the channel and asks the resource manager
                      its own VM id (VM_GET_VMID). Proves the guest can drive the resource manager, which the
                      memory-share request needs. The report shows the channel's capabilities and the reply.
+     --share-window MB  DroidVM's pseudo-unprotected way in (0.3.71): after the VM starts, MB of memory (a memfd)
+                     is shared with it through /dev/gunyah_share (the gunyah-host-share module, which DroidVM's
+                     Kernel Module tab loads), and the guest accepts it itself (MEM_ACCEPT over the --rm-rpc
+                     channel), stores a mark at its start and reads back what this program left at +8. The
+                     resource manager takes one memory region at a VM's creation; this is how the rest gets in.
+     --window-at ADDR  where the guest accepts it (hex; default: 16 MB past the first region)
      --tree-only F   no VM: the tree this run would give, written to F
      --kmsg FILE     the kernel's messages from now on copied to FILE, each forced to storage as it comes:
                      what the kernel said last before a reset
@@ -118,6 +124,9 @@ struct gh_fn_desc { uint32_t type, arg_size; uint64_t arg; };
 #define GH_FN_VCPU 1
 #define GH_FN_IRQFD 2
 struct gh_fn_irqfd_arg { uint32_t fd, label, flags, padding; };
+/* DroidVM's gunyah_host_share module (Droid-VM/gunyah_host_mod, GKI6.1/uapi_gunyah_share.h, GPL-2.0). */
+struct ghsm_share_blob { int32_t vm_fd; uint32_t label, flags, mem_handle; uint64_t guest_phys_addr, memory_size, userspace_addr; };
+#define GHSM_SHARE_BLOB _IOWR(0x47, 0x14, struct ghsm_share_blob)
 #define GH_IRQFD_FLAGS_LEVEL 1u
 #define GH_MEM_RWX 7
 enum { GH_VCPU_EXIT_UNKNOWN, GH_VCPU_EXIT_MMIO, GH_VCPU_EXIT_STATUS };
@@ -163,6 +172,7 @@ enum { RAM_SHM, RAM_RESMEM, RAM_PRIVATE, RAM_PLAIN };
 static int ram_how = RAM_SHM;
 static uint64_t size_max_mb;
 static int shm_alloc, ram_rw, rm_rpc, rm_call;
+static uint64_t window_mb, window_at = ~0ull, window_handle;
 
 /* ---- crumbs: a line forced to storage before each step ---- */
 static const char *crumb_path;
@@ -420,6 +430,7 @@ static size_t build_dtb(uint8_t *out, size_t cap, const Layout *L, int ncpus, in
 static uint64_t rep[32];
 static unsigned seen;
 static uint64_t report_pa, poke_at;
+static uint64_t window_pa_seen; /* the window's address, as the handoff answers it */
 static int poked;
 static volatile sig_atomic_t timed_out;
 static volatile int vm_over;
@@ -443,6 +454,11 @@ static int handle_exit(int cpu) {
             if (i == 15) return 1;
         } else if (!run->mmio.is_write) {
             memset(run->mmio.data, 0, sizeof run->mmio.data);
+            if (a >= report_pa + 0x200 && a < report_pa + 0x218) { /* the window's handoff */
+                uint64_t h[3] = {window_handle, window_pa_seen, window_mb << 20};
+                v = h[(a - report_pa - 0x200) / 8];
+                memcpy(run->mmio.data, &v, 8);
+            }
         } else if (poke_at && a == poke_at) {
             poked = 1;
         } else {
@@ -540,6 +556,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--peek")) peek = 1;
         else if (!strcmp(a, "--rm-rpc")) rm_rpc = 1;
         else if (!strcmp(a, "--rm-call")) rm_rpc = rm_call = 1;
+        else if (!strcmp(a, "--share-window") && v) window_mb = strtoull(v, NULL, 10), rm_rpc = rm_call = 1, i++;
+        else if (!strcmp(a, "--window-at") && v) window_at = strtoull(v, NULL, 16), i++;
         else if (!strcmp(a, "--bells")) bells = 1;
         else if (!v) { fprintf(stderr, "gunyah-probe: %s needs a value\n", a); return 2; }
         else if (!strcmp(a, "--mem")) mem_mb = strtoull(v, NULL, 10), i++;
@@ -628,8 +646,29 @@ int main(int argc, char **argv) {
     uint8_t *image = mmap(NULL, L->image_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
     if (image == MAP_FAILED) { step("map the image", -1); goto fail; }
     memcpy(image, probe_guest, sizeof probe_guest);
-    uint64_t params[7] = {L->report, touch && touch_size ? touch_pa : 0, touch ? touch_size : 0, (uint64_t)ncpus, poke, table,
-                          rm_call ? L->image_pa + L->dtb_off : 0};
+    if (window_mb && L->dtb_off < PROBE_GUEST_SIZE) { printf("RESULT: FAIL --share-window needs the tree past the guest's 8 KB (this layout puts it at %#llx)\n", (unsigned long long)L->dtb_off); return 1; }
+    if (window_at == ~0ull) window_at = L->image_pa + L->image_size + (16ull << 20);
+    window_pa_seen = window_at;
+    if (window_mb && !size_max_mb && window_at >= L->image_pa) { /* the VM's layout must hold the window: stage 2 maps nothing past it */
+        uint64_t need = (window_at + (window_mb << 20) - L->image_pa + (255ull << 20)) >> 20 & ~255ull;
+        size_max_mb = need < 1024 ? 1024 : need;
+    }
+    uint64_t params[8] = {L->report, touch && touch_size ? touch_pa : 0, touch ? touch_size : 0, (uint64_t)ncpus, poke, table,
+                          rm_call ? L->image_pa + L->dtb_off : 0, window_mb ? L->report + 0x200 : 0};
+    /* The window: a memfd of its own, every page made and pinned before the VM exists (the share pins them too),
+       and a pattern at +8 for the guest to read back. */
+    uint8_t *window = NULL;
+    if (window_mb) {
+        int wfd = memfd_create("gunyah-window", MFD_CLOEXEC);
+        if (wfd < 0 || ftruncate(wfd, (off_t)(window_mb << 20)) < 0) { step("make the window (memfd)", -1); goto fail; }
+        window = mmap(NULL, window_mb << 20, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, wfd, 0);
+        if (window == MAP_FAILED) { step("map the window", -1); goto fail; }
+        madvise(window, window_mb << 20, MADV_HUGEPAGE);
+        memset(window, 0, window_mb << 20);
+        uint64_t pat = 0x50524f4245ull; /* "PROBE" */
+        memcpy(window + 8, &pat, 8);
+        printf("window                 %llu MB at %#llx, accepted by the guest after the start\n", (unsigned long long)window_mb, (unsigned long long)window_at);
+    }
     memcpy(image + PROBE_GUEST_PARAMS, params, sizeof params);
 
     struct rlimit nolimit = {RLIM_INFINITY, RLIM_INFINITY};
@@ -702,6 +741,23 @@ int main(int argc, char **argv) {
     if (!strcmp(until, "vcpu")) goto early;
     crumb("try: start VM");
     if (step("start VM", ioctl(vm, GH_VM_START, 0))) goto fail;
+    if (window_mb) {
+        /* After the start, as DroidVM's crosvm does it: a memparcel the guest accepts exists only once the VM does. */
+        struct rlimit nolimit2 = {RLIM_INFINITY, RLIM_INFINITY};
+        setrlimit(RLIMIT_MEMLOCK, &nolimit2);
+        mlock(window, window_mb << 20);
+        crumb("try: share the window through /dev/gunyah_share (%llu MB at %#llx)", (unsigned long long)window_mb, (unsigned long long)window_at);
+        int gs = open("/dev/gunyah_share", O_RDWR | O_CLOEXEC);
+        if (gs < 0) {
+            printf("open /dev/gunyah_share failed: %s (errno %d): load DroidVM's gunyah-host-share module first\n", strerror(errno), errno);
+            goto fail;
+        }
+        struct ghsm_share_blob b = {.vm_fd = vm, .label = 0x4000, .flags = 1 | 2 | 4, /* read, write, execute */
+                                    .guest_phys_addr = window_at, .memory_size = window_mb << 20, .userspace_addr = (uintptr_t)window};
+        if (step("share the window (gunyah_share)", ioctl(gs, GHSM_SHARE_BLOB, &b))) goto fail;
+        window_handle = b.mem_handle;
+        printf("  memparcel handle     %#x\n", b.mem_handle);
+    }
     if (!strcmp(until, "start")) goto early;
     long sz = ioctl(vcpu_fd[0], GH_VCPU_MMAP_SIZE, 0);
     if (sz < 0) sz = ioctl(dev, GH_VCPU_MMAP_SIZE, 0);
@@ -772,6 +828,18 @@ int main(int argc, char **argv) {
                         rep[22] == 0 ? " (the guest can drive the resource manager)" : "");
         }
     }
+    if (window_mb) {
+        uint64_t mark = 0;
+        memcpy(&mark, window, 8);
+        printf("window accept          %s\n", !HAVE(25) ? "not asked (the guest found no channel?)"
+               : rep[25] != 0 ? "MSGQ_SEND failed" : !HAVE(26) || rep[26] == ~0ull ? "no reply from the resource manager"
+               : rep[26] != 0 ? "REFUSED by the resource manager" : "ACCEPTED: the window is the guest's memory");
+        if (HAVE(26) && rep[26] && rep[26] != ~0ull) printf("  error code           %#llx\n", (unsigned long long)rep[26]);
+        if (HAVE(28)) {
+            printf("  guest read +8        %#llx (%s)\n", (unsigned long long)rep[27], rep[27] == 0x50524f4245ull ? "this program's pattern: the host's pages" : "NOT the pattern");
+            printf("  host reads the mark  %#llx (%s)\n", (unsigned long long)mark, mark == 0x48454e4745ull ? "the guest's: both see the same memory" : "NOT the guest's mark");
+        }
+    }
     if (touch && touch_size) {
         if (HAVE(10)) printf("pages written          %llu of %llu\n", (unsigned long long)rep[10], (unsigned long long)pages);
         if (HAVE(11)) printf("pages read back wrong  %llu\n", (unsigned long long)rep[11]);
@@ -788,6 +856,9 @@ int main(int argc, char **argv) {
     else if (rm_call && !HAVE(17)) why = "the guest did not find the resource-manager channel in its tree";
     else if (rm_call && !(HAVE(21) && rep[21] == 0)) why = "the resource manager did not answer the guest";
     else if (rm_call && rep[22] != 0) why = "the resource manager refused the guest's request";
+    else if (window_mb && !(HAVE(26) && rep[26] == 0)) why = "the guest could not accept the shared window";
+    else if (window_mb && !(HAVE(28) && rep[27] == 0x50524f4245ull)) why = "the guest did not see the host's pages in the window";
+    else if (window_mb && memcmp(window, "EGNEH", 5)) why = "the host did not see the guest's mark in the window";
     else if (poke && !poked) why = "a store at a device's address did not come out of the guest";
     else if (ncpus > 1 && (!HAVE(13) || rep[13] != (uint64_t)(ncpus - 1))) {
         snprintf(whybuf, sizeof whybuf, "%llu of %d other CPUs came up", HAVE(13) ? (unsigned long long)rep[13] : 0ull, ncpus - 1);

@@ -42,8 +42,15 @@ final class GunyahTest {
             {"Run a tiny program in it", "%L", "6", "use"},
             {"The guest asks the resource manager its VM id", "--lend --rm-call", "8", "info"},
             {"The guest asks again, 4 CPUs, as the Mac would be", "--lend --base 70000000 --gic 10000000 --image-mb 16 --mmu16k --cpus 4 --rm-call", "15", "info"},
+            // Phase 2b (0.3.71), DroidVM's pseudo-unprotected way: memory shared into the running VM through
+            // /dev/gunyah_share (DroidVM's gunyah-host-share module, loaded from DroidVM's Kernel Module tab), the guest
+            // accepting it itself. The resource manager takes one region at the start; this is how the Mac's RAM gets in.
+            {"Share 4 MB into the running VM (needs DroidVM's gunyah-host-share module)", "--lend --share-window 4", "10", "info"},
+            {"Share 64 MB at the Mac's layout (base 0x70000000)", "--lend --base 70000000 --gic 10000000 --image-mb 16 --share-window 64", "15", "info"},
+            {"Share 2 MB at the boot ROM's place (0x100000, below the base)", "--lend --base 70000000 --gic 10000000 --image-mb 16 --share-window 2 --window-at 100000", "15", "info"},
+            {"Share 512 MB (may reset the tablet)", "--lend --base 70000000 --gic 10000000 --image-mb 16 --share-window 512", "40", "info"},
     };
-    private static final int VERSION = 9; // of STEPS: progress saved by another list starts over
+    private static final int VERSION = 10; // of STEPS: progress saved by another list starts over
 
     static volatile boolean running;
 

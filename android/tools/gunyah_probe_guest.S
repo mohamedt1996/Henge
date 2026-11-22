@@ -11,6 +11,9 @@
             has it, whatever ID_AA64MMFR0 says of them
      +0x30  the VM's device tree (0: none): the guest parses it for the resource-manager message queue and asks
             the resource manager its own VM id (VM_GET_VMID), to prove the guest can drive the resource manager
+     +0x38  a handoff the probe answers reads of (0: none): a memory window shared with the running VM through
+            /dev/gunyah_share (+0x00 its memparcel handle, +0x08 its address, +0x10 its size). The guest accepts it
+            (MEM_ACCEPT, as DroidVM's pseudo-unprotected VMs do), stores a mark at its start and reads +8 back.
    and reads `flags` (image + 0x440): a byte a started CPU sets, by its number.
 
    Report slots (8 bytes each): 0x00 MIDR, 0x08 MMFR0, 0x10 ISAR1, 0x18 CurrentEL, 0x20 the PAC hypercall's
@@ -19,7 +22,9 @@
    0x68 CPUs that came up, 0x70 the address stored to once that store has returned, 0x80 what was read back
    through 16 KB pages (0x16c), 0x88 resource-manager message queue found in the tree (1), 0x90/0x98 its send and
    receive capabilities, 0xa0 MSGQ_SEND result, 0xa8 MSGQ_RECV result, 0xb0 the reply's error code, 0xb8 the VM
-   id the resource manager returned, 0x78 done (0xd0e) or failed (0xbad). */
+   id the resource manager returned, 0xc0 the window's handle, 0xc8 MEM_ACCEPT's MSGQ_SEND result, 0xd0 its reply's
+   error code (-1: no reply), 0xd8 what the guest read at the window's +8, 0xe0 1 once it stored its mark,
+   0x78 done (0xd0e) or failed (0xbad). */
     .text
     .global _start
 _start:
@@ -293,6 +298,9 @@ rmgot:
     str  x0, [x9, #0xb0]
     ldr  w0, [x5, #12]                  /* the VM id it returned */
     str  x0, [x9, #0xb8]
+    ldr  x0, [x10, #0x38]               /* a window to accept? */
+    cbz  x0, rmret
+    bl   accept
 rmret:
     mov  x30, x19
     ret
@@ -330,3 +338,80 @@ vectors:
     b    9b
     .balign 128
     .endr
+
+/* ---- the window: accept it (the resource manager's MEM_ACCEPT, as DroidVM's guest does it) ----
+   The request, in 32-bit stores (memory is Device-nGnRnE with the MMU off: every access naturally aligned):
+   the header (api 0x21, type 1, seq 2, MEM_ACCEPT 0x51000011), the handle, mem type 0 (normal), transaction 2
+   (share), flags 0x90 (map IPA contiguous, done), a validate label of 0, no ACL, one {address, size}, no attributes.
+   With x9 the report page, x10 params, x26/x27 the message queue's send and receive capabilities. */
+    .org 0x1000
+accept:
+    ldr  x11, [x10, #0x38]
+    ldr  x13, [x11, #0x00]              /* the memparcel's handle */
+    ldr  x14, [x11, #0x08]              /* its address */
+    ldr  x15, [x11, #0x10]              /* its size */
+    str  x13, [x9, #0xc0]
+    adr  x5, rmbuf
+    movz w0, #0x0121
+    movk w0, #0x0002, lsl #16
+    str  w0, [x5, #0]
+    movz w0, #0x0011
+    movk w0, #0x5100, lsl #16
+    str  w0, [x5, #4]
+    str  w13, [x5, #8]
+    movz w0, #0x0200
+    movk w0, #0x0090, lsl #16
+    str  w0, [x5, #12]
+    str  wzr, [x5, #16]
+    str  wzr, [x5, #20]
+    mov  w0, #1
+    str  w0, [x5, #24]
+    str  w14, [x5, #28]
+    lsr  x0, x14, #32
+    str  w0, [x5, #32]
+    str  w15, [x5, #36]
+    lsr  x0, x15, #32
+    str  w0, [x5, #40]
+    str  wzr, [x5, #44]
+    movz x0, #0x801b                    /* MSGQ_SEND */
+    movk x0, #0xc600, lsl #16
+    mov  x1, x26
+    mov  x2, #48
+    mov  x3, x5
+    mov  x4, #1
+    hvc  #0
+    str  x0, [x9, #0xc8]
+    cbnz x0, 9f
+    movz x12, #0x0040, lsl #16          /* wait a bounded while for the reply */
+1:  adr  x5, rmbuf
+    movz x0, #0x801c                    /* MSGQ_RECV */
+    movk x0, #0xc600, lsl #16
+    mov  x1, x27
+    mov  x2, x5
+    mov  x3, #240
+    hvc  #0
+    cbnz x0, 2f
+    ldrb w0, [x5, #1]
+    and  w0, w0, #3
+    cmp  w0, #2                         /* a reply */
+    b.ne 2f
+    ldrh w0, [x5, #2]
+    cmp  w0, #2                         /* to this request */
+    b.ne 2f
+    ldr  w0, [x5, #8]                   /* its error code */
+    str  x0, [x9, #0xd0]
+    cbnz w0, 9f
+    movz x0, #0x4745                    /* accepted: the mark "HENGE" at its start, and the probe's +8 read back */
+    movk x0, #0x454e, lsl #16
+    movk x0, #0x0048, lsl #32
+    str  x0, [x14]
+    ldr  x0, [x14, #8]
+    str  x0, [x9, #0xd8]
+    mov  x0, #1
+    str  x0, [x9, #0xe0]
+    b    9f
+2:  subs x12, x12, #1
+    b.ne 1b
+    movn x0, #0
+    str  x0, [x9, #0xd0]
+9:  ret
