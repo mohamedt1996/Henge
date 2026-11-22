@@ -945,6 +945,16 @@ same keys, APIAKey 0), MPIDR 0x80000000 as Henge's CPU 0, and 8 MB of 4 KB pages
 test steps, made beside a 3 GB reserve, had Android kill the app; they are replaced by the reserve's own count
 (--reserve-status), which takes no memory. The Gunyah memory card says what is reserved in words, with Copy.
 
+0.3.77 (2026-11-22): 0.3.76's first hand-over on the tablet: the JIT stopped at iBoot's jump into the kernel, the
+kernel was found and patched (17 reads, 5 writes of Apple's registers, 5 MIDR reads, 19 PAC hypercalls, 4
+timebase-frequency properties), the VM started, the Mac's 3 GB were shared as 12 pieces of 2 MB pages, and the tablet
+reset once the vCPUs ran, before any of the shim's lines reached storage. Untried until then: 99 doorbells in a started
+VM, and 3 GB in 12 pieces accepted. The Gunyah test now tries those without the Mac (--bells with 4 CPUs; the
+reserved memory as the window, in 256 MB pieces, every piece accepted: 1 GB, 3 GB, then everything). The engine
+forces the shim's progress to storage (per piece), counts 2 MB pages by page frame (pinning first; smaps had said 844
+of a reserve that was all 2 MB pages), and HV_GUNYAH_BELLS=0 leaves the doorbells out. The app no longer turns the
+JIT's in-memory RAM off after a Gunyah run (reims could not take the root engine's memory: "Protocol error").
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

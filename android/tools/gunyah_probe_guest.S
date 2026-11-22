@@ -383,13 +383,22 @@ vectors:
    (share), flags 0x90 (map IPA contiguous, done), a validate label of 0, no ACL, one {address, size}, no attributes.
    With x9 the report page, x10 params, x26/x27 the message queue's send and receive capabilities. */
     .org 0x1000
-accept:
-    ldr  x11, [x10, #0x38]
-    ldr  x13, [x11, #0x00]              /* the memparcel's handle */
-    ldr  x14, [x11, #0x08]              /* its address */
-    ldr  x15, [x11, #0x10]              /* its size */
+accept:                                 /* 0.3.77: every piece of the handoff, {count, (handle, address, size)...} */
+    mov  x25, x30
+    ldr  x20, [x10, #0x38]
+    ldr  x21, [x20]                     /* pieces */
+    add  x23, x20, #8
+    mov  x22, #0                        /* accepted so far */
+    str  xzr, [x9, #0xe0]
+acc1:
+    cmp  x22, x21
+    b.hs acc9
+    ldr  x13, [x23, #0x00]              /* the memparcel's handle */
+    ldr  x14, [x23, #0x08]              /* its address */
+    ldr  x15, [x23, #0x10]              /* its size */
+    cbnz x22, 3f
     str  x13, [x9, #0xc0]
-    adr  x5, rmbuf
+3:  adr  x5, rmbuf
     movz w0, #0x0121
     movk w0, #0x0002, lsl #16
     str  w0, [x5, #0]
@@ -419,8 +428,8 @@ accept:
     mov  x4, #1
     hvc  #0
     str  x0, [x9, #0xc8]
-    cbnz x0, 9f
-    movz x12, #0x0040, lsl #16          /* wait a bounded while for the reply */
+    cbnz x0, acc9
+    movz x12, #0x0100, lsl #16          /* wait a bounded while for the reply */
 1:  adr  x5, rmbuf
     movz x0, #0x801c                    /* MSGQ_RECV */
     movk x0, #0xc600, lsl #16
@@ -433,26 +442,27 @@ accept:
     and  w0, w0, #3
     cmp  w0, #2                         /* a reply */
     b.ne 2f
-    ldrh w0, [x5, #2]
-    cmp  w0, #2                         /* to this request */
-    b.ne 2f
     ldr  w0, [x5, #8]                   /* its error code */
     str  x0, [x9, #0xd0]
-    cbnz w0, 9f
-    movz x0, #0x4745                    /* accepted: the mark "HENGE" at its start, and the probe's +8 read back */
+    cbnz w0, acc9
+    movz x0, #0x4745                    /* accepted: the mark "HENGE" at its start */
     movk x0, #0x454e, lsl #16
     movk x0, #0x0048, lsl #32
     str  x0, [x14]
-    ldr  x0, [x14, #8]
+    cbnz x22, 4f
+    ldr  x0, [x14, #8]                  /* the first piece's +8, the probe's pattern */
     str  x0, [x9, #0xd8]
-    mov  x0, #1
-    str  x0, [x9, #0xe0]
-    b    9f
+4:  add  x22, x22, #1
+    str  x22, [x9, #0xe0]               /* pieces accepted */
+    add  x23, x23, #24
+    b    acc1
 2:  subs x12, x12, #1
     b.ne 1b
     movn x0, #0
     str  x0, [x9, #0xd0]
-9:  ret
+acc9:
+    mov  x30, x25
+    ret
 
 /* ---- pointer authentication (0.3.75) ----
    XNU's kernel and every arm64e program use PAC instructions; Henge's JIT runs them as if no key signs. On Gunyah

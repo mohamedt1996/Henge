@@ -382,7 +382,11 @@ public class VmService extends Service {
             // The Mac's RAM in memory, not in a file on the tablet's storage (devices/vmapple.c): unless Settings
             // asks for storage, or the app could not open it on this build (the GPU's note, android/gpu/reims/host.c).
             File memfdNote = new File(reimsHomeDir(this), "ram-memfd-failed");
+            // 0.3.77: a run on Gunyah (the engine root) leaves that note too, for another reason (the app may not take a
+            // root process's memory); it says nothing of the JIT's runs, so it is dropped.
+            if (memfdNote.exists() && "gunyah".equals(prefs.getString("lastEngine", ""))) memfdNote.delete();
             if (memfdNote.exists()) { prefs.edit().putString("ramFileBuild", build).apply(); memfdNote.delete(); }
+            prefs.edit().putString("lastEngine", gunyah() ? "gunyah" : "jit").apply();
             boolean ramInMemory = !install && !"storage".equals(prefs.getString("ram", "memory"))
                     && !build.equals(prefs.getString("ramFileBuild", ""));
             if (ramInMemory) pb.environment().put("HV_RAM_MEMFD", "1");

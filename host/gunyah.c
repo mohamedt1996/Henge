@@ -241,7 +241,7 @@ static size_t build_dtb(uint8_t *out, size_t cap, int ncpus, uint64_t size_max) 
     prop_u32(&f, "queue-depth", 8);
     end(&f);
     for (int id = 0; id < NIRQ; id++) {
-        if (!irq_wanted(id)) continue;
+        if (!irq_wanted(id) || (getenv("HV_GUNYAH_BELLS") && *getenv("HV_GUNYAH_BELLS") == '0')) continue;
         char n[32], path[48];
         snprintf(n, sizeof n, "bell-%x", id);
         snprintf(path, sizeof path, "/hypervisor/bell-%x", id);
@@ -565,16 +565,28 @@ static void put_file(const char *path, const char *v) {
     close(fd);
 }
 
+static void classify(uint8_t *kind, uint64_t nchunks);
 static int ram_ready(void) {
     uint64_t mb = B->ram_size >> 20, two = 2ull << 20;
     if ((uintptr_t)B->ram & (two - 1)) {
         fprintf(stderr, "gunyah: the Mac's RAM is not mapped on a 2 MB boundary: no 2 MB pages\n");
         return -1;
     }
-    uint64_t h = huge_mb(B->ram, B->ram_size);
+    /* Present and pinned first: pagemap shows frames only for pages this process has mapped. 0.3.76 counted the
+       mapping's 2 MB entries (smaps) instead: 844 MB of a reserve that was all 2 MB pages. */
+    struct rlimit nolimit = {RLIM_INFINITY, RLIM_INFINITY};
+    setrlimit(RLIMIT_MEMLOCK, &nolimit);
+    mlock(B->ram, B->ram_size);
+    uint64_t nch = B->ram_size >> 21, h = 0;
+    uint8_t *kind = calloc(nch ? nch : 1, 1);
+    if (kind) {
+        classify(kind, nch);
+        for (uint64_t c = 0; c < nch; c++) h += kind[c] ? 2 : 0;
+        free(kind);
+    }
     fprintf(stderr, "gunyah: the Mac's RAM: %llu of %llu MB in 2 MB pages%s\n", (unsigned long long)h, (unsigned long long)mb,
             B->ram_reserved ? " (reserved at boot)" : "");
-    if (h < mb) {
+    if (h < mb && !B->ram_reserved) {
         /* What is small, collapsed into 2 MB pages now (its contents copied), memory compacted before each pass. */
         put_file("/sys/kernel/mm/transparent_hugepage/shmem_enabled", "advise");
         put_file("/sys/kernel/mm/transparent_hugepage/defrag", "madvise");
@@ -583,7 +595,13 @@ static int ram_ready(void) {
             put_file("/proc/sys/vm/drop_caches", "3");
             put_file("/proc/sys/vm/compact_memory", "1");
             for (uint64_t o = 0; o < B->ram_size; o += two) madvise(B->ram + o, two, 25 /* MADV_COLLAPSE */);
-            h = huge_mb(B->ram, B->ram_size);
+            kind = calloc(nch ? nch : 1, 1);
+            h = 0;
+            if (kind) {
+                classify(kind, nch);
+                for (uint64_t c = 0; c < nch; c++) h += kind[c] ? 2 : 0;
+                free(kind);
+            }
             fprintf(stderr, "gunyah:   after collapsing: %llu MB in 2 MB pages\n", (unsigned long long)h);
         }
     }
@@ -645,6 +663,18 @@ static void fill_state(const HvCpu *c) {
             (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[3], (unsigned long long)s[31]);
 }
 
+/* A line forced to storage: the tablet reset in 0.3.76 right after the vCPUs ran, and lines left in the page cache
+   were lost with it. */
+static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void say(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fflush(stderr);
+    fsync(2);
+}
+
 static const char *phase_name(uint64_t p) {
     return p == 1 ? "started" : p == 2 ? "found its channel to the resource manager" : p == 3 ? "accepted the Mac's RAM"
          : p == 4 ? "loading CPU 0's state" : p == 0xdead ? "STOPPED" : "?";
@@ -656,22 +686,25 @@ static void shim_report(uint64_t off, uint64_t v) {
     shim_rep[i] = v;
     if (off == 0xff8) { /* +0x4ff8: the jump */
         mac_runs = 1;
-        fprintf(stderr, "gunyah: the Mac runs on Gunyah now (CPU 0 at pc %#llx)\n", (unsigned long long)handoff[64 + 32]);
+        say("gunyah: the Mac runs on Gunyah now (CPU 0 at pc %#llx)\n", (unsigned long long)handoff[64 + 32]);
         return;
     }
+    if (i == 8 && v < 640) say("gunyah: shim: accepting piece %llu (%#llx, %llu MB)\n", (unsigned long long)v,
+                               (unsigned long long)handoff[129 + 3 * v], (unsigned long long)(handoff[130 + 3 * v] >> 20));
+    if (i == 10 && v) say("gunyah: shim: the resource manager's answer: error %#llx\n", (unsigned long long)v);
     if (i == 0) {
-        fprintf(stderr, "gunyah: shim: %s\n", phase_name(v));
+        say("gunyah: shim: %s\n", phase_name(v));
         if (v == 2)
-            fprintf(stderr, "gunyah: shim: the vCPU's MIDR %#llx, MPIDR %#llx (Henge's CPU 0: %#llx), ISAR1 %#llx, SCTLR %#llx; "
+            say("gunyah: shim: the vCPU's MIDR %#llx, MPIDR %#llx (Henge's CPU 0: %#llx), ISAR1 %#llx, SCTLR %#llx; "
                             "PAC key read %s%s%llx\n", (unsigned long long)shim_rep[1], (unsigned long long)shim_rep[2],
                     (unsigned long long)hv_vm_cpu(0)->mpidr, (unsigned long long)shim_rep[3], (unsigned long long)shim_rep[4],
                     shim_rep[15] ? "ran: APIAKeyLo " : "TRAPPED", shim_rep[15] ? "0x" : " ", shim_rep[15] ? (unsigned long long)shim_rep[14] : 0ull);
         if (v == 0xdead) {
             if (shim_rep[11] || shim_rep[12])
-                fprintf(stderr, "gunyah: shim: an exception: ESR %#llx at %#llx (FAR %#llx)\n", (unsigned long long)shim_rep[11],
+                say("gunyah: shim: an exception: ESR %#llx at %#llx (FAR %#llx)\n", (unsigned long long)shim_rep[11],
                         (unsigned long long)shim_rep[12], (unsigned long long)shim_rep[13]);
-            else if (!shim_rep[5]) fprintf(stderr, "gunyah: shim: no channel to the resource manager in the VM's tree\n");
-            else fprintf(stderr, "gunyah: shim: piece %llu not accepted: MSGQ_SEND %#llx, the resource manager's error %#llx\n",
+            else if (!shim_rep[5]) say("gunyah: shim: no channel to the resource manager in the VM's tree\n");
+            else say("gunyah: shim: piece %llu not accepted: MSGQ_SEND %#llx, the resource manager's error %#llx\n",
                          (unsigned long long)shim_rep[8], (unsigned long long)shim_rep[9], (unsigned long long)shim_rep[10]);
             hv_gunyah_stop();
         }
@@ -705,7 +738,8 @@ static void *vcpu_thread(void *arg) {
         if (r->exit_reason == GH_VCPU_EXIT_MMIO) {
             uint64_t pa = r->mmio.phys_addr;
             unsigned len = r->mmio.len > 8 ? 8 : r->mmio.len;
-            mmio_exits[id]++;
+            if (mmio_exits[id]++ == 0) say("gunyah: vCPU %d runs (its first exit: %s %#llx)\n", id, r->mmio.is_write ? "a store to" : "a load from",
+                                           (unsigned long long)pa);
             if (pa >= HANDOFF_PA && pa < HANDOFF_PA + 0x5000) {
                 uint64_t off = pa - HANDOFF_PA, v = 0;
                 if (r->mmio.is_write) {
@@ -872,7 +906,8 @@ int hv_gunyah_run(void) {
 
     int bells = 0;
     mark("add the interrupt doorbells");
-    for (int id = 0; id < NIRQ; id++) {
+    int no_bells = getenv("HV_GUNYAH_BELLS") && *getenv("HV_GUNYAH_BELLS") == '0'; /* bring-up: none (no interrupts reach the Mac) */
+    for (int id = 0; id < NIRQ && !no_bells; id++) {
         if (!irq_wanted(id)) continue;
         int efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
         if (efd < 0) { fail("eventfd"); return HV_GUNYAH_NOT_STARTED; }

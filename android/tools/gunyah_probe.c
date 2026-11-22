@@ -178,6 +178,11 @@ static int ram_how = RAM_SHM;
 static uint64_t size_max_mb;
 static int shm_alloc, ram_rw, rm_rpc, rm_call;
 static uint64_t window_mb, window_at = ~0ull, window_handle;
+/* 0.3.77: --reserve-window: the window is henge-reserve's memory (the Mac's RAM, in 2 MB pages), shared in pieces of
+   --piece-mb (256 by default there, as the engine shares it), the guest accepting every piece. */
+#define MAX_WPIECES 64
+static int reserve_window;
+static uint64_t piece_mb, nwp, piece_handle[MAX_WPIECES];
 static int window_only, window_4k; /* --window-4k: the window in 4 KB pages (0.3.75: are small ones safe in small amounts?) */ /* --window-only: make the window and say how much of it is in 2 MB pages, nothing more */
 static int window_small_ok; /* --share-small-pages: share a window that is not in 2 MB pages */
 
@@ -525,9 +530,14 @@ static int handle_exit(int cpu) {
             if (i == 15) return 1;
         } else if (!run->mmio.is_write) {
             memset(run->mmio.data, 0, sizeof run->mmio.data);
-            if (a >= report_pa + 0x200 && a < report_pa + 0x218) { /* the window's handoff */
-                uint64_t h[3] = {window_handle, window_pa_seen, window_mb << 20};
-                v = h[(a - report_pa - 0x200) / 8];
+            if (a >= report_pa + 0x200 && a < report_pa + 0x200 + 8 * (1 + 3 * MAX_WPIECES)) {
+                /* the window's handoff: {pieces, (handle, address, size)...} */
+                uint64_t w = (a - report_pa - 0x200) / 8, pm = (piece_mb ? piece_mb : window_mb) << 20;
+                if (w == 0) v = nwp;
+                else if ((w - 1) / 3 < nwp) {
+                    uint64_t k = (w - 1) / 3, at = k * pm, left = (window_mb << 20) - at;
+                    v = (w - 1) % 3 == 0 ? piece_handle[k] : (w - 1) % 3 == 1 ? window_pa_seen + at : left < pm ? left : pm;
+                }
                 memcpy(run->mmio.data, &v, 8);
             }
         } else if (poke_at && a == poke_at) {
@@ -641,6 +651,37 @@ static int reserve_status(void) {
     return !ok;
 }
 
+/* henge-reserve's memfd, mapped on 2 MB; *mb: what to map (0 or more than it holds: all of it). NULL: none. */
+static uint8_t *reserve_map(uint64_t *mb) {
+    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un a = {.sun_family = AF_UNIX};
+    static const char name[] = "henge-gunyah-ram";
+    memcpy(a.sun_path + 1, name, sizeof name - 1);
+    socklen_t len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + sizeof name);
+    if (s < 0 || connect(s, (struct sockaddr *)&a, len) < 0) { if (s >= 0) close(s); return NULL; }
+    (void)!write(s, "get\n", 4);
+    char reply[128] = {0}, ctl[CMSG_SPACE(sizeof(int))];
+    struct iovec io = {.iov_base = reply, .iov_len = sizeof reply - 1};
+    struct msghdr m = {.msg_iov = &io, .msg_iovlen = 1, .msg_control = ctl, .msg_controllen = sizeof ctl};
+    ssize_t n = recvmsg(s, &m, MSG_CMSG_CLOEXEC);
+    close(s);
+    int fd = -1;
+    for (struct cmsghdr *c = n > 0 ? CMSG_FIRSTHDR(&m) : NULL; c; c = CMSG_NXTHDR(&m, c))
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) memcpy(&fd, CMSG_DATA(c), sizeof fd);
+    unsigned long long size = 0, huge = 0;
+    if (fd < 0 || sscanf(reply, "ok %llu %llu", &size, &huge) != 2) return NULL;
+    if (!*mb || (*mb << 20) > size) *mb = size >> 20;
+    uint64_t two = 2ull << 20, bytes = *mb << 20;
+    uint8_t *res = mmap(NULL, bytes + two, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (res == MAP_FAILED) return NULL;
+    uint8_t *at = (uint8_t *)(((uintptr_t)res + two - 1) & ~(uintptr_t)(two - 1));
+    uint8_t *w = mmap(at, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    if (w == MAP_FAILED) return NULL;
+    printf("reserved memory        %llu MB of henge-reserve's %llu (%llu MB of that in 2 MB pages)\n", (unsigned long long)*mb,
+           size >> 20, huge);
+    return w;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     for (int i = 1; i < argc; i++)
@@ -669,6 +710,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--window-at") && v) window_at = strtoull(v, NULL, 16), i++;
         else if (!strcmp(a, "--window-only")) window_only = 1;
         else if (!strcmp(a, "--window-4k")) window_4k = 1;
+        else if (!strcmp(a, "--reserve-window")) reserve_window = 1;
+        else if (!strcmp(a, "--piece-mb") && v) piece_mb = strtoull(v, NULL, 10), i++;
         else if (!strcmp(a, "--share-small-pages")) window_small_ok = 1;
         else if (!strcmp(a, "--bells")) bells = 1;
         else if (!v) { fprintf(stderr, "gunyah-probe: %s needs a value\n", a); return 2; }
@@ -773,6 +816,12 @@ int main(int argc, char **argv) {
     if (window_mb) {
         struct rlimit nolimit0 = {RLIM_INFINITY, RLIM_INFINITY};
         setrlimit(RLIMIT_MEMLOCK, &nolimit0);
+        if (reserve_window) {
+            if (!piece_mb) piece_mb = 256;
+            window = reserve_map(&window_mb);
+            if (!window) { printf("RESULT: FAIL nothing reserved to use (Settings > Gunyah memory: Reserve at boot)\n"); return 1; }
+            window_small_ok = 1; /* its pages are henge-reserve's, 2 MB folios however this process maps them */
+        } else
         window = window_make(window_mb << 20);
         if (!window) { step("make the window", -1); goto fail; }
         uint64_t pat = 0x50524f4245ull; /* "PROBE" */
@@ -878,11 +927,21 @@ int main(int argc, char **argv) {
             printf("open /dev/gunyah_share failed: %s (errno %d): load DroidVM's gunyah-host-share module first\n", strerror(errno), errno);
             goto fail;
         }
-        struct ghsm_share_blob b = {.vm_fd = vm, .label = 0x4000, .flags = 1 | 2 | 4, /* read, write, execute */
-                                    .guest_phys_addr = window_at, .memory_size = window_mb << 20, .userspace_addr = (uintptr_t)window};
-        if (step("share the window (gunyah_share)", ioctl(gs, GHSM_SHARE_BLOB, &b))) goto fail;
-        window_handle = b.mem_handle;
-        printf("  memparcel handle     %#x\n", b.mem_handle);
+        uint64_t pm = (piece_mb ? piece_mb : window_mb) << 20, total = window_mb << 20;
+        for (uint64_t at = 0; at < total && nwp < MAX_WPIECES; at += pm) {
+            uint64_t n = total - at < pm ? total - at : pm;
+            struct ghsm_share_blob b = {.vm_fd = vm, .label = 0x4000u + (uint32_t)nwp, .flags = 1 | 2 | 4, /* read, write, execute */
+                                        .guest_phys_addr = window_at + at, .memory_size = n, .userspace_addr = (uintptr_t)window + at};
+            crumb("try: share piece %llu (%llu MB at %#llx)", (unsigned long long)nwp, (unsigned long long)(n >> 20),
+                  (unsigned long long)(window_at + at));
+            if (ioctl(gs, GHSM_SHARE_BLOB, &b) < 0) { step("share the window (gunyah_share)", -1); goto fail; }
+            crumb("ok: piece %llu, handle %#x", (unsigned long long)nwp, b.mem_handle);
+            piece_handle[nwp++] = b.mem_handle;
+        }
+        window_handle = piece_handle[0];
+        printf("share the window (gunyah_share) ok\n");
+        printf("  memparcel handle%s   %#x%s\n", nwp > 1 ? "s" : " ", piece_handle[0], nwp > 1 ? "..." : "");
+        if (nwp > 1) printf("  pieces               %llu of %llu MB\n", (unsigned long long)nwp, (unsigned long long)(pm >> 20));
     }
     if (!strcmp(until, "start")) goto early;
     long sz = ioctl(vcpu_fd[0], GH_VCPU_MMAP_SIZE, 0);
@@ -984,7 +1043,8 @@ int main(int argc, char **argv) {
                : rep[25] != 0 ? "MSGQ_SEND failed" : !HAVE(26) || rep[26] == ~0ull ? "no reply from the resource manager"
                : rep[26] != 0 ? "REFUSED by the resource manager" : "ACCEPTED: the window is the guest's memory");
         if (HAVE(26) && rep[26] && rep[26] != ~0ull) printf("  error code           %#llx\n", (unsigned long long)rep[26]);
-        if (HAVE(28)) {
+        if (nwp > 1) printf("  pieces accepted      %llu of %llu\n", HAVE(28) ? (unsigned long long)rep[28] : 0ull, (unsigned long long)nwp);
+        if (HAVE(28) && rep[28]) {
             printf("  guest read +8        %#llx (%s)\n", (unsigned long long)rep[27], rep[27] == 0x50524f4245ull ? "this program's pattern: the host's pages" : "NOT the pattern");
             printf("  host reads the mark  %#llx (%s)\n", (unsigned long long)mark, mark == 0x48454e4745ull ? "the guest's: both see the same memory" : "NOT the guest's mark");
         }
@@ -1006,6 +1066,7 @@ int main(int argc, char **argv) {
     else if (rm_call && !(HAVE(21) && rep[21] == 0)) why = "the resource manager did not answer the guest";
     else if (rm_call && rep[22] != 0) why = "the resource manager refused the guest's request";
     else if (window_mb && !(HAVE(26) && rep[26] == 0)) why = "the guest could not accept the shared window";
+    else if (window_mb && !(HAVE(28) && rep[28] == nwp)) why = "the guest did not accept every piece";
     else if (window_mb && !(HAVE(28) && rep[27] == 0x50524f4245ull)) why = "the guest did not see the host's pages in the window";
     else if (window_mb && memcmp(window, "EGNEH", 5)) why = "the host did not see the guest's mark in the window";
     else if (poke && !poked) why = "a store at a device's address did not come out of the guest";
