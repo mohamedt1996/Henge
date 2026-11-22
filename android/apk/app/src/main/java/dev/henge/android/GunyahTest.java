@@ -50,7 +50,7 @@ final class GunyahTest {
             {"Share 2 MB at the boot ROM's place (0x100000, below the base)", "--lend --base 70000000 --gic 10000000 --image-mb 16 --share-window 2 --window-at 100000", "15", "info"},
             {"Share 512 MB (may reset the tablet)", "--lend --base 70000000 --gic 10000000 --image-mb 16 --share-window 512", "40", "info"},
     };
-    private static final int VERSION = 10; // of STEPS: progress saved by another list starts over
+    private static final int VERSION = 11; // of STEPS: progress saved by another list starts over
 
     static volatile boolean running;
 

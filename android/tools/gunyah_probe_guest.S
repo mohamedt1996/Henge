@@ -199,8 +199,9 @@ rmcall:
     rev  w22, w22                       /* off_dt_strings */
     add  x23, x20, x21                  /* the structure block */
     add  x24, x20, x22                  /* the strings block */
-    mov  x25, #0                        /* in a message-queue node */
-    mov  x28, #0                        /* its caps were found */
+    mov  x25, #0                        /* in the resource manager's node (its compatible matched) */
+    mov  x14, #0                        /* this node's reg, two capabilities, was seen (x17 send, x18 receive) */
+    mov  x28, #0                        /* the caps were found */
 rmwalk:
     ldr  w0, [x23], #4
     rev  w0, w0
@@ -220,6 +221,7 @@ rmnode:
     bic  x23, x23, #3
 rmclr:
     mov  x25, #0
+    mov  x14, #0
     b    rmwalk
 rmprop:
     ldr  w1, [x23], #4
@@ -234,23 +236,54 @@ rmprop:
     adr  x6, s_compatible
     bl   streq
     cbz  w0, rmreg
-    mov  x3, x4                         /* compatible: does its first string name the message queue? */
+    mov  x3, x4                         /* compatible: does any of its strings name the resource manager? */
+    add  x16, x4, x1                    /* (0.3.72: the resource manager's node is "gunyah-resource-manager" or */
+3:  cmp  x3, x16                        /*  "qcom,resource-manager-1-0", as DroidVM's guest finds it) */
+    b.hs rmwalk
+    adr  x6, s_rm1
+    bl   strpre
+    cbnz w0, 4f
+    adr  x6, s_rm2
+    bl   strpre
+    cbnz w0, 4f
     adr  x6, s_msgq
-    bl   streq
-    cbz  w0, rmwalk
-    mov  x25, #1
-    b    rmwalk
+    bl   strpre
+    cbnz w0, 4f
+5:  ldrb w0, [x3], #1                   /* the next string */
+    cbnz w0, 5b
+    b    3b
+4:  mov  x25, #1
+    b    rmcaps
 rmreg:
     adr  x6, s_reg
     bl   streq
     cbz  w0, rmwalk
-    cbz  x25, rmwalk
-    cmp  w1, #16
+    cmp  w1, #8
+    b.ne 6f
+    ldr  w17, [x4]                      /* reg = <send receive>, one cell each */
+    rev  w17, w17
+    ldr  w18, [x4, #4]
+    rev  w18, w18
+    mov  x14, #1
+    b    rmcaps
+6:  cmp  w1, #16
     b.lo rmwalk
-    ldr  x26, [x4]
-    rev  x26, x26                       /* the send capability */
-    ldr  x27, [x4, #8]
-    rev  x27, x27                       /* the receive capability */
+    ldr  w17, [x4, #4]                  /* reg = <send receive>, two cells each (the low words: the property is */
+    rev  w17, w17                       /*  only 4-byte aligned, and memory is Device with the MMU off) */
+    ldr  w0, [x4]
+    rev  w0, w0
+    orr  x17, x17, x0, lsl #32
+    ldr  w18, [x4, #12]
+    rev  w18, w18
+    ldr  w0, [x4, #8]
+    rev  w0, w0
+    orr  x18, x18, x0, lsl #32
+    mov  x14, #1
+rmcaps:                                 /* the node's compatible and its reg, in either order */
+    cbz  x25, rmwalk
+    cbz  x14, rmwalk
+    mov  x26, x17
+    mov  x27, x18
     mov  x28, #1
     b    rmwalk
 rmsend:
@@ -304,24 +337,6 @@ rmgot:
 rmret:
     mov  x30, x19
     ret
-
-/* w0 = 1 if the string at x3 equals the one at x6 (both end at a zero byte). */
-streq:
-    mov  x7, x3
-    mov  x8, x6
-1:  ldrb w0, [x7], #1
-    ldrb w2, [x8], #1
-    cmp  w0, w2
-    b.ne 2f
-    cbnz w0, 1b
-    mov  w0, #1
-    ret
-2:  mov  w0, #0
-    ret
-
-s_compatible: .asciz "compatible"
-s_reg:        .asciz "reg"
-s_msgq:       .asciz "qcom,gunyah-message-queue"
 
     .org 0x800
 vectors:
@@ -415,3 +430,37 @@ accept:
     movn x0, #0
     str  x0, [x9, #0xd0]
 9:  ret
+
+/* w0 = 1 if the string at x3 equals the one at x6 (both end at a zero byte). */
+streq:
+    mov  x7, x3
+    mov  x8, x6
+1:  ldrb w0, [x7], #1
+    ldrb w2, [x8], #1
+    cmp  w0, w2
+    b.ne 2f
+    cbnz w0, 1b
+    mov  w0, #1
+    ret
+2:  mov  w0, #0
+    ret
+
+/* w0 = 1 if the string at x6 begins the one at x3 (x3 is kept). */
+strpre:
+    mov  x7, x3
+    mov  x8, x6
+1:  ldrb w2, [x8], #1
+    cbz  w2, 2f
+    ldrb w0, [x7], #1
+    cmp  w0, w2
+    b.eq 1b
+    mov  w0, #0
+    ret
+2:  mov  w0, #1
+    ret
+
+s_rm1:        .asciz "gunyah-resource-manager"
+s_rm2:        .asciz "qcom,resource-manager"
+s_compatible: .asciz "compatible"
+s_reg:        .asciz "reg"
+s_msgq:       .asciz "qcom,gunyah-message-queue"

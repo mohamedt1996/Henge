@@ -898,6 +898,17 @@ guest accepts it itself with the resource manager's MEM_ACCEPT over its rm-rpc c
   and packs them as a Magisk module (release gunyah-modules), loaded at boot.
 The engine (host/gunyah.c) moves to this way once the steps pass.
 
+0.3.72 (2026-11-22): the tablet's answers to 0.3.71's steps. DroidVM's gunyah-host-share module loads, and sharing
+4 MB into a running VM works (memparcel handle 5); the guest did not find its resource-manager channel, and sharing
+64 MB reset the tablet.
+- The guest looked for a node whose first compatible string is "qcom,gunyah-message-queue". It now takes any string
+  beginning "gunyah-resource-manager" or "qcom,resource-manager" (as DroidVM's guest module finds the node), reg as
+  one or two cells per capability, and reg before or after compatible.
+- A window is now made as DroidVM's crosvm makes them (mthp.rs): caches dropped and memory compacted, shmem huge
+  pages on advice, populated, collapsed 2 MB at a time, pinned, at a 2 MB-aligned address. A parcel takes an entry
+  per folio, and the 64 MB window of 4 KB pages was 16384 of them. The probe says how much of the window is in 2 MB
+  pages, and shares nothing over 4 MB that is under 90% in them (--share-small-pages overrides).
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

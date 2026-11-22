@@ -173,6 +173,48 @@ static int ram_how = RAM_SHM;
 static uint64_t size_max_mb;
 static int shm_alloc, ram_rw, rm_rpc, rm_call;
 static uint64_t window_mb, window_at = ~0ull, window_handle;
+static int window_small_ok; /* --share-small-pages: share a window that is not in 2 MB pages */
+
+static void put_file(const char *f, const char *v) { int fd = open(f, O_WRONLY | O_CLOEXEC); if (fd >= 0) { ssize_t r = write(fd, v, strlen(v)); (void)r; close(fd); } }
+
+/* MB of [p, p+len) the kernel maps in 2 MB pages, from /proc/self/smaps. */
+static uint64_t huge_mb(void *p, uint64_t len) {
+    FILE *f = fopen("/proc/self/smaps", "r");
+    char line[256];
+    int in = 0;
+    uint64_t kb = 0, v;
+    while (f && fgets(line, sizeof line, f)) {
+        unsigned long long lo, hi;
+        if (sscanf(line, "%llx-%llx ", &lo, &hi) == 2) { in = lo < (uintptr_t)p + len && hi > (uintptr_t)p; continue; }
+        if (in && (sscanf(line, "ShmemPmdMapped: %llu kB", (unsigned long long *)&v) == 1 || sscanf(line, "FilePmdMapped: %llu kB", (unsigned long long *)&v) == 1)) kb += v;
+    }
+    if (f) fclose(f);
+    return kb >> 10;
+}
+
+/* The window in 2 MB pages, as DroidVM's crosvm prepares its windows (hypervisor/src/gunyah/mthp.rs): a memory
+   parcel is built from the window's folios, one entry each, and one of 4 KB pages is 256 entries a megabyte (the
+   64 MB window of 0.3.71's step 11 was 16384, and the tablet reset sharing it). Caches dropped and memory compacted,
+   shmem huge pages on advice, then populated, collapsed 2 MB at a time, and pinned. */
+static uint8_t *window_make(uint64_t size) {
+    put_file("/sys/kernel/mm/transparent_hugepage/shmem_enabled", "advise");
+    put_file("/sys/kernel/mm/transparent_hugepage/enabled", "madvise");
+    put_file("/proc/sys/vm/drop_caches", "3");
+    put_file("/proc/sys/vm/compact_memory", "1");
+    int fd = memfd_create("gunyah-window", MFD_CLOEXEC);
+    if (fd < 0 || ftruncate(fd, (off_t)size) < 0) return NULL;
+    uint64_t two = 2ull << 20; /* a 2 MB-aligned address, as the file's offsets are: a PMD needs both */
+    uint8_t *res = mmap(NULL, size + two, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (res == MAP_FAILED) return NULL;
+    uint8_t *at = (uint8_t *)(((uintptr_t)res + two - 1) & ~(uintptr_t)(two - 1));
+    uint8_t *w = mmap(at, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    if (w == MAP_FAILED) return NULL;
+    madvise(w, size, MADV_HUGEPAGE);
+    if (madvise(w, size, 23 /* MADV_POPULATE_WRITE */) < 0) memset(w, 0, size);
+    for (uint64_t o = 0; o < size; o += two) madvise(w + o, size - o < two ? size - o : two, 25 /* MADV_COLLAPSE */);
+    mlock(w, size);
+    return w;
+}
 
 /* ---- crumbs: a line forced to storage before each step ---- */
 static const char *crumb_path;
@@ -558,6 +600,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--rm-call")) rm_rpc = rm_call = 1;
         else if (!strcmp(a, "--share-window") && v) window_mb = strtoull(v, NULL, 10), rm_rpc = rm_call = 1, i++;
         else if (!strcmp(a, "--window-at") && v) window_at = strtoull(v, NULL, 16), i++;
+        else if (!strcmp(a, "--share-small-pages")) window_small_ok = 1;
         else if (!strcmp(a, "--bells")) bells = 1;
         else if (!v) { fprintf(stderr, "gunyah-probe: %s needs a value\n", a); return 2; }
         else if (!strcmp(a, "--mem")) mem_mb = strtoull(v, NULL, 10), i++;
@@ -659,15 +702,22 @@ int main(int argc, char **argv) {
        and a pattern at +8 for the guest to read back. */
     uint8_t *window = NULL;
     if (window_mb) {
-        int wfd = memfd_create("gunyah-window", MFD_CLOEXEC);
-        if (wfd < 0 || ftruncate(wfd, (off_t)(window_mb << 20)) < 0) { step("make the window (memfd)", -1); goto fail; }
-        window = mmap(NULL, window_mb << 20, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, wfd, 0);
-        if (window == MAP_FAILED) { step("map the window", -1); goto fail; }
-        madvise(window, window_mb << 20, MADV_HUGEPAGE);
-        memset(window, 0, window_mb << 20);
+        struct rlimit nolimit0 = {RLIM_INFINITY, RLIM_INFINITY};
+        setrlimit(RLIMIT_MEMLOCK, &nolimit0);
+        window = window_make(window_mb << 20);
+        if (!window) { step("make the window", -1); goto fail; }
         uint64_t pat = 0x50524f4245ull; /* "PROBE" */
         memcpy(window + 8, &pat, 8);
-        printf("window                 %llu MB at %#llx, accepted by the guest after the start\n", (unsigned long long)window_mb, (unsigned long long)window_at);
+        uint64_t hmb = huge_mb(window, window_mb << 20);
+        printf("window                 %llu MB at %#llx, %llu MB of it in 2 MB pages; accepted by the guest after the start\n",
+               (unsigned long long)window_mb, (unsigned long long)window_at, (unsigned long long)hmb);
+        if (window_mb > 4 && hmb * 10 < window_mb * 9 && !window_small_ok) {
+            /* Not shared: a parcel of 4 KB pages this big is what reset the tablet in 0.3.71. */
+            printf("RESULT: FAIL the window is not in 2 MB pages (%llu of %llu MB), and sharing it so reset the tablet before: not shared\n",
+                   (unsigned long long)hmb, (unsigned long long)window_mb);
+            crumb("end: FAIL the window is not in 2 MB pages");
+            return 1;
+        }
     }
     memcpy(image + PROBE_GUEST_PARAMS, params, sizeof params);
 
