@@ -49,8 +49,13 @@ final class GunyahTest {
             {"Share 64 MB at the Mac's layout (base 0x70000000)", "--lend --base 70000000 --gic 10000000 --image-mb 16 --share-window 64", "15", "info"},
             {"Share 2 MB at the boot ROM's place (0x100000, below the base)", "--lend --base 70000000 --gic 10000000 --image-mb 16 --share-window 2 --window-at 100000", "15", "info"},
             {"Share 512 MB (may reset the tablet)", "--lend --base 70000000 --gic 10000000 --image-mb 16 --share-window 512", "40", "info"},
+            // 0.3.73: the boot ROM's place (0x100000) is below base 0x70000000 and refused (error 2), so the Mac needs
+            // a VM whose base is 0, its first region holding the ROM. 0.3.41 found base 0 refused, before the tree's
+            // memory node was named as the resource manager wants: asked again.
+            {"Start with base 0 (4 MB lent at 0)", "--lend --base 0 --image-mb 4 --gic 10000000", "8", "info"},
+            {"Base 0, and 64 MB accepted at the Mac's memory (0x70000000)", "--lend --base 0 --image-mb 4 --gic 10000000 --share-window 64 --window-at 70000000", "15", "info"},
     };
-    private static final int VERSION = 11; // of STEPS: progress saved by another list starts over
+    private static final int VERSION = 12; // of STEPS: progress saved by another list starts over
 
     static volatile boolean running;
 

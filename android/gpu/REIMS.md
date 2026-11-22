@@ -909,6 +909,12 @@ The engine (host/gunyah.c) moves to this way once the steps pass.
   per folio, and the 64 MB window of 4 KB pages was 16384 of them. The probe says how much of the window is in 2 MB
   pages, and shares nothing over 4 MB that is under 90% in them (--share-small-pages overrides).
 
+0.3.73 (2026-11-22): 0.3.72 on the tablet: the guest drives the resource manager (VM id 128), and windows of 4, 64
+and 512 MB in 2 MB pages are shared, accepted, and seen alike by guest and host, at 0x81200000 and 0x72000000. A
+window at the boot ROM's place, 0x100000, below the base 0x70000000, is refused (MEM_ACCEPT error 2): the VM's
+layout starts at its base. Two steps ask whether a VM with base 0 starts now (0.3.41 said no, before the tree's
+memory node was named as the resource manager wants), and whether it takes 64 MB at 0x70000000.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
