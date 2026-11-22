@@ -169,6 +169,31 @@ static void board_poll(void) {
     if (net_on) hv_net_poll();
 }
 
+/* Gunyah hand-over (host/gunyah.c): Gunyah will not give a VM memory below its base, and the Mac's boot ROM and
+   config window are at 0x100000 and 0x400000. So the plan is Henge's own CPUs for the ROM and iBoot, and Gunyah's
+   from the point the Mac no longer needs either. That point is found here: each time a CPU turns its MMU off (iBoot
+   does to start the next stage, and to jump into the kernel, x0 = the kernel's boot_args), and every use of
+   memory below the Mac's RAM after the first (core/mmu.c, low_note). */
+static void on_mmu_off(HvCpu *cpu) {
+    static _Atomic int seen;
+    int n = atomic_fetch_add(&seen, 1);
+    if (n >= 8) return;
+    const uint8_t *ba = hv_phys_ptr(&m, cpu->x[0], 64);
+    uint16_t rev = 0, ver = 0;
+    uint64_t virt = 0, phys = 0, size = 0;
+    if (ba) memcpy(&rev, ba, 2), memcpy(&ver, ba + 2, 2), memcpy(&virt, ba + 8, 8), memcpy(&phys, ba + 16, 8), memcpy(&size, ba + 24, 8);
+    int xnu = ba && (virt >> 40) >= 0xfffe00 && phys >= VMAPPLE_MEM && phys < VMAPPLE_MEM + board.ram_size && size && size <= board.ram_size;
+    fprintf(stderr, "hengevm: gunyah hand-over: CPU %u turns its MMU off at pc 0x%llx (EL%d), x0 0x%llx x1 0x%llx x2 0x%llx x3 0x%llx, "
+            "sp 0x%llx%s\n", cpu->index, (unsigned long long)cpu->pc, cpu->el, (unsigned long long)cpu->x[0],
+            (unsigned long long)cpu->x[1], (unsigned long long)cpu->x[2], (unsigned long long)cpu->x[3], (unsigned long long)cpu->sp,
+            n ? "" : "; from here, memory below the Mac's RAM that is used is logged");
+    if (xnu)
+        fprintf(stderr, "hengevm: gunyah hand-over:   x0 is the kernel's boot_args (revision %u, version %u, virtual base 0x%llx, "
+                "physical base 0x%llx, memory 0x%llx): this is the jump into the kernel\n", rev, ver, (unsigned long long)virt,
+                (unsigned long long)phys, (unsigned long long)size);
+    if (cpu->pc >= VMAPPLE_MEM && !m.low_watch) m.low_watch = VMAPPLE_MEM;
+}
+
 static int fail(char *err, size_t n, const char *msg) {
     if (err && n) snprintf(err, n, "%s", msg);
     return -1;
@@ -332,6 +357,8 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     int r = c->jit_rx ? hv_machine_init_jit(&m, c->jit_rx, c->jit_rw, jit) : hv_machine_init(&m, jit);
     if (r != 0) return fail(err, errlen, "Cannot set up the JIT region.");
     m.log = c->log;
+    m.on_mmu_off = on_mmu_off;
+    m.low_watch = 0, m.low_logged = 0;
     m.gen_checks = getenv("HV_JIT_POISON") != NULL;
     if (getenv("HV_SLOW_MEM")) m.slow_mem = 1; /* debugging: every load and store through the helper */
     ncpus = c->ncpus < 1 ? 1 : c->ncpus > HV_MAX_CPUS ? HV_MAX_CPUS : c->ncpus;

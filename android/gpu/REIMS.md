@@ -915,6 +915,15 @@ window at the boot ROM's place, 0x100000, below the base 0x70000000, is refused 
 layout starts at its base. Two steps ask whether a VM with base 0 starts now (0.3.41 said no, before the tree's
 memory node was named as the resource manager wants), and whether it takes 64 MB at 0x70000000.
 
+0.3.74 (2026-11-22): 0.3.73 on the tablet: a VM based at 0 is refused when it starts (VM_INIT, error 2), as is
+memory below the base, so the boot ROM (0x100000) and the config window (0x400000) can never be Gunyah memory.
+The plan is a hand-over: Henge's own CPUs run the ROM and iBoot, and Gunyah's take over once the Mac needs neither,
+most likely at iBoot's jump into the kernel (MMU off, x0 = boot_args, CPU 0 only, nothing set up yet). The engine
+now logs each time a CPU turns its MMU off, says when x0 is the kernel's boot_args, and after the first logs every
+use of memory below the Mac's RAM: one normal boot's log shows the hand-over point and whether anything after it
+still reads the ROM or the config window. The Gunyah test asks where the VM's own first region can go (memory
+below a high base; a base just under the Mac's RAM) and whether 2 and 3 GB can be had in 2 MB pages.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

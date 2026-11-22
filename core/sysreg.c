@@ -226,6 +226,7 @@ static int write_reg(HvCpu *cpu, uint32_t reg, uint64_t v) {
         v = (v | 1u << 7 | 1u << 8) & ~(uint64_t)(1u << 5);
         uint64_t changed = cpu->sctlr_el1 ^ v;
         cpu->sctlr_el1 = v;
+        if ((changed & 1) && !(v & 1) && cpu->m->on_mmu_off) cpu->m->on_mmu_off(cpu);
         if (changed & (1u | 1u << 19 | 1u << 24 | 1u << 25)) { /* M, WXN, E0E, EE: what translations depend on */
             cpu->m->stats.flush_why[2]++;
             hv_tlb_flush(cpu);

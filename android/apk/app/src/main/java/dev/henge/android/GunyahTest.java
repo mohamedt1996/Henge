@@ -47,15 +47,16 @@ final class GunyahTest {
             // accepting it itself. The resource manager takes one region at the start; this is how the Mac's RAM gets in.
             {"Share 4 MB into the running VM (needs DroidVM's gunyah-host-share module)", "--lend --share-window 4", "10", "info"},
             {"Share 64 MB at the Mac's layout (base 0x70000000)", "--lend --base 70000000 --gic 10000000 --image-mb 16 --share-window 64", "15", "info"},
-            {"Share 2 MB at the boot ROM's place (0x100000, below the base)", "--lend --base 70000000 --gic 10000000 --image-mb 16 --share-window 2 --window-at 100000", "15", "info"},
             {"Share 512 MB (may reset the tablet)", "--lend --base 70000000 --gic 10000000 --image-mb 16 --share-window 512", "40", "info"},
-            // 0.3.73: the boot ROM's place (0x100000) is below base 0x70000000 and refused (error 2), so the Mac needs
-            // a VM whose base is 0, its first region holding the ROM. 0.3.41 found base 0 refused, before the tree's
-            // memory node was named as the resource manager wants: asked again.
-            {"Start with base 0 (4 MB lent at 0)", "--lend --base 0 --image-mb 4 --gic 10000000", "8", "info"},
-            {"Base 0, and 64 MB accepted at the Mac's memory (0x70000000)", "--lend --base 0 --image-mb 4 --gic 10000000 --share-window 64 --window-at 70000000", "15", "info"},
+            // 0.3.74: the boot ROM's place (below the base) and a base of 0 are both refused, so Henge runs the ROM and
+            // iBoot itself and hands the CPUs to Gunyah after. Where the VM's own first region can go, and whether the
+            // Mac's RAM can be had in 2 MB pages:
+            {"Memory below the base, but high (base 0x80000000, 64 MB at 0x72000000)", "--lend --base 80000000 --image-mb 2 --gic 10000000 --share-window 64 --window-at 72000000", "15", "info"},
+            {"Base just under the Mac's RAM (0x6fe00000), 64 MB at 0x70000000", "--lend --base 6fe00000 --image-mb 2 --gic 10000000 --share-window 64 --window-at 70000000", "15", "info"},
+            {"2 GB in 2 MB pages (made only, not shared)", "--share-window 2048 --window-at 70000000 --window-only", "60", "info"},
+            {"3 GB in 2 MB pages (made only, not shared)", "--share-window 3072 --window-at 70000000 --window-only", "80", "info"},
     };
-    private static final int VERSION = 12; // of STEPS: progress saved by another list starts over
+    private static final int VERSION = 13; // of STEPS: progress saved by another list starts over
 
     static volatile boolean running;
 

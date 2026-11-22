@@ -59,6 +59,7 @@
                      channel), stores a mark at its start and reads back what this program left at +8. The
                      resource manager takes one memory region at a VM's creation; this is how the rest gets in.
      --window-at ADDR  where the guest accepts it (hex; default: 16 MB past the first region)
+     --window-only   only make the window and count its 2 MB pages (how much of the Mac's RAM Gunyah could take)
      --tree-only F   no VM: the tree this run would give, written to F
      --kmsg FILE     the kernel's messages from now on copied to FILE, each forced to storage as it comes:
                      what the kernel said last before a reset
@@ -173,6 +174,7 @@ static int ram_how = RAM_SHM;
 static uint64_t size_max_mb;
 static int shm_alloc, ram_rw, rm_rpc, rm_call;
 static uint64_t window_mb, window_at = ~0ull, window_handle;
+static int window_only; /* --window-only: make the window and say how much of it is in 2 MB pages, nothing more */
 static int window_small_ok; /* --share-small-pages: share a window that is not in 2 MB pages */
 
 static void put_file(const char *f, const char *v) { int fd = open(f, O_WRONLY | O_CLOEXEC); if (fd >= 0) { ssize_t r = write(fd, v, strlen(v)); (void)r; close(fd); } }
@@ -600,6 +602,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--rm-call")) rm_rpc = rm_call = 1;
         else if (!strcmp(a, "--share-window") && v) window_mb = strtoull(v, NULL, 10), rm_rpc = rm_call = 1, i++;
         else if (!strcmp(a, "--window-at") && v) window_at = strtoull(v, NULL, 16), i++;
+        else if (!strcmp(a, "--window-only")) window_only = 1;
         else if (!strcmp(a, "--share-small-pages")) window_small_ok = 1;
         else if (!strcmp(a, "--bells")) bells = 1;
         else if (!v) { fprintf(stderr, "gunyah-probe: %s needs a value\n", a); return 2; }
@@ -711,6 +714,13 @@ int main(int argc, char **argv) {
         uint64_t hmb = huge_mb(window, window_mb << 20);
         printf("window                 %llu MB at %#llx, %llu MB of it in 2 MB pages; accepted by the guest after the start\n",
                (unsigned long long)window_mb, (unsigned long long)window_at, (unsigned long long)hmb);
+        if (window_only) { /* 0.3.74: can the Mac's RAM (2-3 GB) be had in 2 MB pages, as Gunyah needs it? */
+            int ok = hmb * 10 >= window_mb * 9;
+            printf("RESULT: %s %llu of %llu MB in 2 MB pages (%s)\n", ok ? "PASS" : "FAIL", (unsigned long long)hmb,
+                   (unsigned long long)window_mb, ok ? "enough to share" : "too little: sharing it would risk a reset");
+            crumb("end: window only");
+            return !ok;
+        }
         if (window_mb > 4 && hmb * 10 < window_mb * 9 && !window_small_ok) {
             /* Not shared: a parcel of 4 KB pages this big is what reset the tablet in 0.3.71. */
             printf("RESULT: FAIL the window is not in 2 MB pages (%llu of %llu MB), and sharing it so reset the tablet before: not shared\n",

@@ -263,6 +263,11 @@ typedef struct HvMachine {
     uint64_t access_pc;  /* guest PC of the load/store being emulated, for logs */
     uint64_t watch_va;   /* debugging: log every write that touches this guest VA (0: off) */
     uint64_t watch_pa;   /* debugging: the same by physical address */
+    /* Gunyah hand-over (host/gunyah.c): where the Mac's boot leaves the boot ROM for good. low_watch: once set, TLB
+       fills of pages below it (the ROM, the config window) are logged, which Gunyah cannot give the guest. */
+    uint64_t low_watch;
+    void (*on_mmu_off)(struct HvCpu *cpu); /* SCTLR.M 1 -> 0 (iBoot's jump to the next stage, or to the kernel) */
+    int low_logged;
     HvStats stats;
     int chain;               /* block chaining and the indirect-branch cache are enabled */
     uint64_t *slots;         /* chainable exits' targets (0: not chained) */
