@@ -1153,6 +1153,62 @@ public class MainActivity extends Activity {
         c.addView(note);
         page.addView(c);
         gunyah(page);
+        gunyahMemory(page);
+    }
+
+    /** 0.3.75: the Mac's RAM held for Gunyah by henge-reserve (android/tools/henge_reserve.c), taken in 2 MB pages while
+     *  the tablet's memory is still whole: Gunyah takes it only so. Reserve now / Release / Reserve at boot (the
+     *  henge-gunyah Magisk module's service.sh starts it from /data/adb/henge-gunyah). */
+    static volatile String reserveStatus = null;
+    private void gunyahMemory(LinearLayout page) {
+        if (!new java.io.File("/dev/gunyah").exists()) return;
+        LinearLayout c = card(22);
+        c.addView(text("Gunyah memory", 16, TEXT, true));
+        c.addView(gap(6));
+        int mb = Math.min(ramMb(), 3072);
+        String bin = getApplicationInfo().nativeLibraryDir + "/libghreserve.so";
+        c.addView(text("Gunyah takes the Mac's RAM only in 2 MB pieces, and Android's memory gets cut up as it runs. "
+                + "Reserving holds " + mb + " MB (the RAM setting, at most 3072) for the Mac, pinned: Android cannot use it "
+                + "until you release it. Reserve at boot takes it right after the tablet starts, when it is whole "
+                + "(needs the henge-gunyah Magisk module, version 2).", 13, DIM, false));
+        c.addView(gap(10));
+        String st = reserveStatus;
+        if (st == null) {
+            reserveStatus = "…";
+            new Thread(() -> {
+                String s = DeviceCheck.sh(true, VmService.sq(bin) + " status; echo; tail -n 3 /data/local/tmp/henge-gunyah-reserve.txt 2>/dev/null; "
+                        + "[ -f /data/adb/henge-gunyah/reserve.conf ] && echo \"at boot: $(cat /data/adb/henge-gunyah/reserve.conf) MB\" || echo 'at boot: off'", 10);
+                reserveStatus = s == null ? "(no root answer)" : s.trim();
+                ui.post(() -> { if (!isFinishing()) render(true); });
+            }, "reserve-status").start();
+            st = "…";
+        }
+        TextView t = text(st, 11, DIM, false, Typeface.MONOSPACE);
+        t.setTextIsSelectable(true);
+        c.addView(t);
+        c.addView(gap(10));
+        c.addView(secondary("Reserve " + mb + " MB now", ACCENT_LIGHT, v -> shReserve(VmService.sq(bin) + " release >/dev/null 2>&1; sleep 1; setsid nohup " + VmService.sq(bin)
+                + " start " + mb + " >/dev/null 2>&1 & sleep 20")));
+        c.addView(gap(8));
+        c.addView(link("Release (give it back to Android)", v -> shReserve(VmService.sq(bin) + " release")));
+        c.addView(gap(8));
+        boolean atBoot = st.contains("at boot: ") && !st.contains("at boot: off");
+        c.addView(link(atBoot ? "Reserve at boot: on (turn off)" : "Reserve at boot: off (turn on, " + mb + " MB)", v -> shReserve(atBoot
+                ? "rm -f /data/adb/henge-gunyah/reserve.conf"
+                : "mkdir -p /data/adb/henge-gunyah && cp " + VmService.sq(bin) + " /data/adb/henge-gunyah/henge-reserve && chmod 755 "
+                  + "/data/adb/henge-gunyah/henge-reserve && echo " + mb + " > /data/adb/henge-gunyah/reserve.conf")));
+        page.addView(gap(14));
+        page.addView(c);
+    }
+
+    private void shReserve(String cmd) {
+        reserveStatus = "working…";
+        render(true);
+        new Thread(() -> {
+            DeviceCheck.sh(true, cmd, 60);
+            reserveStatus = null;
+            ui.post(() -> { if (!isFinishing()) render(true); });
+        }, "reserve").start();
     }
 
     /** Gunyah, a step a tap (GunyahTest): each step adds one thing to the last, and a reset names its step. */

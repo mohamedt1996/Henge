@@ -924,6 +924,19 @@ use of memory below the Mac's RAM: one normal boot's log shows the hand-over poi
 still reads the ROM or the config window. The Gunyah test asks where the VM's own first region can go (memory
 below a high base; a base just under the Mac's RAM) and whether 2 and 3 GB can be had in 2 MB pages.
 
+0.3.75 (2026-11-22): the Gunyah hand-over, first try. 0.3.74's boot log: CPU 0 turns its MMU off three times in
+RAM (AVPBooter's loader to iBootStage1, iBootStage1 to iBootStage2, iBootStage2 to the kernel), and the third is the
+jump into the kernel with only CPU 0 on. Engine Gunyah now runs the boot ROM and iBoot on Henge's CPUs and stops
+CPU 0 there (host/vm.c); host/gunyah.c then patches the kernel collection for a Qualcomm CPU (Apple's own registers
+read 0, MIDR reads Apple's value through stubs in the code's padding, the PAC hypercalls succeed, timebase-frequency
+set to the counter's 19.2 MHz), starts a VM whose own 2 MB region sits at 0x6fe00000, shares the Mac's RAM into it
+after the start in 256 MB pieces, and host/gunyah_shim.S accepts them, loads CPU 0's state from a hand-over page
+and returns to the Mac. If anything fails before the VM starts, Henge's CPUs go on. The Mac's RAM must be all in 2 MB
+pages: henge-reserve (android/tools/henge_reserve.c) takes it at boot (Settings > Gunyah memory, the henge-gunyah
+Magisk module v2) and the kernel is pushed to compact harder. The stage log names RAM pages below 0x70000000 per
+stage. The Gunyah test now says whether PAC instructions run on Gunyah's vCPUs and whether each vCPU signs alike,
+and has an optional 8 MB share of 4 KB pages.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

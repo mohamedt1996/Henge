@@ -53,6 +53,7 @@ _start:
     str  x0, [x9, #0x30]
     mrs  x1, id_aa64pfr0_el1
     str  x1, [x9, #0x38]
+    bl   pactest                        /* 0.3.75: do PAC instructions run here, and with what keys */
 
     /* Every page of the memory asked for: its own address written, then read back. */
     ldr  x11, [x10, #0x08]              /* first byte */
@@ -113,6 +114,7 @@ cpus:
 6:  str  x16, [x9, #0x68]
 
 done:
+    bl   packeys
     bl   rmcall                         /* ask the resource manager its VM id, if a tree was given */
     ldr  x11, [x10, #0x20]              /* a store where the Mac has a device: an exit, or an exception */
     cbz  x11, 10f
@@ -162,6 +164,9 @@ done:
 
 /* A CPU started by CPU_ON: x0 is its number. */
 secondary:
+    mov  x20, x0
+    bl   pacsec
+    mov  x0, x20
     adr  x1, flags
     mov  w2, #1
     strb w2, [x1, x0]
@@ -176,7 +181,15 @@ params:
     .quad 0x10000000, 0, 0, 1, 0, 0, 0
     .org 0x440
 flags:
-    .fill 64, 1, 0
+    .fill 8, 1, 0
+tryflag:                                /* 1 while an instruction that may trap is tried: the vectors skip it */
+    .quad 0
+tryesr:
+    .quad 0
+pacres:                                 /* each CPU's PACIA of the same pointer, with the keys it was given */
+    .quad 0, 0, 0, 0
+pacok:                                  /* CPU 0 found PACIA runs: the others try it too */
+    .quad 0
 
     .org 0x480
 rmbuf:
@@ -341,7 +354,17 @@ rmret:
     .org 0x800
 vectors:
     .rept 16
-    adr  x10, params
+    adr  x16, tryflag
+    ldr  x17, [x16]
+    cbz  x17, 1f
+    str  xzr, [x16]
+    mrs  x17, esr_el1
+    str  x17, [x16, #8]
+    mrs  x17, elr_el1
+    add  x17, x17, #4
+    msr  elr_el1, x17
+    eret
+1:  adr  x10, params
     ldr  x9, [x10]
     mrs  x1, esr_el1
     str  x1, [x9, #0x40]
@@ -430,6 +453,107 @@ accept:
     movn x0, #0
     str  x0, [x9, #0xd0]
 9:  ret
+
+/* ---- pointer authentication (0.3.75) ----
+   XNU's kernel and every arm64e program use PAC instructions; Henge's JIT runs them as if no key signs. On Gunyah
+   they run on the CPU: they work only if Gunyah lets them (HCR_EL2.API), and the Mac's threads move between
+   vCPUs, so every vCPU must sign with the same keys. Gunyah's ID registers say no PAC (ISAR1 APA/API 0).
+   Report: 0xe8 PACIA ran (1) or trapped (0), 0xf0 the trap's ESR, 0xf8 its result, 0x118 SCTLR with the enables
+   set, 0x140 MPIDR, 0x148 APIAKeyLo read, 0x150 1 if that read ran. Slots 0x120-0x138: each CPU's PACIA.
+   Uses x0-x8, x16, x17. */
+pactest:
+    mrs  x1, mpidr_el1
+    str  x1, [x9, #0x140]
+    mrs  x1, sctlr_el1
+    orr  x1, x1, #0x80000000            /* EnIA */
+    orr  x1, x1, #0x40000000            /* EnIB */
+    orr  x1, x1, #0x08000000            /* EnDA */
+    orr  x1, x1, #0x2000                /* EnDB */
+    msr  sctlr_el1, x1
+    isb
+    mrs  x1, sctlr_el1
+    str  x1, [x9, #0x118]
+    adr  x16, tryflag
+    mov  x17, #1
+    str  x17, [x16]
+    mov  x2, #0
+    mrs  x2, s3_0_c2_c1_0               /* APIAKeyLo_EL1 */
+    ldr  x17, [x16]
+    str  x17, [x9, #0x150]
+    str  x2, [x9, #0x148]
+    str  xzr, [x16]
+    mov  x17, #1
+    str  x17, [x16]
+    str  xzr, [x16, #8]
+    movz x0, #0x5678
+    movk x0, #0x1234, lsl #16
+    mov  x1, #0
+    .inst 0xdac10020                    /* pacia x0, x1 */
+    ldr  x17, [x16]
+    str  x17, [x9, #0xe8]
+    ldr  x2, [x16, #8]
+    str  x2, [x9, #0xf0]
+    str  x0, [x9, #0xf8]
+    str  xzr, [x16]
+    adr  x2, pacres
+    str  x0, [x2]
+    str  x17, [x2, #0x20]               /* pacok */
+    ret
+
+/* A started CPU: the same PACIA, if CPU 0's ran; its result in pacres[n]. x20 = its number. */
+pacsec:
+    adr  x2, pacres
+    ldr  x3, [x2, #0x20]
+    cbz  x3, 1f
+    cmp  x20, #4                        /* four slots */
+    b.hs 1f
+    mrs  x1, sctlr_el1
+    orr  x1, x1, #0x80000000
+    orr  x1, x1, #0x40000000
+    orr  x1, x1, #0x08000000
+    orr  x1, x1, #0x2000
+    msr  sctlr_el1, x1
+    isb
+    movz x0, #0x5678
+    movk x0, #0x1234, lsl #16
+    mov  x1, #0
+    .inst 0xdac10020                    /* pacia x0, x1 */
+    str  x0, [x2, x20, lsl #3]
+    dsb  sy
+1:  ret
+
+/* CPU 0, once the others ran: their results reported, then whether EL1 may set a key (APIAKeyLo/Hi = 0) and
+   what PACIA gives then. 0x100 the key write ran (1), 0x108 its ESR, 0x110 PACIA after it. */
+packeys:
+    adr  x2, pacres
+    ldr  x3, [x2]
+    str  x3, [x9, #0x120]
+    ldr  x3, [x2, #8]
+    str  x3, [x9, #0x128]
+    ldr  x3, [x2, #16]
+    str  x3, [x9, #0x130]
+    ldr  x3, [x2, #24]
+    str  x3, [x9, #0x138]
+    ldr  x3, [x2, #0x20]
+    cbz  x3, 1f
+    adr  x16, tryflag
+    mov  x17, #1
+    str  x17, [x16]
+    str  xzr, [x16, #8]
+    msr  s3_0_c2_c1_0, xzr              /* APIAKeyLo_EL1 */
+    msr  s3_0_c2_c1_1, xzr              /* APIAKeyHi_EL1 */
+    isb
+    ldr  x17, [x16]
+    str  x17, [x9, #0x100]
+    ldr  x3, [x16, #8]
+    str  x3, [x9, #0x108]
+    str  xzr, [x16]
+    movz x0, #0x5678
+    movk x0, #0x1234, lsl #16
+    mov  x1, #0
+    .inst 0xdac10020                    /* pacia x0, x1 */
+    str  x0, [x9, #0x110]
+1:  ret
 
 /* w0 = 1 if the string at x3 equals the one at x6 (both end at a zero byte). */
 streq:

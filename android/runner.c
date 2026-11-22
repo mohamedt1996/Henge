@@ -749,18 +749,20 @@ int main(int argc, char **argv) {
     int gunyah = !strcmp(engine, "gunyah");
     if (!gunyah && strcmp(engine, "jit")) usage();
     if (gunyah) {
-        /* The CPU runs on Gunyah (host/gunyah.c): every CPU asked for, each a vCPU. Guest RAM is pinned for the
-           hypervisor, so it must be anonymous: a long-term pin of a file's pages (the RAM file Graphics: Vulkan
-           and reims share with the app) leaves them dirty under the file system's writeback, which on this
-           kernel (no FOLL_LONGTERM refusal for file pages before Linux 6.5) can panic and reboot the tablet.
-           So those two run only with the JIT engine for now; Gunyah gets pvg_lite. */
-        if (!strcmp(gpu, "vulkan") || !strcmp(gpu, "reims") || !strcmp(gpu, "applegfx")) {
-            fprintf(stderr, "hengevm: Graphics %s needs the JIT engine for now (Gunyah cannot pin a file's pages "
-                            "safely); using GPU instead\n", gpu);
+        /* Henge's CPUs run the boot ROM and iBoot, Gunyah's the Mac from the jump into the kernel on (host/gunyah.c).
+           The Mac's RAM must be a memfd in 2 MB pages that Gunyah can be given: henge-reserve's when it holds it
+           (taken at boot, android/tools/henge_reserve.c), else a memfd of this run's mapped on 2 MB and touched
+           ahead. A memfd is shmem, never written back to storage, which is what pinning a file's pages risked. Graphics
+           that map a file on storage (Vulkan, applegfx) stay off; reims takes the memfd. */
+        if (!strcmp(gpu, "vulkan") || !strcmp(gpu, "applegfx")) {
+            fprintf(stderr, "hengevm: Graphics %s needs the JIT engine (it maps the Mac's RAM from storage); using GPU instead\n", gpu);
             gpu = "on";
         }
-        setenv("HV_RAM_FILE", "", 1);
-        fprintf(stderr, "hengevm: engine: Gunyah (experimental), %d CPUs\n", vc.ncpus);
+        setenv("HV_RAM_RESERVE", "1", 1);
+        setenv("HV_RAM_MEMFD", "1", 1);
+        setenv("HV_RAM_THP", "2", 1);
+        if (!getenv("HV_RAM_FILE") || !*getenv("HV_RAM_FILE")) setenv("HV_RAM_FILE", "memfd", 1);
+        fprintf(stderr, "hengevm: engine: Gunyah from the jump into the kernel (experimental), %d CPUs; Henge's CPUs until then\n", vc.ncpus);
     }
     if (!install_dir && access(vc.rom, R_OK) != 0) { /* a Mac whose boot ROM went missing: put it back */
         curl_global_init_all();
@@ -884,14 +886,21 @@ int main(int argc, char **argv) {
     signal(SIGUSR1, resume_file ? on_save_signal : on_signal); /* without Instant resume, a stop like SIGTERM's */
     fprintf(stderr, "hengevm: %d CPUs, %llu MB, network %s, sound %s\n", hv_vm_ncpus(),
             (unsigned long long)vc.ram_mb, vc.no_net ? "off" : "on (NAT)", vc.no_sound ? "off" : "on");
-    if (!gunyah) {
-        /* CPUs 1 and up need their own threads (parked until PSCI CPU_ON) and the 1 ms kicker. Without them
-           XNU's CPU_ON for cpu1 waits forever for a thread that was never started: cpu0 stuck, +0 blocks. */
-        hv_vm_start(0, NULL);
-        hv_vm_cpu_qos(); /* this thread runs CPU 0: its own signal stack, like the others */
-    }
+    /* CPUs 1 and up need their own threads (parked until PSCI CPU_ON) and the 1 ms kicker. Without them
+       XNU's CPU_ON for cpu1 waits forever for a thread that was never started: cpu0 stuck, +0 blocks. */
+    hv_vm_start(0, NULL);
+    hv_vm_cpu_qos(); /* this thread runs CPU 0: its own signal stack, like the others */
     if (resumed) hv_vm_link_flap(); /* its network renewed, as after a Mac's sleep */
-    int reason = gunyah ? hv_gunyah_run() : hv_vm_run_cpu0();
+    if (gunyah) hv_vm_set_handover(getenv("HV_GUNYAH_AT") ? atoi(getenv("HV_GUNYAH_AT")) : 3);
+    int reason = hv_vm_run_cpu0();
+    while (gunyah && atomic_load(&hv_vm_cpu(0)->halted) == HV_HALT_HANDOVER) {
+        hv_vm_end_jit();
+        reason = hv_gunyah_run();
+        if (reason != HV_GUNYAH_NOT_STARTED) break;
+        fprintf(stderr, "hengevm: the Mac goes on with Henge's CPUs (the hand-over did not happen: see above)\n");
+        hv_vm_resume_jit();
+        reason = hv_vm_run_cpu0();
+    }
     if (!gunyah && resume_file && atomic_load(&hv_vm_cpu(0)->halted) == HV_HALT_SAVE) {
         /* Stopped to be saved: CPU 0 is this thread, so the pause is finished here, then the saver writes it. */
         if (hv_vm_finish_pause() == 0) {

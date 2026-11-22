@@ -169,29 +169,78 @@ static void board_poll(void) {
     if (net_on) hv_net_poll();
 }
 
-/* Gunyah hand-over (host/gunyah.c): Gunyah will not give a VM memory below its base, and the Mac's boot ROM and
-   config window are at 0x100000 and 0x400000. So the plan is Henge's own CPUs for the ROM and iBoot, and Gunyah's
-   from the point the Mac no longer needs either. That point is found here: each time a CPU turns its MMU off (iBoot
-   does to start the next stage, and to jump into the kernel, x0 = the kernel's boot_args), and every use of
-   memory below the Mac's RAM after the first (core/mmu.c, low_note). */
+/* Gunyah hand-over (host/gunyah.c): Gunyah will not give a VM memory at the bottom of its address space, where the
+   Mac's boot ROM (0x100000) and config window (0x400000) are. So Henge's own CPUs run the ROM and iBoot, and
+   Gunyah's take over at iBoot's jump into the kernel. iBoot turns the MMU off before each jump: AVPBooter's loader
+   to iBootStage1, iBootStage1 to iBootStage2, iBootStage2 to the kernel (the tablet, 0.3.74: pc 0x70048014, then
+   0xaca00044 twice). Each such moment on CPU 0 is a stage here; memory below the Mac's RAM a stage uses is logged
+   (core/mmu.c calls on_low), which shows what Gunyah could not give. hv_vm_set_handover(n): stop the CPUs at the
+   n-th (HV_HALT_HANDOVER) for gunyah.c to go on from there. */
+static int handover_at;
+static _Atomic int mmu_stage;
+static pthread_mutex_t low_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t low_pages[64];
+static int nlow, low_lines;
+
+void hv_vm_set_handover(int stage) { handover_at = stage; }
+
+static void on_low(HvCpu *cpu, uint64_t va, int el, uint64_t pa, int rwx) {
+    int ram = 0;
+    for (int i = 0; i < m.nram; i++)
+        if (pa >= m.ram[i].pa && pa < m.ram[i].pa + m.ram[i].size) ram = 1;
+    if (!ram) return; /* a device: Gunyah sends those to Henge anyway */
+    uint64_t pg = pa >> 14;
+    pthread_mutex_lock(&low_mu);
+    int seen = 0;
+    for (int i = 0; i < nlow; i++) seen |= low_pages[i] == pg;
+    if (!seen && nlow < 64) low_pages[nlow++] = pg;
+    int say = !seen && low_lines < 24;
+    if (say) low_lines++;
+    pthread_mutex_unlock(&low_mu);
+    if (say)
+        fprintf(stderr, "hengevm: gunyah hand-over: stage %d: CPU %u uses memory at pa 0x%llx (va 0x%llx, EL%d, %s%s%s, pc 0x%llx)\n",
+                atomic_load(&mmu_stage), cpu->index, (unsigned long long)pa, (unsigned long long)va, el, rwx & 4 ? "r" : "",
+                rwx & 2 ? "w" : "", rwx & 1 ? "x" : "", (unsigned long long)cpu->pc);
+}
+
 static void on_mmu_off(HvCpu *cpu) {
-    static _Atomic int seen;
-    int n = atomic_fetch_add(&seen, 1);
-    if (n >= 8) return;
-    const uint8_t *ba = hv_phys_ptr(&m, cpu->x[0], 64);
-    uint16_t rev = 0, ver = 0;
-    uint64_t virt = 0, phys = 0, size = 0;
-    if (ba) memcpy(&rev, ba, 2), memcpy(&ver, ba + 2, 2), memcpy(&virt, ba + 8, 8), memcpy(&phys, ba + 16, 8), memcpy(&size, ba + 24, 8);
-    int xnu = ba && (virt >> 40) >= 0xfffe00 && phys >= VMAPPLE_MEM && phys < VMAPPLE_MEM + board.ram_size && size && size <= board.ram_size;
-    fprintf(stderr, "hengevm: gunyah hand-over: CPU %u turns its MMU off at pc 0x%llx (EL%d), x0 0x%llx x1 0x%llx x2 0x%llx x3 0x%llx, "
-            "sp 0x%llx%s\n", cpu->index, (unsigned long long)cpu->pc, cpu->el, (unsigned long long)cpu->x[0],
-            (unsigned long long)cpu->x[1], (unsigned long long)cpu->x[2], (unsigned long long)cpu->x[3], (unsigned long long)cpu->sp,
-            n ? "" : "; from here, memory below the Mac's RAM that is used is logged");
-    if (xnu)
-        fprintf(stderr, "hengevm: gunyah hand-over:   x0 is the kernel's boot_args (revision %u, version %u, virtual base 0x%llx, "
-                "physical base 0x%llx, memory 0x%llx): this is the jump into the kernel\n", rev, ver, (unsigned long long)virt,
-                (unsigned long long)phys, (unsigned long long)size);
-    if (cpu->pc >= VMAPPLE_MEM && !m.low_watch) m.low_watch = VMAPPLE_MEM;
+    if (cpu->index != 0 || cpu->pc < VMAPPLE_MEM) return;
+    int n = atomic_fetch_add(&mmu_stage, 1) + 1;
+    pthread_mutex_lock(&low_mu);
+    nlow = 0, low_lines = 0;
+    pthread_mutex_unlock(&low_mu);
+    m.low_watch = VMAPPLE_MEM;
+    if (n <= 8)
+        fprintf(stderr, "hengevm: gunyah hand-over: stage %d: CPU 0 turns its MMU off at pc 0x%llx (EL%d), x0 0x%llx x1 0x%llx%s\n", n,
+                (unsigned long long)cpu->pc, cpu->el, (unsigned long long)cpu->x[0], (unsigned long long)cpu->x[1],
+                n == 1 ? " (the boot ROM's loader starting iBootStage1)" : n == 2 ? " (iBootStage1 starting iBootStage2)"
+                : n == 3 ? " (iBootStage2 jumping into the kernel)" : "");
+    if (!handover_at || n != handover_at) return;
+    int others = 0;
+    for (int i = 1; i < ncpus; i++) others += !cpus[i].off;
+    if (cpu->el != 1 || others) {
+        fprintf(stderr, "hengevm: gunyah hand-over: not here (EL%d, %d other CPUs on): the Mac goes on with Henge's CPUs\n", cpu->el, others);
+        return;
+    }
+    fprintf(stderr, "hengevm: gunyah hand-over: CPU 0 stops here for Gunyah\n");
+    hv_machine_halt(&m, HV_HALT_HANDOVER);
+}
+
+/* After hv_vm_run_cpu0 returned for the hand-over (CPU 0's own thread): the other CPUs' threads and the kicker end. */
+void hv_vm_end_jit(void) {
+    atomic_store(&kicker_stopped, 1);
+    for (int i = 1; i < ncpus; i++)
+        if (secondary_started[i]) pthread_join(secondary_threads[i], NULL);
+    if (kicker_started) pthread_join(kicker, NULL);
+    kicker_started = 0;
+    memset(secondary_started, 0, sizeof secondary_started);
+}
+
+/* The hand-over did not happen (gunyah.c failed before starting its VM): Henge's CPUs go on where they stopped. */
+void hv_vm_resume_jit(void) {
+    handover_at = 0;
+    for (int i = 0; i < ncpus; i++) atomic_store(&cpus[i].halted, HV_HALT_NONE);
+    hv_vm_start(0, exit_cb);
 }
 
 static int fail(char *err, size_t n, const char *msg) {
@@ -357,8 +406,9 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     int r = c->jit_rx ? hv_machine_init_jit(&m, c->jit_rx, c->jit_rw, jit) : hv_machine_init(&m, jit);
     if (r != 0) return fail(err, errlen, "Cannot set up the JIT region.");
     m.log = c->log;
-    m.on_mmu_off = on_mmu_off;
-    m.low_watch = 0, m.low_logged = 0;
+    m.on_mmu_off = on_mmu_off, m.on_low = on_low;
+    m.low_watch = 0;
+    atomic_store(&mmu_stage, 0);
     m.gen_checks = getenv("HV_JIT_POISON") != NULL;
     if (getenv("HV_SLOW_MEM")) m.slow_mem = 1; /* debugging: every load and store through the helper */
     ncpus = c->ncpus < 1 ? 1 : c->ncpus > HV_MAX_CPUS ? HV_MAX_CPUS : c->ncpus;
@@ -469,6 +519,7 @@ __attribute__((weak)) void hv_host_cpu_thread(void) {}
 /* The guest CPU the calling thread runs, for that: set by a secondary's thread before it asks. */
 static __thread int this_cpu;
 int hv_vm_this_cpu(void) { return this_cpu; }
+void hv_vm_set_this_cpu(int i) { this_cpu = i; } /* a thread running a CPU elsewhere (gunyah.c's vCPUs) */
 
 /* iOS parks default-QoS threads on efficiency cores readily; the guest's CPUs are what the user waits on. */
 void hv_vm_cpu_qos(void) {

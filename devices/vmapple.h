@@ -73,6 +73,7 @@ typedef struct HvVmapple {
     uint8_t *cfg, *rom, *ram;
     uint64_t ram_size;
     int ram_fd;              /* the file under guest RAM, kept open for the balloon's holes, or -1 */
+    int ram_reserved;        /* ram_fd is henge-reserve's memory (Gunyah): pinned in 2 MB pages, never given back */
     uint64_t panic_events;   /* last pvpanic event the guest reported */
     void *ctrr, *sealed;
     pthread_t prefault_thread;

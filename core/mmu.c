@@ -626,17 +626,10 @@ void hv_kva_hist_dump(FILE *f) {
         if (kva_fills[g]) fprintf(f, "kva gb %d fills %llu pages %llu\n", g, (unsigned long long)kva_fills[g], (unsigned long long)kva_pages_n[g]);
 }
 
-static void low_note(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
-    HvMachine *m = cpu->m;
-    if (__atomic_fetch_add(&m->low_logged, 1, __ATOMIC_RELAXED) >= 40) return;
-    fprintf(stderr, "hengevm: gunyah hand-over: CPU %u uses pa 0x%llx below 0x%llx after it (va 0x%llx, EL%d, %s%s%s, pc 0x%llx)\n",
-            cpu->index, (unsigned long long)w->pa, (unsigned long long)m->low_watch, (unsigned long long)va, el,
-            w->r ? "r" : "", w->w ? "w" : "", w->x ? "x" : "", (unsigned long long)cpu->pc);
-}
-
 static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
     if ((va >> 55) & 1) kva_note(va & ~(uint64_t)PAGE_MASK);
-    if (__builtin_expect(w->pa < cpu->m->low_watch, 0)) low_note(cpu, va, el, w);
+    if (__builtin_expect(w->pa < cpu->m->low_watch, 0) && cpu->m->on_low)
+        cpu->m->on_low(cpu, va, el, w->pa, (w->r ? 4 : 0) | (w->w ? 2 : 0) | (w->x ? 1 : 0));
     if (w->block_size < (1ull << HV_TLB_PAGE_BITS)) return; /* smaller guest pages: slow path only */
     HvRam *ram = ram_of(cpu->m, w->pa);
     if (!ram) return;

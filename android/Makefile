@@ -92,9 +92,15 @@ $(B)/seccomp_compat.o: android/seccomp_compat.c | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(B)/runner.o: android/runner.c android/*.h host/vm.h | $(B)
 	$(CC) $(CFLAGS) -I$(DEPS)/include -c $< -o $@
+# The Gunyah hand-over's first code in the VM (host/gunyah.c copies it there).
+$(B)/gunyah_shim.o: host/gunyah_shim.S | $(B)
+	$(CC) $(ASFLAGS) -c $< -o $@
 # Root-only check of the tablet's Gunyah hypervisor (the app's device check runs it through su).
 $(B)/gunyah-probe: android/tools/gunyah_probe.c android/tools/gunyah_probe_blobs.h | $(B)
 	$(CC) $(TARGET) -O2 -Iandroid/tools $< $(STATIC) -o $@
+# Root-only: holds the Mac's RAM for Gunyah in 2 MB pages (the henge-gunyah Magisk module starts it at boot).
+$(B)/henge-reserve: android/tools/henge_reserve.c | $(B)
+	$(CC) $(TARGET) -O2 $< $(STATIC) -o $@
 $(B)/libhengerestore.a: android/build_restore.sh host/install.c host/libusb_shim.c
 	DEPS=$(DEPS) android/build_restore.sh
 RESTORE_LIBS = $(B)/libhengerestore.a $(DEPS)/libzip/lib/libzip.a -L$(DEPS)/lib -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz
@@ -102,7 +108,7 @@ $(B)/lz4.o: third_party/lz4/lz4.c third_party/lz4/lz4.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(B)/snapshot.o: host/snapshot.c host/*.h android/compat/compression.h android/compat/dispatch/dispatch.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
-$(B)/hengevm-android: $(B)/seccomp_compat.o $(B)/runner.o $(B)/gunyah.o $(B)/snapshot.o $(B)/lz4.o $(B)/dt_fixup.o $(B)/share.o $(B)/pvg_reims.o $(B)/pvg_applegfx.o $(APPLEGFX_LIB) $(B)/curl_android.o $(B)/fetch.o $(LZFSE_OBJ) $(B)/vm.o $(B)/usb_host.o $(B)/net_slirp.o $(B)/vnc.o $(B)/audio_android.o $(B)/host_stubs.o $(B)/libhengevm.a $(B)/libhengerestore.a
+$(B)/hengevm-android: $(B)/seccomp_compat.o $(B)/runner.o $(B)/gunyah.o $(B)/gunyah_shim.o $(B)/snapshot.o $(B)/lz4.o $(B)/dt_fixup.o $(B)/share.o $(B)/pvg_reims.o $(B)/pvg_applegfx.o $(APPLEGFX_LIB) $(B)/curl_android.o $(B)/fetch.o $(LZFSE_OBJ) $(B)/vm.o $(B)/usb_host.o $(B)/net_slirp.o $(B)/vnc.o $(B)/audio_android.o $(B)/host_stubs.o $(B)/libhengevm.a $(B)/libhengerestore.a
 	$(CC) $(CFLAGS) $(filter-out $(B)/libhengerestore.a,$^) $(RESTORE_LIBS) $(SLIRP_LIBS) $(LIBS) $(APPLEGFX_VK_LIBS) -Wl,--wrap=curl_easy_init -o $@
 	python3 android/nosyscall.py $@
 

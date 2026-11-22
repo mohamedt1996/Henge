@@ -48,15 +48,16 @@ final class GunyahTest {
             {"Share 4 MB into the running VM (needs DroidVM's gunyah-host-share module)", "--lend --share-window 4", "10", "info"},
             {"Share 64 MB at the Mac's layout (base 0x70000000)", "--lend --base 70000000 --gic 10000000 --image-mb 16 --share-window 64", "15", "info"},
             {"Share 512 MB (may reset the tablet)", "--lend --base 70000000 --gic 10000000 --image-mb 16 --share-window 512", "40", "info"},
-            // 0.3.74: the boot ROM's place (below the base) and a base of 0 are both refused, so Henge runs the ROM and
-            // iBoot itself and hands the CPUs to Gunyah after. Where the VM's own first region can go, and whether the
-            // Mac's RAM can be had in 2 MB pages:
-            {"Memory below the base, but high (base 0x80000000, 64 MB at 0x72000000)", "--lend --base 80000000 --image-mb 2 --gic 10000000 --share-window 64 --window-at 72000000", "15", "info"},
-            {"Base just under the Mac's RAM (0x6fe00000), 64 MB at 0x70000000", "--lend --base 6fe00000 --image-mb 2 --gic 10000000 --share-window 64 --window-at 70000000", "15", "info"},
-            {"2 GB in 2 MB pages (made only, not shared)", "--share-window 2048 --window-at 70000000 --window-only", "60", "info"},
-            {"3 GB in 2 MB pages (made only, not shared)", "--share-window 3072 --window-at 70000000 --window-only", "80", "info"},
+            // 0.3.74/0.3.75: Henge runs the boot ROM and iBoot itself and hands the CPUs to Gunyah at the jump into the
+            // kernel (base 0x6fe00000 and memory at 0x70000000 work). Steps 7 and 9 also say whether PAC instructions
+            // run and whether every vCPU signs alike. Can the Mac's RAM be had in 2 MB pages (harder compaction now;
+            // with the reserve on, it holds that memory already):
+            {"2 GB in 2 MB pages (made only, not shared)", "--share-window 2048 --window-at 70000000 --window-only", "90", "info"},
+            {"3 GB in 2 MB pages (made only, not shared)", "--share-window 3072 --window-at 70000000 --window-only", "120", "info"},
+            // Optional: whether 4 KB pages are safe in a small amount (64 MB of them reset the tablet in 0.3.71).
+            {"Optional: share 8 MB in 4 KB pages (may reset the tablet)", "--lend --base 70000000 --gic 10000000 --image-mb 16 --share-window 8 --window-4k", "15", "info"},
     };
-    private static final int VERSION = 13; // of STEPS: progress saved by another list starts over
+    private static final int VERSION = 14; // of STEPS: progress saved by another list starts over
 
     static volatile boolean running;
 

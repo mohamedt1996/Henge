@@ -60,6 +60,7 @@
                      resource manager takes one memory region at a VM's creation; this is how the rest gets in.
      --window-at ADDR  where the guest accepts it (hex; default: 16 MB past the first region)
      --window-only   only make the window and count its 2 MB pages (how much of the Mac's RAM Gunyah could take)
+     --window-4k     the window in 4 KB pages, shared as such (a small one: whether 4 KB pages are safe in small amounts)
      --tree-only F   no VM: the tree this run would give, written to F
      --kmsg FILE     the kernel's messages from now on copied to FILE, each forced to storage as it comes:
                      what the kernel said last before a reset
@@ -174,7 +175,7 @@ static int ram_how = RAM_SHM;
 static uint64_t size_max_mb;
 static int shm_alloc, ram_rw, rm_rpc, rm_call;
 static uint64_t window_mb, window_at = ~0ull, window_handle;
-static int window_only; /* --window-only: make the window and say how much of it is in 2 MB pages, nothing more */
+static int window_only, window_4k; /* --window-4k: the window in 4 KB pages (0.3.75: are small ones safe in small amounts?) */ /* --window-only: make the window and say how much of it is in 2 MB pages, nothing more */
 static int window_small_ok; /* --share-small-pages: share a window that is not in 2 MB pages */
 
 static void put_file(const char *f, const char *v) { int fd = open(f, O_WRONLY | O_CLOEXEC); if (fd >= 0) { ssize_t r = write(fd, v, strlen(v)); (void)r; close(fd); } }
@@ -198,9 +199,16 @@ static uint64_t huge_mb(void *p, uint64_t len) {
    parcel is built from the window's folios, one entry each, and one of 4 KB pages is 256 entries a megabyte (the
    64 MB window of 0.3.71's step 11 was 16384, and the tablet reset sharing it). Caches dropped and memory compacted,
    shmem huge pages on advice, then populated, collapsed 2 MB at a time, and pinned. */
+static uint64_t huge_mb(void *p, uint64_t len);
 static uint8_t *window_make(uint64_t size) {
     put_file("/sys/kernel/mm/transparent_hugepage/shmem_enabled", "advise");
     put_file("/sys/kernel/mm/transparent_hugepage/enabled", "madvise");
+    /* 0.3.75: the kernel made to work harder for 2 MB runs: compaction on a fault in advised memory, kept up in the
+       background, and preferred to reclaim when memory is cut up (the tablet gave 186 of 2048 MB without). */
+    put_file("/sys/kernel/mm/transparent_hugepage/defrag", "madvise");
+    put_file("/sys/kernel/mm/transparent_hugepage/khugepaged/defrag", "1");
+    put_file("/proc/sys/vm/compaction_proactiveness", "100");
+    put_file("/proc/sys/vm/extfrag_threshold", "100");
     put_file("/proc/sys/vm/drop_caches", "3");
     put_file("/proc/sys/vm/compact_memory", "1");
     int fd = memfd_create("gunyah-window", MFD_CLOEXEC);
@@ -211,9 +219,25 @@ static uint8_t *window_make(uint64_t size) {
     uint8_t *at = (uint8_t *)(((uintptr_t)res + two - 1) & ~(uintptr_t)(two - 1));
     uint8_t *w = mmap(at, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
     if (w == MAP_FAILED) return NULL;
+    if (window_4k) {
+        madvise(w, size, MADV_NOHUGEPAGE);
+        if (madvise(w, size, 23 /* MADV_POPULATE_WRITE */) < 0) memset(w, 0, size);
+        mlock(w, size);
+        return w;
+    }
     madvise(w, size, MADV_HUGEPAGE);
-    if (madvise(w, size, 23 /* MADV_POPULATE_WRITE */) < 0) memset(w, 0, size);
-    for (uint64_t o = 0; o < size; o += two) madvise(w + o, size - o < two ? size - o : two, 25 /* MADV_COLLAPSE */);
+    /* 2 MB at a time, each populated then collapsed, so a compaction's gains go to the next piece at once; then
+       up to three more passes over what is still small, memory compacted before each. */
+    for (uint64_t o = 0; o < size; o += two) {
+        uint64_t n = size - o < two ? size - o : two;
+        if (madvise(w + o, n, 23 /* MADV_POPULATE_WRITE */) < 0) memset(w + o, 0, n);
+        madvise(w + o, n, 25 /* MADV_COLLAPSE */);
+    }
+    for (int pass = 0; pass < 3 && huge_mb(w, size) * 100 < (size >> 20) * 99; pass++) {
+        put_file("/proc/sys/vm/drop_caches", "3");
+        put_file("/proc/sys/vm/compact_memory", "1");
+        for (uint64_t o = 0; o < size; o += two) madvise(w + o, size - o < two ? size - o : two, 25 /* MADV_COLLAPSE */);
+    }
     mlock(w, size);
     return w;
 }
@@ -471,8 +495,8 @@ static size_t build_dtb(uint8_t *out, size_t cap, const Layout *L, int ncpus, in
 }
 
 /* ---- running ---- */
-static uint64_t rep[32];
-static unsigned seen;
+static uint64_t rep[64];
+static uint64_t seen;
 static uint64_t report_pa, poke_at;
 static uint64_t window_pa_seen; /* the window's address, as the handoff answers it */
 static int poked;
@@ -491,10 +515,10 @@ static int handle_exit(int cpu) {
     struct gh_vcpu_run *run = vrun[cpu];
     if (run->exit_reason == GH_VCPU_EXIT_MMIO) {
         uint64_t a = run->mmio.phys_addr, v = 0;
-        if (run->mmio.is_write && a >= report_pa && a < report_pa + 0x100) {
+        if (run->mmio.is_write && a >= report_pa && a < report_pa + 0x200) {
             memcpy(&v, run->mmio.data, run->mmio.len < 8 ? run->mmio.len : 8);
             unsigned i = (unsigned)((a - report_pa) / 8);
-            rep[i] = v, seen |= 1u << i;
+            rep[i] = v, seen |= 1ull << i;
             if (i == 15) return 1;
         } else if (!run->mmio.is_write) {
             memset(run->mmio.data, 0, sizeof run->mmio.data);
@@ -603,6 +627,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--share-window") && v) window_mb = strtoull(v, NULL, 10), rm_rpc = rm_call = 1, i++;
         else if (!strcmp(a, "--window-at") && v) window_at = strtoull(v, NULL, 16), i++;
         else if (!strcmp(a, "--window-only")) window_only = 1;
+        else if (!strcmp(a, "--window-4k")) window_4k = 1;
         else if (!strcmp(a, "--share-small-pages")) window_small_ok = 1;
         else if (!strcmp(a, "--bells")) bells = 1;
         else if (!v) { fprintf(stderr, "gunyah-probe: %s needs a value\n", a); return 2; }
@@ -721,7 +746,7 @@ int main(int argc, char **argv) {
             crumb("end: window only");
             return !ok;
         }
-        if (window_mb > 4 && hmb * 10 < window_mb * 9 && !window_small_ok) {
+        if (window_mb > 4 && hmb * 10 < window_mb * 9 && !window_small_ok && !window_4k) {
             /* Not shared: a parcel of 4 KB pages this big is what reset the tablet in 0.3.71. */
             printf("RESULT: FAIL the window is not in 2 MB pages (%llu of %llu MB), and sharing it so reset the tablet before: not shared\n",
                    (unsigned long long)hmb, (unsigned long long)window_mb);
@@ -856,7 +881,7 @@ int main(int argc, char **argv) {
     printf("guest ran: %d exits%s\n", vexits[0], timed_out ? ", stopped after the time allowed" : "");
     crumb("ok: the guest ran (%d exits%s)", vexits[0], timed_out ? ", out of time" : "");
 
-#define HAVE(i) (seen & (1u << (i)))
+#define HAVE(i) (seen & (1ull << (i)))
     if (HAVE(0)) printf("MIDR                   %#llx\n", (unsigned long long)rep[0]);
     if (HAVE(1)) {
         unsigned tg16 = (unsigned)(rep[1] >> 20) & 0xf;
@@ -868,6 +893,29 @@ int main(int argc, char **argv) {
     if (HAVE(5)) printf("SMCCC OEM UID          %s\n", hvc_result(rep[5]));
     if (HAVE(6)) printf("PSCI version           %#llx\n", (unsigned long long)rep[6]);
     if (HAVE(7)) printf("PFR0                   %#llx\n", (unsigned long long)rep[7]);
+    if (HAVE(40)) printf("MPIDR                  %#llx\n", (unsigned long long)rep[40]);
+    if (HAVE(29)) { /* 0.3.75: pointer authentication, which macOS's kernel and arm64e programs need */
+        if (!rep[29]) printf("PAC instructions       TRAP (ESR %#llx): Gunyah does not let the guest run them\n", (unsigned long long)rep[30]);
+        else printf("PAC instructions       RUN: PACIA of 0x12345678 gives %#llx (%s)\n", (unsigned long long)rep[31],
+                    rep[31] == 0x12345678ull ? "unchanged: no key signs" : "signed: the CPU's keys are in use");
+        if (HAVE(35)) printf("  SCTLR, enables set   %#llx\n", (unsigned long long)rep[35]);
+        if (HAVE(42)) printf("  key read (APIAKeyLo) %s\n", rep[42] ? "ran" : "TRAPS");
+        if (HAVE(42) && rep[42]) printf("  APIAKeyLo            %#llx\n", (unsigned long long)rep[41]);
+        if (rep[29] && HAVE(36)) {
+            int same = 1;
+            printf("  each CPU's PACIA     ");
+            for (int c = 0; c < ncpus && c < 4; c++) {
+                printf("%s%#llx", c ? ", " : "", (unsigned long long)rep[36 + c]);
+                if (rep[36 + c] != rep[36]) same = 0;
+            }
+            printf("%s\n", ncpus < 2 ? "" : same ? " (the SAME keys on every vCPU)" : " (DIFFERENT keys: the Mac's threads would fail moving between CPUs)");
+        }
+        if (HAVE(32)) printf("  key write (EL1)      %s", rep[32] ? "ran" : "TRAPS");
+        if (HAVE(32) && !rep[32]) printf(" (ESR %#llx)", (unsigned long long)rep[33]);
+        if (HAVE(32)) printf("\n");
+        if (HAVE(34) && HAVE(32) && rep[32]) printf("  PACIA after it        %#llx (%s)\n", (unsigned long long)rep[34],
+                                                   rep[34] != rep[31] ? "the key took" : "no change");
+    }
     if (HAVE(8)) printf("guest exception        ESR %#llx at %#llx\n", (unsigned long long)rep[8], (unsigned long long)rep[9]);
     if (poke) printf("store at %#llx        %s\n", (unsigned long long)poke,
                      poked ? "came out to this program, as a device's must" : HAVE(14) ? "did NOT come out: it went to memory, or nowhere"

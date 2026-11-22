@@ -1,40 +1,31 @@
-/* The virtual Mac's CPUs on Gunyah (see gunyah.h). Linux/Android only.
+/* The virtual Mac's CPUs on Gunyah, from the jump into the kernel on (see gunyah.h). Linux/Android only.
 
-   How the vmapple machine is laid onto a Gunyah VM:
-   - Memory: every RAM range the machine has (boot ROM at 0x100000, the config window, guest RAM at 0x70000000)
-     is shared with the VM at the same address. Henge keeps its own mapping, so its devices DMA as before.
-     Gunyah's resource manager is not told the addresses the kernel is given: by itself it places only the
-     region that holds the tree, at the tree's base-address, and keeps everything below that address for
-     devices. So the base address is 0 (the boot region, below the ROM), and every other piece is named in the
-     tree with its label and its address: a `shm` device each (HV_GUNYAH_RAM=resmem: a /reserved-memory node
-     each; =plain: not named). Which of these the tablet's resource manager takes is what the app's Gunyah test
-     finds (android/tools/gunyah_probe.c has the rules, from Qualcomm's source); the app passes what it found.
-   - Boot: Gunyah starts an unauthenticated VM at the base of the memory region that holds its device tree, with
-     x0 = the tree. That region (BOOT_PA) starts with a five-instruction trampoline to the boot ROM, so AVPBooter
-     starts as on Apple's hypervisor: EL1, MMU off, x0-x3 zero. HV_GUNYAH_LEND_BOOT=1 lends that region to
-     the VM (the resource manager of 2023 takes a VM's first region only as the VM's own); Henge never
-     touches it after the start.
-   - The device tree here is only for Gunyah's resource manager (gunyah-vm-config: vCPUs, the GIC, doorbells);
-     the Mac never reads it (iBoot builds the kernel's device tree from the config device, as always). The
-     resource manager fails a tree with a memory node not named exactly `memory`, or with no /chosen, and
-     writes the tree back with its own nodes added: the tree's region is all of the boot region after it.
-   - GIC and timer: Gunyah's virtual GICv3, placed at vmapple's addresses, and the CPU's own virtual timer.
-     Henge's emulated GIC is left in place but unused; its MMIO never exits here unless Gunyah put its GIC
-     elsewhere, which this logs.
-   - Device interrupts: one Gunyah doorbell (irqfd) per vmapple SPI, raised from Henge's GIC entry points through
-     hv_gic_external. Level lines are re-raised while the device still holds them.
-   - MMIO: each exit goes to hv_phys_read/hv_phys_write, Henge's device dispatch, under the same device lock.
-   - Devices: a thread runs the machine's tick (virtio queues, USB, network, display) every millisecond and
-     right after any MMIO write.
-   - Paravirtualized PAC: vmapple's XNU asks Apple's hypervisor to program PAC keys (hvc #0 with x0 =
-     0xc100000x, then `cbnz x0, .`). Gunyah answers those itself with NOT_SUPPORTED, and the guest would spin
-     there forever. A scanner rewrites each `hvc #0; cbnz x0, .` pair it finds in guest memory to
-     `mov x0, #0; nop` (and makes the CPU see it): the keys stay at their reset values, which every process then
-     shares, which is what Henge's JIT does as well.
-   - vCPUs: one per Henge CPU, each run by its own host thread (the VM's vCPUs are "proxy" scheduled: a vCPU runs
-     only while a thread sits in GH_VCPU_RUN for it). The resource manager's tree lists cpu@0..N with reg = i, the
-     same Aff0 values vmapple's config gives XNU, and Gunyah itself answers the guest's PSCI (method hvc): a
-     secondary's GH_VCPU_RUN returns to guest code once the kernel's CPU_ON powers it on. */
+   Why a hand-over: Gunyah's resource manager on the tablet (Xiaomi Pad 7, SM8635, android14-6.1) gives a VM no
+   memory at the bottom of its address space: a VM based at 0 is refused when it starts, and memory shared at the boot
+   ROM's place (0x100000) is refused when the guest accepts it (the app's Gunyah test, 0.3.73). The Mac's boot ROM and
+   config window live there. So Henge's own CPUs run the ROM and iBoot as always, and at iBoot's jump into the kernel
+   (the third time CPU 0 turns its MMU off in RAM, host/vm.c) CPU 0 stops and this goes on from the same state:
+
+   - The VM: its own 2 MB region at BOOT_PA, just under the Mac's RAM (lent: the shim and the resource manager's
+     device tree), the Mac's RAM shared into it after it starts through DroidVM's /dev/gunyah_share (the
+     gunyah-host-share module) in 2 MB pages, and accepted by the guest itself (host/gunyah_shim.S). Both work on the
+     tablet (0.3.72-0.3.74); a parcel of 4 KB pages reset it, so the RAM must be all in 2 MB pages (henge-reserve
+     holds it so, android/tools/henge_reserve.c).
+   - The shim loads CPU 0's state from the hand-over page (HANDOFF_PA: reads there come back here) and returns to the
+     Mac where the JIT stopped. Nothing below 0x70000000 is the VM's memory: the ROM and the config window are not
+     used past this point (0.3.75's log says whether anything still reads them; each read would come here as an MMIO
+     exit and be answered from Henge's copy, which works for single loads only).
+   - Before the start, the kernel (the kernel collection iBoot loaded, found from boot_args) is made to run on a
+     Qualcomm CPU: Apple's implementation-defined registers (op0 3, CRn 11 and 15) read as 0 and ignore writes, as
+     Henge's JIT has them; MIDR_EL1 reads Apple's value the JIT gives (a branch to a stub in the padding at the end of
+     the code); vmapple's PAC hypercalls answer success (as before). The kernel's device tree gets the CPU's own counter
+     rate as its timebase-frequency (19.2 MHz here, where the JIT counts 24).
+   - GIC and timer: Gunyah's virtual GICv3 at vmapple's addresses, the CPU's own virtual timer. Device interrupts: one
+     Gunyah doorbell (irqfd) per vmapple SPI, raised from Henge's GIC entry points through hv_gic_external.
+   - MMIO: each exit goes to hv_phys_read/hv_phys_write, Henge's device dispatch, under the same device lock; a thread
+     runs the machine's tick (virtio queues, USB, network, display) every millisecond and after any MMIO write.
+   - vCPUs: one per Henge CPU, each run by its own host thread on the core the JIT gave that CPU; Gunyah answers the
+     guest's PSCI, so XNU's CPU_ON brings the others up itself. */
 #include "gunyah.h"
 
 #include <errno.h>
@@ -90,15 +81,24 @@ struct gh_vcpu_run {
     };
 };
 
-#define BOOT_PA 0x00000000ull   /* trampoline + the VM's device tree: the megabyte below vmapple's boot ROM */
-#define BOOT_SIZE 0x100000ull
-#define DTB_OFF 0x1000ull
-#define MAX_PIECES 96           /* 256 MB pieces of the machine's RAM ranges, halved where the kernel is short */
+/* DroidVM's gunyah_host_share module (Droid-VM/gunyah_host_mod, GKI6.1/uapi_gunyah_share.h, GPL-2.0). */
+struct ghsm_share_blob { int32_t vm_fd; uint32_t label, flags, mem_handle; uint64_t guest_phys_addr, memory_size, userspace_addr; };
+#define GHSM_SHARE_BLOB _IOWR(0x47, 0x14, struct ghsm_share_blob)
+
+#define BOOT_PA 0x6fe00000ull   /* the VM's own region: just under the Mac's RAM (the tablet takes it, 0.3.74) */
+#define BOOT_SIZE 0x200000ull
+#define DTB_OFF 0x10000ull
+#define HANDOFF_PA 0x6f000000ull /* a page with nothing behind it: the shim's reads and reports come here */
+#define SHARE_CHUNK (256ull << 20)
+#define MAX_PIECES 64
 #define SPI_LOW_FIRST 32        /* UART, RTC, GPIO, AES, graphics: INTIDs 33..63 */
 #define SPI_LOW_LAST 67         /* and PCIe INTx 64..67 */
 #define NIRQ 160
+#define APPLE_MIDR 0x611f0220ull /* what Henge's JIT answers (core/sysreg.c MIDR) */
 
 extern void (*hv_vm_stop_hook)(void);
+void hv_host_cpu_thread(void); /* the core this thread's CPU has (android/runner.c; a no-op elsewhere) */
+extern const uint8_t hv_gunyah_shim_start[], hv_gunyah_shim_end[], hv_gunyah_shim_params[];
 
 static HvMachine *M;
 static HvVmapple *B;
@@ -110,6 +110,9 @@ static pthread_t vcpu_thread_id[HV_MAX_CPUS];
 static volatile uint64_t mmio_exits[HV_MAX_CPUS];
 static int irq_fd[NIRQ];
 static volatile uint8_t irq_level[NIRQ];
+static uint64_t handoff[256];   /* the hand-over page's first half, as the shim reads it */
+static uint64_t shim_rep[256];  /* its reports */
+static volatile int mac_runs;   /* the shim jumped to the Mac */
 
 /* ---- a minimal flattened device tree writer ---- */
 
@@ -155,14 +158,10 @@ static int irq_wanted(int intid) {
 }
 static int irq_is_msi(int intid) { return intid >= VMAPPLE_MSI_BASE; }
 
-/* The pieces given to the VM beyond the boot region, as the tree names them. */
-static struct { uint32_t label; uint64_t pa, size; } piece[MAX_PIECES];
-static int npiece;
-enum { RAM_SHM, RAM_RESMEM, RAM_PLAIN };
-static int ram_how;
-
-/* The VM's configuration for Gunyah's resource manager, in the shape crosvm gives it. */
-static size_t build_dtb(uint8_t *out, size_t cap, int ncpus) {
+/* The VM's configuration for Gunyah's resource manager (as android/tools/gunyah_probe.c has it, which the tablet
+   takes): the VM's own region as its memory, room above it for the Mac's RAM (size-max), a channel to the resource
+   manager for the shim's MEM_ACCEPTs, the GIC at vmapple's addresses, a doorbell per interrupt line. */
+static size_t build_dtb(uint8_t *out, size_t cap, int ncpus, uint64_t size_max) {
     static Fdt f;
     memset(&f, 0, sizeof f);
     const uint32_t GIC = 1;
@@ -171,8 +170,7 @@ static size_t build_dtb(uint8_t *out, size_t cap, int ncpus) {
     prop_u32(&f, "#size-cells", 2);
     prop_str(&f, "compatible", "linux,dummy-virt");
     prop_u32(&f, "interrupt-parent", GIC);
-    /* One memory node, named `memory` and nothing more: the resource manager fails the tree for any other, and
-       replaces this one with what it gave the VM. */
+    /* One memory node, named `memory` and nothing more: the resource manager fails the tree for any other. */
     begin(&f, "memory");
     prop_str(&f, "device_type", "memory");
     uint32_t boot_reg[4] = {(uint32_t)(BOOT_PA >> 32), (uint32_t)BOOT_PA, 0, (uint32_t)BOOT_SIZE};
@@ -180,23 +178,6 @@ static size_t build_dtb(uint8_t *out, size_t cap, int ncpus) {
     end(&f);
     begin(&f, "chosen"); /* the resource manager adds to it, and refuses its changes whole if it is not there */
     end(&f);
-    if (ram_how == RAM_RESMEM && npiece) {
-        begin(&f, "reserved-memory");
-        prop_u32(&f, "#address-cells", 2);
-        prop_u32(&f, "#size-cells", 2);
-        prop(&f, "ranges", NULL, 0);
-        for (int i = 0; i < npiece; i++) {
-            char n[48];
-            snprintf(n, sizeof n, "henge@%llx", (unsigned long long)piece[i].pa);
-            begin(&f, n);
-            uint32_t reg[4] = {(uint32_t)(piece[i].pa >> 32), (uint32_t)piece[i].pa, (uint32_t)(piece[i].size >> 32),
-                               (uint32_t)piece[i].size};
-            prop_u32s(&f, "reg", reg, 4);
-            prop_u32(&f, "qcom,label", piece[i].label);
-            end(&f);
-        }
-        end(&f);
-    }
     begin(&f, "cpus");
     prop_u32(&f, "#address-cells", 1);
     prop_u32(&f, "#size-cells", 0);
@@ -239,6 +220,7 @@ static size_t build_dtb(uint8_t *out, size_t cap, int ncpus) {
     prop_u32(&f, "#size-cells", 2);
     uint32_t base[2] = {(uint32_t)(BOOT_PA >> 32), (uint32_t)BOOT_PA};
     prop_u32s(&f, "base-address", base, 2);
+    prop_u32(&f, "size-max", (uint32_t)size_max); /* one cell, as the probe's (the node above says none) */
     end(&f);
     begin(&f, "interrupts");
     prop_u32(&f, "config", GIC);
@@ -248,25 +230,14 @@ static size_t build_dtb(uint8_t *out, size_t cap, int ncpus) {
     end(&f);
     begin(&f, "vdevices");
     prop_str(&f, "generate", "/hypervisor");
-    for (int i = 0; ram_how == RAM_SHM && i < npiece; i++) {
-        /* Shared memory at an address of its own: the parcel of this label, placed at `base`. */
-        char n[32], path[48];
-        snprintf(n, sizeof n, "shm-%x", piece[i].label);
-        snprintf(path, sizeof path, "/hypervisor/shm-%x", piece[i].label);
-        begin(&f, n);
-        prop_str(&f, "vdevice-type", "shm");
-        prop_str(&f, "generate", path);
-        prop(&f, "peer-default", NULL, 0);
-        prop_u32(&f, "#address-cells", 2);
-        prop_u32(&f, "#size-cells", 2);
-        begin(&f, "memory");
-        prop_u32(&f, "qcom,label", piece[i].label);
-        prop_u32(&f, "label", piece[i].label);
-        uint32_t at[2] = {(uint32_t)(piece[i].pa >> 32), (uint32_t)piece[i].pa};
-        prop_u32s(&f, "base", at, 2);
-        end(&f);
-        end(&f);
-    }
+    begin(&f, "rm-rpc"); /* the guest's own channel to the resource manager: the shim's MEM_ACCEPTs */
+    prop_str(&f, "vdevice-type", "rm-rpc");
+    prop_str(&f, "generate", "/hypervisor/qcom,resource-mgr");
+    prop_u32(&f, "label", 0);
+    prop(&f, "console-dev", NULL, 0);
+    prop_u32(&f, "message-size", 240);
+    prop_u32(&f, "queue-depth", 8);
+    end(&f);
     for (int id = 0; id < NIRQ; id++) {
         if (!irq_wanted(id)) continue;
         char n[32], path[48];
@@ -347,14 +318,17 @@ static void pac_scan(void) {
 
 static void *pac_thread(void *arg) {
     (void)arg;
-    uint64_t reported = 0;
+    uint64_t reported = pac_patched;
     while (!stop_req) {
+        /* The kernel's own calls were rewritten before the start (kpatch); this is for code loaded later (the
+           auxiliary kernel collection), a pass over all of the Mac's RAM every 30 s. */
+        for (int i = 0; i < 300 && !stop_req; i++) usleep(100000);
+        if (stop_req) break;
         pac_scan();
         if (pac_patched != reported) {
             fprintf(stderr, "gunyah: %llu PAC hypercalls rewritten so far\n", (unsigned long long)pac_patched);
             reported = pac_patched;
         }
-        usleep(pac_patched ? 2000000 : 300000);
     }
     return NULL;
 }
@@ -382,6 +356,298 @@ static void kick_devices(void) {
     if (write(dev_kick, &one, sizeof one) < 0) { }
 }
 
+/* ---- the kernel, made to run on this CPU (before the VM starts) ---- */
+
+static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+static uint64_t rd64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
+
+/* boot_args, as iBoot left it for the kernel (vm.c's display scan checks the same fields): its RAM offset, or -1. */
+static int64_t find_boot_args(void) {
+    uint64_t limit = B->ram_size < (1ull << 30) ? B->ram_size : 1ull << 30;
+    for (uint64_t off = 0; off + 0x1000 <= limit; off += 0x4000) {
+        const uint8_t *p = B->ram + off;
+        uint16_t rev, ver;
+        memcpy(&rev, p, 2), memcpy(&ver, p + 2, 2);
+        if (rev < 2 || rev > 3 || ver < 1 || ver > 3) continue;
+        uint64_t virt = rd64(p + 8), phys = rd64(p + 16), mem = rd64(p + 24);
+        if (virt >> 40 != 0xfffffe || phys < VMAPPLE_MEM || phys >= VMAPPLE_MEM + B->ram_size || !mem || mem > B->ram_size) continue;
+        return (int64_t)off;
+    }
+    return -1;
+}
+
+static struct { uint64_t pa, size; } xr[64]; /* the kernel collection's code, by physical address */
+static int nxr;
+
+static void add_exec(uint64_t pa, uint64_t size) {
+    if (pa < VMAPPLE_MEM || pa >= VMAPPLE_MEM + B->ram_size) return;
+    if (size > VMAPPLE_MEM + B->ram_size - pa) size = VMAPPLE_MEM + B->ram_size - pa;
+    for (int i = 0; i < nxr; i++)
+        if (pa < xr[i].pa + xr[i].size && pa + size > xr[i].pa) return; /* already (a fileset entry's part of a segment) */
+    if (nxr < 64) xr[nxr].pa = pa, xr[nxr].size = size, nxr++;
+}
+
+/* A Mach-O header at hdr_pa whose __TEXT is at base_vm: its executable segments, and its fileset entries'. */
+static void exec_segments(uint64_t hdr_pa, uint64_t base_vm, int depth) {
+    const uint8_t *h = hv_phys_ptr(M, hdr_pa, 32);
+    if (!h || rd32(h) != 0xfeedfacfu) return;
+    uint32_t ncmds = rd32(h + 16), sizeofcmds = rd32(h + 20);
+    const uint8_t *lc = hv_phys_ptr(M, hdr_pa + 32, sizeofcmds);
+    if (!lc || sizeofcmds > (4u << 20)) return;
+    for (uint32_t i = 0, o = 0; i < ncmds && o + 8 <= sizeofcmds; i++) {
+        uint32_t cmd = rd32(lc + o), size = rd32(lc + o + 4);
+        if (size < 8 || o + size > sizeofcmds) break;
+        if (cmd == 0x19 && size >= 72) { /* LC_SEGMENT_64 */
+            uint64_t vmaddr = rd64(lc + o + 24), vmsize = rd64(lc + o + 32);
+            uint32_t initprot = rd32(lc + o + 60);
+            if ((initprot & 4) && vmsize && vmaddr >= base_vm) add_exec(hdr_pa + (vmaddr - base_vm), vmsize);
+        } else if (cmd == 0x80000035u && size >= 24 && depth == 0) { /* LC_FILESET_ENTRY */
+            uint64_t vmaddr = rd64(lc + o + 8);
+            if (vmaddr >= base_vm) exec_segments(hdr_pa + (vmaddr - base_vm), base_vm, 1);
+        }
+        o += size;
+    }
+}
+
+#define MOVZ_X(rt) (0xd2800000u | (rt))
+#define MOVK_X(rt, imm16, hw) (0xf2800000u | (uint32_t)(hw) << 21 | (uint32_t)(imm16) << 5 | (rt))
+#define MOVZ_XS(rt, imm16, hw) (0xd2800000u | (uint32_t)(hw) << 21 | (uint32_t)(imm16) << 5 | (rt))
+
+static uint32_t branch(uint64_t from, uint64_t to) { return 0x14000000u | (uint32_t)(((int64_t)(to - from) >> 2) & 0x3ffffff); }
+
+/* The patches. Returns 0, or -1 when the kernel was not found (the hand-over does not happen). */
+static int kpatch(void) {
+    int64_t ba = find_boot_args();
+    if (ba < 0) { fprintf(stderr, "gunyah: no boot_args in the Mac's RAM: this is not the jump into the kernel\n"); return -1; }
+    const uint8_t *b = B->ram + ba;
+    uint64_t virt = rd64(b + 8), phys = rd64(b + 16), top = rd64(b + 32), dtva = rd64(b + 96);
+    uint32_t dtlen = rd32(b + 104);
+    fprintf(stderr, "gunyah: boot_args at pa %#llx: kernel at virtual %#llx = physical %#llx, its data to %#llx, device tree "
+                    "at %#llx (%u bytes)\n", (unsigned long long)(VMAPPLE_MEM + (uint64_t)ba), (unsigned long long)virt,
+            (unsigned long long)phys, (unsigned long long)top, (unsigned long long)dtva, dtlen);
+    /* The kernel collection's header: the first arm64 Mach-O (a fileset, or a plain kernel) from physBase on. */
+    uint64_t hdr = 0;
+    for (uint64_t pa = phys & ~0x3fffull; pa < phys + (256ull << 20) && pa + 32 <= VMAPPLE_MEM + B->ram_size; pa += 0x4000) {
+        const uint8_t *h = hv_phys_ptr(M, pa, 32);
+        if (h && rd32(h) == 0xfeedfacfu && rd32(h + 4) == 0x0100000cu && (rd32(h + 12) == 12 || rd32(h + 12) == 2)) { hdr = pa; break; }
+    }
+    if (!hdr) { fprintf(stderr, "gunyah: the kernel's Mach-O header was not found past %#llx\n", (unsigned long long)phys); return -1; }
+    /* __TEXT (file offset 0) is where the header is: every segment's place follows from it. */
+    uint64_t base_vm = 0;
+    {
+        const uint8_t *h = hv_phys_ptr(M, hdr, 32);
+        uint32_t ncmds = rd32(h + 16), sizeofcmds = rd32(h + 20);
+        const uint8_t *lc = hv_phys_ptr(M, hdr + 32, sizeofcmds);
+        for (uint32_t i = 0, o = 0; lc && i < ncmds && o + 8 <= sizeofcmds; i++) {
+            uint32_t cmd = rd32(lc + o), size = rd32(lc + o + 4);
+            if (size < 8) break;
+            if (cmd == 0x19 && size >= 72 && rd64(lc + o + 40) == 0 && rd64(lc + o + 48)) { base_vm = rd64(lc + o + 24); break; }
+            o += size;
+        }
+    }
+    if (!base_vm) { fprintf(stderr, "gunyah: the kernel's __TEXT was not found\n"); return -1; }
+    exec_segments(hdr, base_vm, 0);
+    uint64_t code = 0;
+    for (int i = 0; i < nxr; i++) code += xr[i].size;
+    fprintf(stderr, "gunyah: kernel collection at pa %#llx (%s, __TEXT at %#llx): %d code ranges, %llu MB\n", (unsigned long long)hdr,
+            rd32(hv_phys_ptr(M, hdr, 32) + 12) == 12 ? "fileset" : "kernel", (unsigned long long)base_vm, nxr,
+            (unsigned long long)(code >> 20));
+
+    uint64_t impl_r = 0, impl_w = 0, midr = 0, midr_left = 0, pac = 0;
+    for (int r = 0; r < nxr; r++) {
+        uint32_t *w = hv_phys_ptr(M, xr[r].pa, xr[r].size);
+        if (!w) continue;
+        uint64_t n = xr[r].size / 4;
+        /* The stub pool: the zeros at the code's end (page padding), less a margin. */
+        uint64_t z = n;
+        while (z > 0 && w[z - 1] == 0) z--;
+        uint64_t pool = z + 16 < n ? z + 16 : n;
+        for (uint64_t i = 0; i < z; i++) {
+            uint32_t x = w[i];
+            if (x == HVC0 && i + 1 < n && w[i + 1] == CBNZ_X0_SELF) {
+                w[i] = MOV_X0_0, w[i + 1] = NOP, pac++;
+                continue;
+            }
+            uint32_t top13 = x & 0xfff80000u, crn = (x >> 12) & 15, rt = x & 31;
+            if (top13 == 0xd5380000u && (x & ~31u) == 0xd5380000u) { /* MRS Xt, MIDR_EL1 */
+                if (pool + 3 > n || (int64_t)((pool - i) * 4) >= (128ll << 20)) { midr_left++; continue; }
+                uint64_t site = xr[r].pa + i * 4, stub = xr[r].pa + pool * 4;
+                w[pool] = MOVZ_XS(rt, (APPLE_MIDR >> 16) & 0xffff, 1);
+                w[pool + 1] = MOVK_X(rt, APPLE_MIDR & 0xffff, 0);
+                w[pool + 2] = branch(stub + 8, site + 4);
+                w[i] = branch(site, stub);
+                pool += 3, midr++;
+                continue;
+            }
+            if ((top13 == 0xd5380000u || top13 == 0xd5180000u) && (crn == 15 || crn == 11)) { /* implementation defined */
+                if (top13 == 0xd5380000u) w[i] = rt == 31 ? NOP : MOVZ_X(rt), impl_r++;
+                else w[i] = NOP, impl_w++;
+            }
+        }
+    }
+    pac_patched += pac;
+    fprintf(stderr, "gunyah: kernel patched for this CPU: %llu reads and %llu writes of Apple's own registers (now 0 and "
+                    "ignored), %llu MIDR reads (now Apple's %#llx)%s, %llu PAC hypercalls (now success)\n",
+            (unsigned long long)impl_r, (unsigned long long)impl_w, (unsigned long long)midr, (unsigned long long)APPLE_MIDR,
+            midr_left ? " (some left: no room for their stubs)" : "", (unsigned long long)pac);
+
+    /* The timebase: the kernel's tree says the 24 MHz Henge's JIT counts; Gunyah gives the CPU's own counter. */
+    uint64_t f;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+    int changed = 0;
+    if (dtva >= virt && dtlen > 8) {
+        uint64_t dtpa = dtva - virt + phys;
+        uint8_t *dt = hv_phys_ptr(M, dtpa, dtlen);
+        if (dt) {
+            /* Apple's device tree: a node is {u32 properties, u32 children}, then each property {char name[32],
+               u32 length (bit 31: a placeholder), value padded to 4}, then its children. */
+            uint8_t *p = dt, *end = dt + dtlen;
+            uint32_t stack[64];
+            int depth = 0;
+            stack[0] = 1;
+            while (depth >= 0 && p + 8 <= end) {
+                if (!stack[depth]) { depth--; continue; }
+                stack[depth]--;
+                uint32_t np = rd32(p), nc = rd32(p + 4);
+                p += 8;
+                for (uint32_t i = 0; i < np && p + 36 <= end; i++) {
+                    uint32_t len = rd32(p + 32) & 0x7fffffffu;
+                    if (p + 36 + len > end) { p = end; break; }
+                    if (!strncmp((const char *)p, "timebase-frequency", 32) && (len == 4 || len == 8)) {
+                        uint32_t v = rd32(p + 36);
+                        if (v != (uint32_t)f) {
+                            uint32_t nv = (uint32_t)f;
+                            memcpy(p + 36, &nv, 4);
+                            if (len == 8) memset(p + 40, 0, 4);
+                            changed++;
+                        }
+                    }
+                    p += 36 + ((len + 3) & ~3u);
+                }
+                if (nc && depth < 63) stack[++depth] = nc;
+            }
+        }
+    }
+    fprintf(stderr, "gunyah: the kernel's timebase-frequency: %d set to the CPU's %llu Hz\n", changed, (unsigned long long)f);
+    return 0;
+}
+
+/* ---- the Mac's RAM: all of it in 2 MB pages, or the hand-over does not happen ---- */
+
+static uint64_t huge_mb(void *p, uint64_t len) {
+    FILE *f = fopen("/proc/self/smaps", "r");
+    if (!f) return 0;
+    char line[256];
+    int in = 0;
+    uint64_t kb = 0;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long lo, hi;
+        char *dash = strchr(line, '-'), *sp = strchr(line, ' ');
+        if (dash && sp && dash < sp && sscanf(line, "%lx-%lx ", &lo, &hi) == 2) {
+            in = lo < (uintptr_t)p + len && hi > (uintptr_t)p;
+            continue;
+        }
+        unsigned long v;
+        if (in && (sscanf(line, "ShmemPmdMapped: %lu kB", &v) == 1 || sscanf(line, "FilePmdMapped: %lu kB", &v) == 1 ||
+                   sscanf(line, "AnonHugePages: %lu kB", &v) == 1))
+            kb += v;
+    }
+    fclose(f);
+    return kb >> 10;
+}
+
+static void put_file(const char *path, const char *v) {
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    (void)!write(fd, v, strlen(v));
+    close(fd);
+}
+
+static int ram_ready(void) {
+    uint64_t mb = B->ram_size >> 20, two = 2ull << 20;
+    if ((uintptr_t)B->ram & (two - 1)) {
+        fprintf(stderr, "gunyah: the Mac's RAM is not mapped on a 2 MB boundary: no 2 MB pages\n");
+        return -1;
+    }
+    uint64_t h = huge_mb(B->ram, B->ram_size);
+    fprintf(stderr, "gunyah: the Mac's RAM: %llu of %llu MB in 2 MB pages%s\n", (unsigned long long)h, (unsigned long long)mb,
+            B->ram_reserved ? " (reserved at boot)" : "");
+    if (h < mb) {
+        /* What is small, collapsed into 2 MB pages now (its contents copied), memory compacted before each pass. */
+        put_file("/sys/kernel/mm/transparent_hugepage/shmem_enabled", "advise");
+        put_file("/sys/kernel/mm/transparent_hugepage/defrag", "madvise");
+        madvise(B->ram, B->ram_size, MADV_HUGEPAGE);
+        for (int pass = 0; pass < 3 && h < mb; pass++) {
+            put_file("/proc/sys/vm/drop_caches", "3");
+            put_file("/proc/sys/vm/compact_memory", "1");
+            for (uint64_t o = 0; o < B->ram_size; o += two) madvise(B->ram + o, two, 25 /* MADV_COLLAPSE */);
+            h = huge_mb(B->ram, B->ram_size);
+            fprintf(stderr, "gunyah:   after collapsing: %llu MB in 2 MB pages\n", (unsigned long long)h);
+        }
+    }
+    const char *min = getenv("HV_GUNYAH_MIN_HUGE"); /* percent; 100 by default: 4 KB pages have reset the tablet */
+    uint64_t need = mb * (uint64_t)(min && *min ? atoi(min) : 100) / 100;
+    if (h < need) {
+        fprintf(stderr, "gunyah: only %llu of %llu MB in 2 MB pages: not handed over (a parcel of 4 KB pages reset the "
+                        "tablet). Turn on Settings > Gunyah memory > Reserve at boot and restart the tablet\n",
+                (unsigned long long)h, (unsigned long long)mb);
+        return -1;
+    }
+    return 0;
+}
+
+/* ---- the hand-over page ---- */
+
+static void fill_state(const HvCpu *c) {
+    uint64_t *s = handoff + 64;
+    for (int i = 0; i < 31; i++) s[i] = c->x[i];
+    /* SP: the JIT keeps the current one in sp and banks the other. */
+    s[31] = c->spsel ? c->sp : c->sp_el1;  /* SP_EL1 */
+    s[45] = c->spsel ? c->sp_el0 : c->sp;  /* SP_EL0 */
+    s[32] = c->pc;
+    s[33] = (c->nzcv & 0xf0000000ull) | (c->daif & 0x3c0ull) | (c->pstate_extra & ((1ull << 22) | (1ull << 23) | (1ull << 12))) |
+            ((uint64_t)c->el << 2) | (c->spsel ? 1 : 0);
+    s[34] = c->sctlr_el1, s[35] = c->ttbr0_el1, s[36] = c->ttbr1_el1, s[37] = c->tcr_el1, s[38] = c->mair_el1;
+    s[39] = c->amair_el1, s[40] = c->vbar_el1, s[41] = c->contextidr_el1, s[42] = c->tpidr_el0, s[43] = c->tpidrro_el0;
+    s[44] = c->tpidr_el1, s[46] = c->cpacr_el1, s[47] = c->cntkctl_el1, s[48] = c->fpcr, s[49] = c->fpsr, s[50] = c->mdscr_el1;
+    fprintf(stderr, "gunyah: CPU 0 goes on at pc %#llx (EL%u, MMU %s), x0 %#llx x1 %#llx x2 %#llx x3 %#llx, SP_EL1 %#llx\n",
+            (unsigned long long)c->pc, c->el, c->sctlr_el1 & 1 ? "on" : "off", (unsigned long long)c->x[0],
+            (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[3], (unsigned long long)s[31]);
+}
+
+static const char *phase_name(uint64_t p) {
+    return p == 1 ? "started" : p == 2 ? "found its channel to the resource manager" : p == 3 ? "accepted the Mac's RAM"
+         : p == 4 ? "loading CPU 0's state" : p == 0xdead ? "STOPPED" : "?";
+}
+
+/* A store of the shim's to the page's second half. */
+static void shim_report(uint64_t off, uint64_t v) {
+    unsigned i = (unsigned)(off / 8) & 255;
+    shim_rep[i] = v;
+    if (off == 0x7f8) { /* +0xff8: the jump */
+        mac_runs = 1;
+        fprintf(stderr, "gunyah: the Mac runs on Gunyah now (CPU 0 at pc %#llx)\n", (unsigned long long)handoff[64 + 32]);
+        return;
+    }
+    if (i == 0) {
+        fprintf(stderr, "gunyah: shim: %s\n", phase_name(v));
+        if (v == 2)
+            fprintf(stderr, "gunyah: shim: the vCPU's MIDR %#llx, MPIDR %#llx (Henge's CPU 0: %#llx), ISAR1 %#llx, SCTLR %#llx; "
+                            "PAC key read %s%s%llx\n", (unsigned long long)shim_rep[1], (unsigned long long)shim_rep[2],
+                    (unsigned long long)hv_vm_cpu(0)->mpidr, (unsigned long long)shim_rep[3], (unsigned long long)shim_rep[4],
+                    shim_rep[15] ? "ran: APIAKeyLo " : "TRAPPED", shim_rep[15] ? "0x" : " ", shim_rep[15] ? (unsigned long long)shim_rep[14] : 0ull);
+        if (v == 0xdead) {
+            if (shim_rep[11] || shim_rep[12])
+                fprintf(stderr, "gunyah: shim: an exception: ESR %#llx at %#llx (FAR %#llx)\n", (unsigned long long)shim_rep[11],
+                        (unsigned long long)shim_rep[12], (unsigned long long)shim_rep[13]);
+            else if (!shim_rep[5]) fprintf(stderr, "gunyah: shim: no channel to the resource manager in the VM's tree\n");
+            else fprintf(stderr, "gunyah: shim: piece %llu not accepted: MSGQ_SEND %#llx, the resource manager's error %#llx\n",
+                         (unsigned long long)shim_rep[8], (unsigned long long)shim_rep[9], (unsigned long long)shim_rep[10]);
+            hv_gunyah_stop();
+        }
+    }
+}
+
 /* ---- the vCPU ---- */
 
 static void on_sigusr(int s) { (void)s; }
@@ -389,8 +655,16 @@ static void on_sigusr(int s) { (void)s; }
 static void *vcpu_thread(void *arg) {
     int id = (int)(intptr_t)arg;
     struct gh_vcpu_run *r = run[id];
-    uint64_t unknown = 0, gic_exits = 0;
+    uint64_t unknown = 0, gic_exits = 0, low = 0;
     time_t last_report = time(NULL);
+    /* The JIT's CPU 0 thread blocked the signals this one needs (a stop breaks GH_VCPU_RUN with SIGUSR1), and bound
+       itself to one core: each vCPU to the core the JIT gave that CPU. */
+    sigset_t s;
+    sigemptyset(&s);
+    sigaddset(&s, SIGUSR1);
+    pthread_sigmask(SIG_UNBLOCK, &s, NULL);
+    hv_vm_set_this_cpu(id);
+    hv_host_cpu_thread();
     while (!stop_req) {
         if (ioctl(vcpu_fd[id], GH_VCPU_RUN, 0) < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
@@ -402,6 +676,21 @@ static void *vcpu_thread(void *arg) {
             uint64_t pa = r->mmio.phys_addr;
             unsigned len = r->mmio.len > 8 ? 8 : r->mmio.len;
             mmio_exits[id]++;
+            if (pa >= HANDOFF_PA && pa < HANDOFF_PA + 0x1000) {
+                uint64_t off = pa - HANDOFF_PA, v = 0;
+                if (r->mmio.is_write) {
+                    memcpy(&v, r->mmio.data, len);
+                    if (off >= 0x800) shim_report(off - 0x800, v);
+                } else {
+                    if (off < 0x800) v = handoff[off / 8];
+                    memset(r->mmio.data, 0, sizeof r->mmio.data);
+                    memcpy(r->mmio.data, &v, len);
+                }
+                continue;
+            }
+            if (pa < VMAPPLE_MEM && pa >= VMAPPLE_FIRMWARE && pa < VMAPPLE_CONFIG + 0x100000 && low++ < 16)
+                fprintf(stderr, "gunyah: vCPU %d %s the %s at %#llx (Gunyah could not give it; answered from Henge's copy)\n", id,
+                        r->mmio.is_write ? "writes" : "reads", pa < VMAPPLE_CONFIG ? "boot ROM" : "config window", (unsigned long long)pa);
             if (pa >= VMAPPLE_GIC_DIST && pa < VMAPPLE_GIC_MSI && gic_exits++ < 4)
                 fprintf(stderr, "gunyah: vCPU %d's GIC access at %llx came here: Gunyah did not put its GIC at "
                                 "vmapple's address\n", id, (unsigned long long)pa);
@@ -492,6 +781,8 @@ static int fail(const char *what) {
     return -1;
 }
 
+/* Returns 0 / an HV_EXIT reason once the VM is over, or HV_GUNYAH_NOT_STARTED when nothing of Gunyah's was started
+   (the caller lets Henge's CPUs go on). */
 int hv_gunyah_run(void) {
     M = hv_vm_machine();
     B = hv_vm_board();
@@ -500,6 +791,19 @@ int hv_gunyah_run(void) {
     if (nvcpu > HV_MAX_CPUS) nvcpu = HV_MAX_CPUS;
     for (int i = 0; i < HV_MAX_CPUS; i++) vcpu_fd[i] = -1;
     for (int i = 0; i < NIRQ; i++) irq_fd[i] = -1;
+    HvCpu *c0 = hv_vm_cpu(0);
+    if (c0->el != 1 || (c0->sctlr_el1 & 1)) {
+        fprintf(stderr, "gunyah: CPU 0 is at EL%u with its MMU %s: the shim hands over only at EL1 with it off\n", c0->el,
+                c0->sctlr_el1 & 1 ? "on" : "off");
+        return HV_GUNYAH_NOT_STARTED;
+    }
+    if (ram_ready() != 0) return HV_GUNYAH_NOT_STARTED;
+    if (kpatch() != 0) return HV_GUNYAH_NOT_STARTED;
+    int gs = open("/dev/gunyah_share", O_RDWR | O_CLOEXEC);
+    if (gs < 0) {
+        fprintf(stderr, "gunyah: /dev/gunyah_share: %s (the henge-gunyah Magisk module loads DroidVM's gunyah-host-share)\n", strerror(errno));
+        return HV_GUNYAH_NOT_STARTED;
+    }
 
     if (getenv("HV_GUNYAH_KMSG")) {
         pthread_t k;
@@ -508,95 +812,41 @@ int hv_gunyah_run(void) {
     }
     mark("open /dev/gunyah");
     int dev = open("/dev/gunyah", O_RDWR | O_CLOEXEC);
-    if (dev < 0) return fail("opening /dev/gunyah (it needs root)");
+    if (dev < 0) { fail("opening /dev/gunyah (it needs root)"); return HV_GUNYAH_NOT_STARTED; }
     mark("create the VM");
     vm_fd = ioctl(dev, GH_CREATE_VM, 0);
-    if (vm_fd < 0) return fail("creating the VM");
+    if (vm_fd < 0) { fail("creating the VM"); return HV_GUNYAH_NOT_STARTED; }
 
-    /* The boot region: trampoline to the ROM, then the resource manager's device tree. */
+    /* The VM's own region: the shim, then the resource manager's device tree. */
     uint8_t *boot = mmap(NULL, BOOT_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
-    if (boot == MAP_FAILED) return fail("mapping the boot region");
-    const uint32_t tramp[] = {
-        0xd2a00010u | ((uint32_t)(VMAPPLE_FIRMWARE >> 16) << 5), /* movz x16, #(ROM >> 16), lsl #16 */
-        0xaa1f03e0u, 0xaa1f03e1u, 0xaa1f03e2u, 0xaa1f03e3u,       /* mov x0..x3, xzr */
-        0xd61f0200u,                                              /* br x16 */
-    };
-    memcpy(boot, tramp, sizeof tramp);
-    const char *how = getenv("HV_GUNYAH_RAM");
-    ram_how = how && !strcmp(how, "resmem") ? RAM_RESMEM : how && !strcmp(how, "plain") ? RAM_PLAIN : RAM_SHM;
-    int lend_boot = getenv("HV_GUNYAH_LEND_BOOT") != NULL;
-    fprintf(stderr, "gunyah: boot region at %#llx (%s); memory named to the resource manager as %s\n", (unsigned long long)BOOT_PA,
-            lend_boot ? "lent" : "shared", ram_how == RAM_SHM ? "shm devices" : ram_how == RAM_RESMEM ? "reserved-memory nodes" : "nothing");
-    for (int i = 0; i < M->nram; i++)
-        if (M->ram[i].pa < BOOT_PA + BOOT_SIZE && M->ram[i].pa + M->ram[i].size > BOOT_PA) {
-            fprintf(stderr, "gunyah: the machine has memory at %#llx, where the boot region is\n", (unsigned long long)M->ram[i].pa);
-            return -1;
-        }
-
-    uint32_t label = 0;
-    struct gh_userspace_memory_region r = {.label = label++, .flags = GH_MEM_R | GH_MEM_W | GH_MEM_X,
-                                           .guest_phys_addr = BOOT_PA, .memory_size = BOOT_SIZE,
-                                           .userspace_addr = (uintptr_t)boot};
-    mark(lend_boot ? "lend the boot region" : "share the boot region");
-    if (ioctl(vm_fd, lend_boot ? GH_VM_ANDROID_LEND_USER_MEM : GH_VM_SET_USER_MEM_REGION, &r) < 0) return fail("giving the boot region");
-    /* Gunyah pins every page and keeps one kcalloc'd array entry per 4 KB page (plus one parcel entry per run),
-       so one 3 GB region needs a 6 MB+ physically contiguous kernel allocation and fails with ENOMEM. Large
-       regions are shared in chunks, halved on ENOMEM down to 8 MB. Root may also need a higher memlock limit. */
-    struct rlimit nolimit = {RLIM_INFINITY, RLIM_INFINITY};
-    if (setrlimit(RLIMIT_MEMLOCK, &nolimit) < 0) fprintf(stderr, "gunyah: raising the memlock limit: %s\n", strerror(errno));
-    for (int i = 0; i < M->nram; i++) {
-        HvRam *ram = &M->ram[i];
-        fprintf(stderr, "gunyah: memory %llx-%llx (%llu MB)\n", (unsigned long long)ram->pa,
-                (unsigned long long)(ram->pa + ram->size), (unsigned long long)(ram->size >> 20));
-        /* No transparent huge pages in what Gunyah is given. This asked for them (fewer, longer runs in the
-           parcel), and the tablet panicked when the VM started. Gunyah's firmware of the Snapdragon 8 Gen 3
-           generation (the Mi Pad 7's 7+ Gen 3 is of it, Linux 6.1) is reported not to take 2 MB pages made by
-           THP collapse: the hypervisor fails and resets the device (xiehezhi/Xiaomi14-8Gen3-Gunyah-Fix, on
-           DroidVM's "Prepare Lend mTHP"). Plain 4 KB pages, as HV_GUNYAH_THP=1 does not. */
-        madvise(ram->host, ram->size, getenv("HV_GUNYAH_THP") ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
-        uint64_t chunk = 256ull << 20, done = 0;
-        int pieces = 0;
-        while (done < ram->size) {
-            uint64_t n = ram->size - done < chunk ? ram->size - done : chunk;
-            r = (struct gh_userspace_memory_region){.label = label, .flags = GH_MEM_R | GH_MEM_W | GH_MEM_X,
-                                                    .guest_phys_addr = ram->pa + done, .memory_size = n,
-                                                    .userspace_addr = (uintptr_t)ram->host + done};
-            mark("share %llu MB of memory at %llx", (unsigned long long)(n >> 20), (unsigned long long)(ram->pa + done));
-            if (ioctl(vm_fd, GH_VM_SET_USER_MEM_REGION, &r) == 0) {
-                if (npiece == MAX_PIECES) { fprintf(stderr, "gunyah: memory in more than %d pieces\n", MAX_PIECES); return -1; }
-                piece[npiece].label = label, piece[npiece].pa = ram->pa + done, piece[npiece].size = n, npiece++;
-                label++, pieces++, done += n;
-                continue;
-            }
-            if (errno != ENOMEM || chunk <= (8ull << 20)) {
-                fprintf(stderr, "gunyah: shared %llu of %llu MB before this; lower the RAM setting if memory is short\n",
-                        (unsigned long long)(done >> 20), (unsigned long long)(ram->size >> 20));
-                return fail("sharing guest memory");
-            }
-            chunk >>= 1;
-        }
-        if (pieces > 1) fprintf(stderr, "gunyah:   shared as %d pieces (%llu MB each at the end)\n", pieces,
-                                (unsigned long long)(chunk >> 20));
-    }
-    /* The tree, now that the pieces and their labels are known (the boot region's pages are pinned, and still
-       this process's to write until the VM starts). Its region is all of the boot region after it: the resource
-       manager writes the tree back there with its own nodes added. */
-    size_t dtb_len = build_dtb(boot + DTB_OFF, BOOT_SIZE - DTB_OFF, nvcpu);
-    if (!dtb_len) { fprintf(stderr, "gunyah: the VM device tree is too big\n"); return -1; }
-    fprintf(stderr, "gunyah: device tree %zu bytes in a region of %llu KB, %d pieces of memory\n", dtb_len,
-            (unsigned long long)((BOOT_SIZE - DTB_OFF) >> 10), npiece);
+    if (boot == MAP_FAILED) { fail("mapping the boot region"); return HV_GUNYAH_NOT_STARTED; }
+    size_t shim_len = (size_t)(hv_gunyah_shim_end - hv_gunyah_shim_start);
+    memcpy(boot, hv_gunyah_shim_start, shim_len);
+    uint64_t params[2] = {HANDOFF_PA, BOOT_PA + DTB_OFF};
+    memcpy(boot + (hv_gunyah_shim_params - hv_gunyah_shim_start), params, sizeof params);
+    uint64_t ram_end = VMAPPLE_MEM + B->ram_size;
+    uint64_t size_max = (ram_end - BOOT_PA + (256ull << 20) - 1) & ~((256ull << 20) - 1);
+    if (size_max > 0xffffffffull) size_max = 0xfff00000ull; /* one cell: 4 GB less a megabyte at most */
+    size_t dtb_len = build_dtb(boot + DTB_OFF, BOOT_SIZE - DTB_OFF, nvcpu, size_max);
+    if (!dtb_len) { fprintf(stderr, "gunyah: the VM device tree is too big\n"); return HV_GUNYAH_NOT_STARTED; }
+    fprintf(stderr, "gunyah: the VM: its region %#llx (2 MB, lent: shim %zu bytes, tree %zu bytes), up to %#llx for the Mac's "
+                    "RAM at %#llx (%llu MB)\n", (unsigned long long)BOOT_PA, shim_len, dtb_len,
+            (unsigned long long)(BOOT_PA + size_max), (unsigned long long)VMAPPLE_MEM, (unsigned long long)(B->ram_size >> 20));
+    struct gh_userspace_memory_region r = {.label = 0, .flags = GH_MEM_R | GH_MEM_W | GH_MEM_X, .guest_phys_addr = BOOT_PA,
+                                           .memory_size = BOOT_SIZE, .userspace_addr = (uintptr_t)boot};
+    mark("lend the VM's region");
+    if (ioctl(vm_fd, GH_VM_ANDROID_LEND_USER_MEM, &r) < 0) { fail("lending the VM's region"); return HV_GUNYAH_NOT_STARTED; }
     struct gh_vm_dtb_config dtb = {.guest_phys_addr = BOOT_PA + DTB_OFF, .size = BOOT_SIZE - DTB_OFF};
     mark("set the VM device tree");
-    if (ioctl(vm_fd, GH_VM_SET_DTB_CONFIG, &dtb) < 0) return fail("setting the VM device tree");
+    if (ioctl(vm_fd, GH_VM_SET_DTB_CONFIG, &dtb) < 0) { fail("setting the VM device tree"); return HV_GUNYAH_NOT_STARTED; }
 
     int bells = 0;
     mark("add the interrupt doorbells");
     for (int id = 0; id < NIRQ; id++) {
         if (!irq_wanted(id)) continue;
         int efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-        if (efd < 0) return fail("eventfd");
-        struct gh_fn_irqfd_arg a = {.fd = (uint32_t)efd, .label = (uint32_t)id,
-                                    .flags = irq_is_msi(id) ? 0 : GH_IRQFD_FLAGS_LEVEL};
+        if (efd < 0) { fail("eventfd"); return HV_GUNYAH_NOT_STARTED; }
+        struct gh_fn_irqfd_arg a = {.fd = (uint32_t)efd, .label = (uint32_t)id, .flags = irq_is_msi(id) ? 0 : GH_IRQFD_FLAGS_LEVEL};
         struct gh_fn_desc fn = {.type = GH_FN_IRQFD, .arg_size = sizeof a, .arg = (uintptr_t)&a};
         if (ioctl(vm_fd, GH_VM_ADD_FUNCTION, &fn) < 0) {
             fprintf(stderr, "gunyah: doorbell for interrupt %d: %s\n", id, strerror(errno));
@@ -607,36 +857,60 @@ int hv_gunyah_run(void) {
         bells++;
     }
     fprintf(stderr, "gunyah: %d interrupt doorbells\n", bells);
-
     for (int i = 0; i < nvcpu; i++) {
         uint32_t id = (uint32_t)i;
         struct gh_fn_desc fn = {.type = GH_FN_VCPU, .arg_size = sizeof id, .arg = (uintptr_t)&id};
         mark("add vCPU %d", i);
         vcpu_fd[i] = ioctl(vm_fd, GH_VM_ADD_FUNCTION, &fn);
         if (vcpu_fd[i] < 0) {
-            if (i == 0) return fail("adding the vCPU");
-            /* The VM was configured for nvcpu; fewer vCPUs would leave XNU waiting on CPUs that never come. */
-            fprintf(stderr, "gunyah: adding vCPU %d failed: %s; set the CPU count to %d\n", i, strerror(errno), i);
-            return -1;
+            fprintf(stderr, "gunyah: adding vCPU %d failed: %s\n", i, strerror(errno));
+            return HV_GUNYAH_NOT_STARTED;
         }
     }
+    struct rlimit nolimit = {RLIM_INFINITY, RLIM_INFINITY};
+    setrlimit(RLIMIT_MEMLOCK, &nolimit);
+    mlock(B->ram, B->ram_size);
+
     mark("start the VM");
-    if (ioctl(vm_fd, GH_VM_START, 0) < 0) return fail("starting the VM");
+    if (ioctl(vm_fd, GH_VM_START, 0) < 0) { fail("starting the VM"); return HV_GUNYAH_NOT_STARTED; }
+    /* From here Henge's CPUs cannot take the Mac back: a failure ends the run. */
+
+    /* The Mac's RAM, shared into the running VM 256 MB a piece (DroidVM's way: a memparcel the guest accepts exists
+       only once the VM does), each piece's handle for the shim. */
+    int pieces = 0;
+    for (uint64_t done = 0; done < B->ram_size && pieces < MAX_PIECES; pieces++) {
+        uint64_t n = B->ram_size - done < SHARE_CHUNK ? B->ram_size - done : SHARE_CHUNK;
+        struct ghsm_share_blob sb = {.vm_fd = vm_fd, .label = 0x4000u + (uint32_t)pieces, .flags = GH_MEM_R | GH_MEM_W | GH_MEM_X,
+                                     .guest_phys_addr = VMAPPLE_MEM + done, .memory_size = n,
+                                     .userspace_addr = (uintptr_t)B->ram + done};
+        mark("share %llu MB of the Mac's RAM at %llx", (unsigned long long)(n >> 20), (unsigned long long)(VMAPPLE_MEM + done));
+        if (ioctl(gs, GHSM_SHARE_BLOB, &sb) < 0) {
+            fprintf(stderr, "gunyah: sharing the Mac's RAM at %#llx: %s (after %d pieces)\n", (unsigned long long)(VMAPPLE_MEM + done),
+                    strerror(errno), pieces);
+            return HV_EXIT_UNSUPPORTED;
+        }
+        handoff[2 + 3 * pieces] = sb.mem_handle, handoff[3 + 3 * pieces] = VMAPPLE_MEM + done, handoff[4 + 3 * pieces] = n;
+        done += n;
+    }
+    handoff[0] = 0x444e414845474e48ull; /* "HNGEHAND" */
+    handoff[1] = (uint64_t)pieces;
+    fill_state(c0);
+    fprintf(stderr, "gunyah: the Mac's RAM shared as %d pieces; the shim accepts them\n", pieces);
+
     long sz = ioctl(vcpu_fd[0], GH_VCPU_MMAP_SIZE, 0);
     if (sz < 0) sz = ioctl(dev, GH_VCPU_MMAP_SIZE, 0);
-    if (sz <= 0) return fail("asking the vCPU's run area size");
+    if (sz <= 0) { fail("asking the vCPU's run area size"); return HV_EXIT_UNSUPPORTED; }
     for (int i = 0; i < nvcpu; i++) {
         run[i] = mmap(NULL, (size_t)sz, PROT_READ | PROT_WRITE, MAP_SHARED, vcpu_fd[i], 0);
-        if (run[i] == MAP_FAILED) { run[i] = NULL; return fail("mapping a vCPU's run area"); }
+        if (run[i] == MAP_FAILED) { run[i] = NULL; fail("mapping a vCPU's run area"); return HV_EXIT_UNSUPPORTED; }
     }
-    fprintf(stderr, "gunyah: %d vCPU%s\n", nvcpu, nvcpu == 1 ? "" : "s");
 
     dev_kick = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     hv_vm_stop_hook = hv_gunyah_stop;
     hv_gic_external = gic_external; /* from here Henge's devices ring doorbells instead of its own GIC */
     struct sigaction sa = {.sa_handler = on_sigusr}; /* no SA_RESTART: a stop breaks GH_VCPU_RUN */
     sigaction(SIGUSR1, &sa, NULL);
-    mark("run the vCPUs (the VM started; the boot ROM runs on the CPU itself)");
+    mark("run the vCPUs (the shim, then the Mac's kernel)");
 
     pthread_t t;
     pthread_create(&t, NULL, device_thread, NULL);
@@ -651,5 +925,6 @@ int hv_gunyah_run(void) {
     for (int i = 0; i < nvcpu; i++) vcpu_thread_id[i] = 0;
     stop_req = 1;
     usleep(20000);
+    if (!mac_runs) fprintf(stderr, "gunyah: the shim did not reach the Mac (its last phase: %s)\n", phase_name(shim_rep[0]));
     return vm_reason < 0 ? 0 : vm_reason;
 }

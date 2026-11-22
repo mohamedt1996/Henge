@@ -267,7 +267,7 @@ typedef struct HvMachine {
        fills of pages below it (the ROM, the config window) are logged, which Gunyah cannot give the guest. */
     uint64_t low_watch;
     void (*on_mmu_off)(struct HvCpu *cpu); /* SCTLR.M 1 -> 0 (iBoot's jump to the next stage, or to the kernel) */
-    int low_logged;
+    void (*on_low)(struct HvCpu *cpu, uint64_t va, int el, uint64_t pa, int rwx); /* a TLB fill below low_watch */
     HvStats stats;
     int chain;               /* block chaining and the indirect-branch cache are enabled */
     uint64_t *slots;         /* chainable exits' targets (0: not chained) */

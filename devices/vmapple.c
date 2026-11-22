@@ -23,7 +23,10 @@ __attribute__((weak)) int hv_pvg_applegfx_create(HvMachine *m, HvGic *gic, uint6
 #include <errno.h>
 #ifdef __linux__
 #include "plat_linux.h"
+#include <stddef.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/un.h>
 #else
 #include <mach/mach.h>
 #include <mach/mach_error.h>
@@ -353,6 +356,40 @@ static uint8_t *map_on_2mb(int fd, uint64_t size) {
     if (reserved_end > end) munmap(end, (size_t)(reserved_end - end));
     return ram;
 }
+
+/* HV_RAM_RESERVE (the Gunyah engine, which runs as root): the Mac's RAM from henge-reserve (android/tools/
+   henge_reserve.c), which took it in 2 MB pages at boot and keeps it pinned. Its memfd over the abstract socket
+   @henge-gunyah-ram; -1 when it does not run or holds less than the Mac needs. */
+static int reserve_get(uint64_t need, uint64_t *huge_mb) {
+    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un a = {.sun_family = AF_UNIX};
+    static const char name[] = "henge-gunyah-ram";
+    memcpy(a.sun_path + 1, name, sizeof name - 1);
+    socklen_t len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + sizeof name);
+    if (s < 0 || connect(s, (struct sockaddr *)&a, len) < 0) {
+        if (s >= 0) close(s);
+        return -1;
+    }
+    (void)!write(s, "get\n", 4);
+    char reply[128] = {0}, ctl[CMSG_SPACE(sizeof(int))];
+    struct iovec io = {.iov_base = reply, .iov_len = sizeof reply - 1};
+    struct msghdr m = {.msg_iov = &io, .msg_iovlen = 1, .msg_control = ctl, .msg_controllen = sizeof ctl};
+    ssize_t n = recvmsg(s, &m, MSG_CMSG_CLOEXEC);
+    close(s);
+    int fd = -1;
+    for (struct cmsghdr *c = n > 0 ? CMSG_FIRSTHDR(&m) : NULL; c; c = CMSG_NXTHDR(&m, c))
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) memcpy(&fd, CMSG_DATA(c), sizeof fd);
+    unsigned long long size = 0, huge = 0;
+    if (fd < 0 || sscanf(reply, "ok %llu %llu", &size, &huge) != 2) { if (fd >= 0) close(fd); return -1; }
+    if (size < need) {
+        fprintf(stderr, "hengevm: the reserved memory is %llu MB, less than the Mac's %llu: not used (reserve more, or "
+                        "lower the RAM setting)\n", size >> 20, (unsigned long long)(need >> 20));
+        close(fd);
+        return -1;
+    }
+    *huge_mb = huge;
+    return fd;
+}
 #endif
 
 int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size, HvDisk *root, HvDisk *aux,
@@ -382,6 +419,26 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
        each writeback, and the guest's CPUs held back whenever the dirty pages outrun the flash. (Linux has no
        per-app memory ledger to dodge, which is what the file is for on iOS.) No prefault: memory is taken as
        the guest touches it. */
+    if (b->ram == MAP_FAILED && getenv("HV_RAM_RESERVE")) {
+        uint64_t huge = 0;
+        int fd = reserve_get(ram_size, &huge);
+        if (fd >= 0) b->ram = map_on_2mb(fd, ram_size);
+        if (b->ram != MAP_FAILED) {
+            b->ram_fd = fd;
+            b->ram_reserved = 1;
+            static char name[64], number[16];
+            snprintf(name, sizeof name, "/proc/%d/fd/%d", (int)getpid(), fd);
+            setenv("HV_RAM_FILE", name, 1);
+            snprintf(number, sizeof number, "%d", fd);
+            setenv("HV_RAM_FD", number, 1);
+            fprintf(stderr, "hengevm: guest RAM (%llu MB) is the memory reserved for Gunyah (%llu MB of it in 2 MB pages, pinned)\n",
+                    (unsigned long long)(ram_size >> 20), (unsigned long long)huge);
+        } else {
+            if (fd >= 0) close(fd);
+            fprintf(stderr, "hengevm: no memory reserved for Gunyah (Settings > Gunyah memory); the Mac's RAM is taken now, "
+                            "and the hand-over needs it all in 2 MB pages\n");
+        }
+    }
     if (b->ram == MAP_FAILED && ram_file && *ram_file && getenv("HV_RAM_MEMFD")) {
         /* Sealable, and sealed against shrinking once it has its size: /dev/udmabuf makes dma-bufs only of such
            a memfd's pages, which is how a Vulkan driver gets the Mac's memory in place (android/gpu/REIMS.md). */
@@ -509,7 +566,8 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     if (!order) b->mouse = hv_virtio_input_create(m, b->pcie, HV_VINPUT_MOUSE);
     if (!getenv("HV_NO_SOUND")) b->snd = hv_virtio_snd_create(m, b->pcie);
     if ((aux && !b->aux_blk) || (root && !b->root_blk)) return -1;
-    if (getenv("HV_BALLOON")) {
+    if (getenv("HV_BALLOON") && b->ram_reserved) fprintf(stderr, "hengevm: Give memory back is off: the Mac's RAM is the memory reserved for Gunyah\n");
+    if (getenv("HV_BALLOON") && !b->ram_reserved) {
         b->balloon = hv_virtio_balloon_create(m, b->pcie, b->ram, VMAPPLE_MEM, ram_size, b->ram_fd);
         hv_virtio_balloon_set_target(b->balloon, (uint64_t)atoll(getenv("HV_BALLOON")) << 20);
     }

@@ -72,6 +72,12 @@ void hv_vm_cpu_qos(void);
 int hv_vm_this_cpu(void);
 /* Run CPU 0 on the calling thread (what hv_vm_start does on its own thread); returns its exit reason. */
 int hv_vm_run_cpu0(void);
+/* The Gunyah hand-over (vm.c, host/gunyah.c): stop the CPUs (HV_HALT_HANDOVER) at the n-th time CPU 0 turns its
+   MMU off in RAM (3: iBoot's jump into the kernel); then end the other CPUs' threads, or let them all go on. */
+void hv_vm_set_handover(int stage);
+void hv_vm_end_jit(void);
+void hv_vm_resume_jit(void);
+void hv_vm_set_this_cpu(int i);
 /* Stop at the next block; the CPUs' threads end. */
 void hv_vm_stop(void);
 /* Instant resume (see snapshot.h). hv_vm_pause stops every CPU at a block boundary and quiets the devices (disk
