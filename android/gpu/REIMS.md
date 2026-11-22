@@ -982,6 +982,12 @@ loads (0x20020200-0x200202f0) went to Henge's devices, which answered 0. The ker
 (x0 should be boot_args), made no more exits for 30 s, and did not reset the tablet this time. The page is now the
 hand-over's for the whole run.
 
+0.3.82 (2026-11-23): 0.3.81: macOS's kernel ran on Gunyah with its real registers, wrote to the serial port (6404
+stores) and panicked at once: "Unexpected debugger trap while SP1 selected at pc 0xfffffe002e5e1828", ESR
+0x02000000 (an instruction the CPU or Gunyah does not take; the JIT did). The tablet stayed up for 4+ minutes. The
+engine now reads the Mac's serial output for panic lines and logs the instruction words around each pc named
+(decoded where they are system instructions), so the next build can rewrite that instruction.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

@@ -384,6 +384,7 @@ static int64_t find_boot_args(void) {
 }
 
 static struct { uint64_t pa, size; } xr[64]; /* the kernel collection's code, by physical address */
+static uint64_t k_virt, k_phys; /* the kernel's static mapping: virtual k_virt is physical k_phys */
 static int nxr;
 
 static void add_exec(uint64_t pa, uint64_t size) {
@@ -428,6 +429,7 @@ static int kpatch(void) {
     if (ba < 0) { fprintf(stderr, "gunyah: no boot_args in the Mac's RAM: this is not the jump into the kernel\n"); return -1; }
     const uint8_t *b = B->ram + ba;
     uint64_t virt = rd64(b + 8), phys = rd64(b + 16), top = rd64(b + 32), dtva = rd64(b + 96);
+    k_virt = virt, k_phys = phys;
     uint32_t dtlen = rd32(b + 104);
     fprintf(stderr, "gunyah: boot_args at pa %#llx: kernel at virtual %#llx = physical %#llx, its data to %#llx, device tree "
                     "at %#llx (%u bytes)\n", (unsigned long long)(VMAPPLE_MEM + (uint64_t)ba), (unsigned long long)virt,
@@ -716,6 +718,55 @@ static void shim_report(uint64_t off, uint64_t v) {
     }
 }
 
+/* ---- the Mac's serial port, read for its panics ----
+   0.3.81: XNU ran on Gunyah and panicked at once, "Unexpected debugger trap while SP1 selected at pc ...", ESR
+   0x02000000: an instruction this CPU (or Gunyah) does not take, where Henge's JIT did. Each pc a panic line names is
+   looked up in the Mac's RAM and the instruction words around it are logged, decoded where they are system
+   instructions, so the next patch knows what to rewrite. */
+static char uart_line[512];
+static int uart_n;
+static uint64_t pcs_seen[8];
+static int npcs;
+
+static void decode_word(uint32_t w, char *out, size_t cap) {
+    if ((w & 0xffc00000u) == 0xd5000000u) { /* system: MSR/MRS/SYS/SYSL, hints, barriers */
+        unsigned l = w >> 21 & 1, op0 = w >> 19 & 3, op1 = w >> 16 & 7, crn = w >> 12 & 15, crm = w >> 8 & 15, op2 = w >> 5 & 7, rt = w & 31;
+        if (op0 >= 2) snprintf(out, cap, "%s S%u_%u_C%u_C%u_%u, x%u", l ? "MRS (read)" : "MSR (write)", op0, op1, crn, crm, op2, rt);
+        else if (op0 == 1) snprintf(out, cap, "%s #%u, C%u, C%u, #%u, x%u", l ? "SYSL" : "SYS", op1, crn, crm, op2, rt);
+        else snprintf(out, cap, "hint/barrier/pstate (op1 %u CRn %u CRm %u op2 %u)", op1, crn, crm, op2);
+    } else if ((w & 0xffe0001fu) == 0xd4000002u) snprintf(out, cap, "HVC #%u", w >> 5 & 0xffff);
+    else if ((w & 0xffe0001fu) == 0xd4000003u) snprintf(out, cap, "SMC #%u", w >> 5 & 0xffff);
+    else if ((w & 0xffe0001fu) == 0xd4200000u) snprintf(out, cap, "BRK #%#x", w >> 5 & 0xffff);
+    else if ((w & 0xfffff000u) == 0x00201000u) snprintf(out, cap, "Apple AMX/GXF space (0x0020xxxx)");
+    else snprintf(out, cap, "-");
+}
+
+static void panic_pc(uint64_t pc) {
+    for (int i = 0; i < npcs; i++) if (pcs_seen[i] == pc) return;
+    if (npcs == 8 || !k_virt || pc < k_virt) return;
+    pcs_seen[npcs++] = pc;
+    uint64_t pa = pc - k_virt + k_phys;
+    const uint32_t *w = hv_phys_ptr(M, (pa & ~3ull) - 16, 36);
+    if (!w) { say("gunyah: the panic's pc %#llx is pa %#llx, not in the Mac's RAM\n", (unsigned long long)pc, (unsigned long long)pa); return; }
+    say("gunyah: the panic's pc %#llx (pa %#llx), the instructions around it:\n", (unsigned long long)pc, (unsigned long long)pa);
+    for (int i = 0; i < 9; i++) {
+        char d[96];
+        decode_word(w[i], d, sizeof d);
+        say("gunyah:   %s%#llx: %08x  %s\n", i == 4 ? "=> " : "   ", (unsigned long long)(pc - 16 + 4 * (uint64_t)i), w[i], d);
+    }
+}
+
+static void uart_char(char c) {
+    if (c != '\n' && uart_n < (int)sizeof uart_line - 1) { uart_line[uart_n++] = c; return; }
+    uart_line[uart_n] = 0;
+    uart_n = 0;
+    const char *keys[] = {"at pc 0x", "pc:  0x", "pc: 0x"};
+    for (int k = 0; k < 3; k++) {
+        const char *s = strstr(uart_line, keys[k]);
+        if (s) panic_pc(strtoull(s + strlen(keys[k]), NULL, 16));
+    }
+}
+
 /* ---- the vCPU ---- */
 
 /* 0.3.77's hand-over: vCPU 0 never came back from GH_VCPU_RUN, and 20 s later the hypervisor's watchdog reset the
@@ -823,6 +874,7 @@ static void *vcpu_thread(void *arg) {
                 fprintf(stderr, "gunyah: vCPU %d's GIC access at %llx came here: Gunyah did not put its GIC at "
                                 "vmapple's address\n", id, (unsigned long long)pa);
             /* Every vCPU goes through Henge's device dispatch, which takes the device lock itself. */
+            if (r->mmio.is_write && pa == VMAPPLE_UART && mac_runs) uart_char((char)r->mmio.data[0]);
             if (r->mmio.is_write) {
                 if (hv_phys_write(M, pa, r->mmio.data, len) != 0 && unknown++ < 16)
                     fprintf(stderr, "gunyah: vCPU %d write to nothing at %llx\n", id, (unsigned long long)pa);
