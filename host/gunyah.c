@@ -89,7 +89,9 @@ struct ghsm_share_blob { int32_t vm_fd; uint32_t label, flags, mem_handle; uint6
 
 #define BOOT_PA 0x6fe00000ull   /* the VM's own region: just under the Mac's RAM (the tablet takes it, 0.3.74) */
 #define BOOT_SIZE 0x200000ull
-#define DTB_OFF 0x10000ull
+/* The tree's region: the second megabyte, as the probe has it (its 12 pieces were all accepted; 0.3.78's tree region of
+   1.9 MB from 64 KB had the second piece refused, NORESOURCE: the resource manager's own room in the VM's region?). */
+#define DTB_OFF 0x100000ull
 /* The shim's reads and reports come here: 20 KB with nothing behind them, beside vmapple's UART (0x20010000, where
    the probe's report page has always exited); 0.3.77's 0x6f000000, just under the VM's base, never exited once. Only
    until the jump: Henge's own devices after it. */

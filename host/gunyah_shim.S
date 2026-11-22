@@ -68,8 +68,16 @@ hv_gunyah_shim_start:
     ldr  x13, [x23]                     /* handle */
     ldr  x14, [x23, #8]                 /* address */
     ldr  x15, [x23, #16]                /* size */
-    bl   accept
-    cbnz x0, stop
+    mov  x24, #4                        /* tries: a refusal may be for the moment (0.3.78: NORESOURCE on piece 1) */
+3:  bl   accept
+    cbz  x0, 4f
+    subs x24, x24, #1
+    b.eq stop
+    movz x12, #0x0200, lsl #16          /* a while before the next try */
+5:  subs x12, x12, #1
+    b.ne 5b
+    b    3b
+4:
     add  x23, x23, #24
     add  x22, x22, #1
     b    1b

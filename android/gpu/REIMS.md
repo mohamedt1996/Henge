@@ -964,6 +964,13 @@ sends each vCPU thread a signal every 2 ms (HV_GUNYAH_KICK_MS) so GH_VCPU_RUN co
 guest that never stops otherwise keeps its CPU from Android. The test gets a guest that spins 30 s with no exit,
 plain and kicked (--spin, --kick), which says whether that is what happened and whether the kicks help.
 
+0.3.79 (2026-11-22): 0.3.78's hand-over ran the shim on Gunyah for the first time, twice, with no reset: the hand-over
+page beside the UART exits, the kicks bring every vCPU back, the shim found its channel, read the vCPU (MIDR 0xf0480,
+MPIDR 0x80000000 as Henge's CPU 0, PAC key readable) and accepted the first 256 MB piece; the second was refused,
+NORESOURCE (2), both times. The probe's 12 pieces were all accepted with its tree region in the VM region's second
+megabyte; the engine's took 1.9 MB of it from 64 KB on. The engine now lays the region out as the probe does, and the
+shim tries a refused piece four times before it stops.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as
