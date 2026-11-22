@@ -203,6 +203,8 @@ jobs:
           find android/apk/app/build android/apk/app/.cxx -name libhengegpu.so -printf '%s %p\n' 2>/dev/null | sort -n | tail -3
           so=$(find android/apk/app/build android/apk/app/.cxx -name libhengegpu.so -printf '%s %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)
           [ -n "$so" ] && cp "$so" symbols/libhengegpu.so && file symbols/libhengegpu.so
+          # The engine before strip: its crash lines give offsets from its start ("hengevm+0x...").
+          cp build/android/hengevm-android symbols/hengevm-android 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         continue-on-error: true
         with:

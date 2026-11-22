@@ -881,6 +881,11 @@ nearly full. Memory, not the JIT, is what the tablet is short of.
   per-submission import lists and needs the later tree.
 - m2v_no_host_import.py follows `DeviceWord::restored`; reims_lenient.py follows `created_or_decided`.
 
+0.3.70 (2026-11-22): the 0.3.69 log's engine died of SIGSEGV twice while Instant resume paused the Mac to save it, with
+no word of where. A fault in the engine's own code (not in translated code) now writes "hengevm: signal N in the engine
+(thread T)" and its frames as offsets from the engine's start ("hengevm+0x..."); the CI's symbols artifact keeps the
+unstripped engine (hengevm-android) they resolve against (addr2line -fe hengevm-android 0x...).
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

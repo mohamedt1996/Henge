@@ -23,6 +23,7 @@
 #include <pthread/qos.h>
 #include <signal.h>
 #include <sys/ucontext.h>
+#include <dlfcn.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -253,6 +254,34 @@ static void on_ill(int sig, siginfo_t *info, void *ctx) {
             /* Which slot or cache entry holds it? */
             for (uint32_t k = 0; k < m.max_slots; k++)
                 if (m.slots && m.slots[k] == pc) fprintf(stderr, "  chain slot %u holds it\n", k);
+        }
+        fflush(stderr);
+    }
+    else { /* a fault in the engine's own code: where, as library offsets, and the frames above it */
+        char name[17] = "?";
+        pthread_getname_np(pthread_self(), name, sizeof name);
+        fprintf(stderr, "hengevm: signal %d in the engine (thread %s): addr %p\n", sig, name, info->si_addr);
+        uint64_t at[20];
+        int n = 0;
+        at[n++] = pc, at[n++] = HV_UC_LR(uc);
+        for (const uint64_t *fp = (const uint64_t *)(uintptr_t)HV_UC_X(uc, 29); fp && n < 20 && ((uintptr_t)fp & 7) == 0; fp = (const uint64_t *)(uintptr_t)fp[0]) {
+            uint64_t ret = fp[1];
+            if (!ret || (uintptr_t)fp[0] <= (uintptr_t)fp) break;
+            at[n++] = ret;
+        }
+        extern const char __ehdr_start[] __attribute__((weak)); /* this binary's start, static or not */
+        for (int i = 0; i < n; i++) {
+            Dl_info d = {0};
+            if (&__ehdr_start[0] && at[i] >= (uint64_t)(uintptr_t)__ehdr_start && !(dladdr((void *)(uintptr_t)at[i], &d) && d.dli_sname)) {
+                fprintf(stderr, "  #%d hengevm+0x%llx\n", i, (unsigned long long)(at[i] - (uint64_t)(uintptr_t)__ehdr_start));
+                continue;
+            }
+            if (dladdr((void *)(uintptr_t)at[i], &d) && d.dli_fname) {
+                const char *lib = strrchr(d.dli_fname, '/');
+                fprintf(stderr, "  #%d %s+0x%llx%s%s\n", i, lib ? lib + 1 : d.dli_fname,
+                        (unsigned long long)(at[i] - (uint64_t)(uintptr_t)d.dli_fbase), d.dli_sname ? " " : "", d.dli_sname ? d.dli_sname : "");
+            } else
+                fprintf(stderr, "  #%d %llx\n", i, (unsigned long long)at[i]);
         }
         fflush(stderr);
     }
