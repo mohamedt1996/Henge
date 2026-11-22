@@ -955,6 +955,15 @@ forces the shim's progress to storage (per piece), counts 2 MB pages by page fra
 of a reserve that was all 2 MB pages), and HV_GUNYAH_BELLS=0 leaves the doorbells out. The app no longer turns the
 JIT's in-memory RAM off after a Gunyah run (reims could not take the root engine's memory: "Protocol error").
 
+0.3.78 (2026-11-22): 0.3.77's Gunyah test passed everything the Mac's VM has (4 CPUs, 99 doorbells, 3 GB in 12
+pieces accepted), and its hand-over still reset the tablet: no vCPU exit at all after GH_VCPU_RUN (not even the
+shim's first report, now forced to storage), then the hypervisor's watchdog bit ("cpu alive mask from last pet 0f",
+20 s since the last pet). Two changes: the hand-over page moves to 0x20020000, beside the UART where the probe's
+reports always exited (0x6f000000, just under the VM's base, may be memory the resource manager keeps); and the engine
+sends each vCPU thread a signal every 2 ms (HV_GUNYAH_KICK_MS) so GH_VCPU_RUN comes back and the thread yields, as a
+guest that never stops otherwise keeps its CPU from Android. The test gets a guest that spins 30 s with no exit,
+plain and kicked (--spin, --kick), which says whether that is what happened and whether the kicks help.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

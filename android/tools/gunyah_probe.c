@@ -182,6 +182,17 @@ static uint64_t window_mb, window_at = ~0ull, window_handle;
    --piece-mb (256 by default there, as the engine shares it), the guest accepting every piece. */
 #define MAX_WPIECES 64
 static int reserve_window;
+/* 0.3.78: --spin S: once done, the guest runs S seconds more with no exit, as an OS does (the Mac's hand-over hung a
+   CPU and the hypervisor's watchdog reset the tablet); --kick MS: a signal every MS ms brings GH_VCPU_RUN back. */
+static int spin_s, kick_ms;
+static volatile int vm_over;
+static pthread_t main_tid;
+static volatile uint64_t kick_sent;
+static void *kicker(void *a) {
+    (void)a;
+    while (!vm_over) { usleep((useconds_t)kick_ms * 1000); pthread_kill(main_tid, SIGUSR1); kick_sent++; }
+    return NULL;
+}
 static uint64_t piece_mb, nwp, piece_handle[MAX_WPIECES];
 static int window_only, window_4k; /* --window-4k: the window in 4 KB pages (0.3.75: are small ones safe in small amounts?) */ /* --window-only: make the window and say how much of it is in 2 MB pages, nothing more */
 static int window_small_ok; /* --share-small-pages: share a window that is not in 2 MB pages */
@@ -509,7 +520,6 @@ static uint64_t report_pa, poke_at;
 static uint64_t window_pa_seen; /* the window's address, as the handoff answers it */
 static int poked;
 static volatile sig_atomic_t timed_out;
-static volatile int vm_over;
 static void on_alarm(int s) { (void)s; timed_out = 1; }
 static void on_usr1(int s) { (void)s; }
 
@@ -711,6 +721,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--window-only")) window_only = 1;
         else if (!strcmp(a, "--window-4k")) window_4k = 1;
         else if (!strcmp(a, "--reserve-window")) reserve_window = 1;
+        else if (!strcmp(a, "--spin") && v) spin_s = atoi(v), i++;
+        else if (!strcmp(a, "--kick") && v) kick_ms = atoi(v), i++;
         else if (!strcmp(a, "--piece-mb") && v) piece_mb = strtoull(v, NULL, 10), i++;
         else if (!strcmp(a, "--share-small-pages")) window_small_ok = 1;
         else if (!strcmp(a, "--bells")) bells = 1;
@@ -845,6 +857,7 @@ int main(int argc, char **argv) {
         }
     }
     memcpy(image + PROBE_GUEST_PARAMS, params, sizeof params);
+    if (spin_s) image[PROBE_GUEST_FLAGS + 7] = 1;
 
     struct rlimit nolimit = {RLIM_INFINITY, RLIM_INFINITY};
     setrlimit(RLIMIT_MEMLOCK, &nolimit); /* Gunyah pins what it is given */
@@ -970,6 +983,32 @@ int main(int argc, char **argv) {
         done = handle_exit(0);
     }
     alarm(0);
+    if (spin_s && done && !timed_out) {
+        /* The guest spins now: GH_VCPU_RUN comes back only if the driver lets a signal (the alarm, a kick) through. */
+        crumb("try: the guest spins %d s with no exit%s", spin_s, kick_ms ? ", kicked" : "");
+        printf("spin                   the guest runs %d s with no exit%s\n", spin_s, kick_ms ? " (kicked)" : "");
+        main_tid = pthread_self();
+        pthread_t kt;
+        if (kick_ms) pthread_create(&kt, NULL, kicker, NULL);
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        uint64_t back = 0, other = 0;
+        timed_out = 0;
+        alarm((unsigned)spin_s);
+        while (!timed_out) {
+            if (ioctl(vcpu_fd[0], GH_VCPU_RUN, 0) < 0) { if (errno == EINTR || errno == EAGAIN) { back++; continue; } break; }
+            other++;
+            if (handle_exit(0)) break;
+        }
+        alarm(0);
+        vm_over = 1;
+        if (kick_ms) pthread_join(kt, NULL);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double secs = (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+        printf("  spun                 %.1f s; GH_VCPU_RUN came back %llu times on signals (%llu kicks sent), %llu exits\n", secs,
+               (unsigned long long)back, (unsigned long long)kick_sent, (unsigned long long)other);
+        crumb("ok: spun %.1f s", secs);
+    }
     vm_over = 1;
     for (int i = 1; i < ncpus; i++) {
         pthread_kill(vthread[i], SIGUSR1); /* out of GH_VCPU_RUN */

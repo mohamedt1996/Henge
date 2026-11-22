@@ -156,7 +156,11 @@ done:
     str  x3, [x9, #0x80]
 12: movz x1, #0xd0e
     str  x1, [x9, #0x78]
-    movz x0, #0x8400, lsl #16
+    adr  x1, flags                      /* 0.3.78: flags[7] set: run on forever with no exit (--spin), as an OS does */
+    ldrb w1, [x1, #7]
+    cbz  w1, 13f
+14: b    14b
+13: movz x0, #0x8400, lsl #16
     movk x0, #0x0008                    /* PSCI SYSTEM_OFF */
     hvc  #0
 7:  wfi

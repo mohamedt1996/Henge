@@ -32,6 +32,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -89,7 +90,10 @@ struct ghsm_share_blob { int32_t vm_fd; uint32_t label, flags, mem_handle; uint6
 #define BOOT_PA 0x6fe00000ull   /* the VM's own region: just under the Mac's RAM (the tablet takes it, 0.3.74) */
 #define BOOT_SIZE 0x200000ull
 #define DTB_OFF 0x10000ull
-#define HANDOFF_PA 0x6f000000ull /* a page with nothing behind it: the shim's reads and reports come here */
+/* The shim's reads and reports come here: 20 KB with nothing behind them, beside vmapple's UART (0x20010000, where
+   the probe's report page has always exited); 0.3.77's 0x6f000000, just under the VM's base, never exited once. Only
+   until the jump: Henge's own devices after it. */
+#define HANDOFF_PA 0x20020000ull
 #define SHARE_CHUNK (256ull << 20)  /* a piece of 2 MB pages */
 #define SMALL_CHUNK (8ull << 20)    /* a piece of 4 KB pages: 8 MB of them shared fine, 64 MB reset the tablet (0.3.75) */
 #define MAX_PIECES 640
@@ -713,6 +717,23 @@ static void shim_report(uint64_t off, uint64_t v) {
 
 /* ---- the vCPU ---- */
 
+/* 0.3.77's hand-over: vCPU 0 never came back from GH_VCPU_RUN, and 20 s later the hypervisor's watchdog reset the
+   tablet with four of its CPUs silent ("cpu alive mask 0f"): a vCPU that runs on and on keeps its CPU from Android.
+   A signal every HV_GUNYAH_KICK_MS (2 by default; 0: none) brings each vCPU's GH_VCPU_RUN back, and the thread yields
+   before going in again. The app's Gunyah test (--spin, --kick) says whether the driver lets signals through. */
+static int kick_ms = 2;
+static uint64_t kicks_back[HV_MAX_CPUS];
+static void *kick_thread(void *arg) {
+    (void)arg;
+    while (!stop_req) {
+        usleep((useconds_t)kick_ms * 1000);
+        for (int i = 0; i < nvcpu; i++)
+            if (vcpu_thread_id[i]) pthread_kill(vcpu_thread_id[i], SIGUSR1);
+    }
+    return NULL;
+}
+
+
 static void on_sigusr(int s) { (void)s; }
 
 static void *vcpu_thread(void *arg) {
@@ -728,9 +749,14 @@ static void *vcpu_thread(void *arg) {
     pthread_sigmask(SIG_UNBLOCK, &s, NULL);
     hv_vm_set_this_cpu(id);
     hv_host_cpu_thread();
+    say("gunyah: vCPU %d enters GH_VCPU_RUN\n", id);
     while (!stop_req) {
         if (ioctl(vcpu_fd[id], GH_VCPU_RUN, 0) < 0) {
-            if (errno == EINTR || errno == EAGAIN) continue;
+            if (errno == EINTR || errno == EAGAIN) {
+                if (kicks_back[id]++ == 0) say("gunyah: vCPU %d came back on a signal: the kicks work\n", id);
+                sched_yield();
+                continue;
+            }
             fprintf(stderr, "gunyah: running vCPU %d failed: %s\n", id, strerror(errno));
             vm_reason = HV_EXIT_UNSUPPORTED;
             break;
@@ -740,7 +766,7 @@ static void *vcpu_thread(void *arg) {
             unsigned len = r->mmio.len > 8 ? 8 : r->mmio.len;
             if (mmio_exits[id]++ == 0) say("gunyah: vCPU %d runs (its first exit: %s %#llx)\n", id, r->mmio.is_write ? "a store to" : "a load from",
                                            (unsigned long long)pa);
-            if (pa >= HANDOFF_PA && pa < HANDOFF_PA + 0x5000) {
+            if (!mac_runs && pa >= HANDOFF_PA && pa < HANDOFF_PA + 0x5000) {
                 uint64_t off = pa - HANDOFF_PA, v = 0;
                 if (r->mmio.is_write) {
                     memcpy(&v, r->mmio.data, len);
@@ -1003,10 +1029,16 @@ int hv_gunyah_run(void) {
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 8u << 20);
     for (int i = 0; i < nvcpu; i++) pthread_create(&vcpu_thread_id[i], &attr, vcpu_thread, (void *)(intptr_t)i);
+    if (getenv("HV_GUNYAH_KICK_MS")) kick_ms = atoi(getenv("HV_GUNYAH_KICK_MS"));
+    if (kick_ms > 0) {
+        pthread_create(&t, NULL, kick_thread, NULL);
+        pthread_detach(t);
+    }
     for (int i = 0; i < nvcpu; i++) pthread_join(vcpu_thread_id[i], NULL);
     for (int i = 0; i < nvcpu; i++) vcpu_thread_id[i] = 0;
     stop_req = 1;
     usleep(20000);
     if (!mac_runs) fprintf(stderr, "gunyah: the shim did not reach the Mac (its last phase: %s)\n", phase_name(shim_rep[0]));
+    fprintf(stderr, "gunyah: vCPU 0 came back on signals %llu times\n", (unsigned long long)kicks_back[0]);
     return vm_reason < 0 ? 0 : vm_reason;
 }

@@ -48,15 +48,13 @@ final class GunyahTest {
             {"Share 4 MB into the running VM (needs DroidVM's gunyah-host-share module)", "--lend --share-window 4", "10", "info"},
             {"Share 64 MB at the Mac's layout (base 0x70000000)", "--lend --base 70000000 --gic 10000000 --image-mb 16 --share-window 64", "15", "info"},
             {"The memory reserved for the Mac (Settings > Gunyah memory)", "--reserve-status", "10", "info"},
-            // 0.3.77: the first hand-over (0.3.76) reset the tablet as its vCPUs started, after 3 GB were shared in 12
-            // pieces into a VM with 99 interrupt doorbells: neither had been tried. These try each, then both, without
-            // the Mac (the reserved memory is the window; the Mac must not be running).
-            {"As the Mac's VM: 4 CPUs and its 99 interrupt doorbells", "--lend --base 6fe00000 --image-mb 2 --gic 10000000 --cpus 4 --rm-call --bells", "15", "info"},
-            {"The reserved RAM: 1 GB in 4 pieces, accepted by the guest", "--lend --base 6fe00000 --image-mb 2 --gic 10000000 --reserve-window --share-window 1024 --window-at 70000000", "30", "info"},
-            {"All of it: 3 GB in 12 pieces, as the Mac's (may reset the tablet)", "--lend --base 6fe00000 --image-mb 2 --gic 10000000 --reserve-window --share-window 3072 --window-at 70000000", "45", "info"},
-            {"Everything the Mac's VM has: 4 CPUs, doorbells, 3 GB (may reset the tablet)", "--lend --base 6fe00000 --image-mb 2 --gic 10000000 --cpus 4 --bells --reserve-window --share-window 3072 --window-at 70000000", "45", "info"},
+            // 0.3.78: 0.3.77's steps all passed (4 CPUs, 99 doorbells, 3 GB in 12 pieces), yet the Mac's hand-over hung
+            // a CPU and the hypervisor's watchdog reset the tablet 20 s later: the probe's guests always stopped, an OS
+            // never does. A guest that runs on with no exit, without and then with a signal every 2 ms:
+            {"A guest that never stops: 30 s with no exit (may reset the tablet)", "--lend --base 6fe00000 --image-mb 2 --gic 10000000 --spin 30", "50", "info"},
+            {"The same, with a signal every 2 ms to bring it back (may reset the tablet)", "--lend --base 6fe00000 --image-mb 2 --gic 10000000 --spin 30 --kick 2", "50", "info"},
     };
-    private static final int VERSION = 16; // of STEPS: progress saved by another list starts over
+    private static final int VERSION = 17; // of STEPS: progress saved by another list starts over
 
     static volatile boolean running;
 
