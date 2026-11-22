@@ -149,6 +149,11 @@ pub(crate) fn henge_note_written(line: std::fmt::Arguments<'_>) {
 def main() -> None:
     root = pathlib.Path(sys.argv[1])
     changed = 0
+    # metal2vulkan takes textures that render or that a shader writes in place itself from eac9da3
+    # (2026-11-07, `Access::Renders`, `Access::Writes`), each checked on the device: nothing to add.
+    if 'Renders,' in (root / 'crates/metal2vulkan-runtime/src/in_place.rs').read_text():
+        print('m2v_render_in_place: metal2vulkan renders in place itself; nothing to do')
+        return
     for rel, edits in EDITS.items():
         path = root / rel
         text = path.read_text()

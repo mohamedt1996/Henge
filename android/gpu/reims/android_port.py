@@ -225,6 +225,10 @@ def main() -> None:
     # reims-vgpu: what this device lacks is an error the guest sees (Metal's NSError, nil), not the
     # app's death (reims_lenient.py).
     subprocess.run([sys.executable, '-I', str(HERE / 'reims_lenient.py'), str(reims)], check=True)
+    # reims-vgpu's dma-buf answers of 2026-11-15, backported: udmabuf's limits read once a second, and
+    # each source's latest answers kept (reims_dma_buf_kept.py). Only where the revision lacks them.
+    if 'fn host_limits()' not in (reims / 'crates/reims-vgpu-vulkan/src/os/linux/dma_buf.rs').read_text():
+        subprocess.run([sys.executable, '-I', str(HERE / 'reims_dma_buf_kept.py'), str(reims)], check=True)
     # The shader primer: pipeline records kept across runs and warmed on the next device. reims-vgpu
     # does this itself from 2026-11 (records.rs); there its warm pass's driver-cache budget is cut from
     # 4 GiB to 256 MiB, the tablet's RAM holding Turnip's cache. Older revisions take reims_primer.py.

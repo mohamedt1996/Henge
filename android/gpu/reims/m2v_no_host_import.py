@@ -171,6 +171,15 @@ def main() -> None:
         path = root / rel
         text = path.read_text()
         for old, new in edits:
+            # metal2vulkan from eac9da3 (2026-11-07) puts the loader's word back around a call under
+            # its lock (`DeviceWord::restored`), no longer by a bare `restore`.
+            if 'unsafe fn restored<R>' in (root / 'crates/metal2vulkan-runtime/src/loader_word.rs').read_text():
+                new = new.replace('''                let function = unsafe {
+                    loader_word.restore();
+                    instance.get_device_proc_addr(handle, name.as_ptr())
+                };''', '''                let function = unsafe {
+                    loader_word.restored(|| instance.get_device_proc_addr(handle, name.as_ptr()))
+                };''')
             if new in text:
                 continue
             if text.count(old) != 1:

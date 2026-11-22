@@ -860,12 +860,26 @@ nearly full. Memory, not the JIT, is what the tablet is short of.
 - **JIT**: CONTEXTIDR_EL1 (read and write), PSTATE.UAO (MSR immediate and register) and SCTLR_EL1 writes that change
   none of M, WXN, E0E or EE are translated inline at EL1, no longer a helper exit each (about a third of the
   0.3.68 log's ~22 thousand MSR exits a second). A SCTLR write that changes one of those four still takes the helper.
-- **reims-vgpu fe127c1 / metal2vulkan 6b4b4b0** (2026-11-07), from 1fe0acb / 219f013 (2026-10-29): 1373 and 894
-  commits. This is the last reims-vgpu with Apple's ParavirtualizedGraphics glue: upstream deleted it on 2026-11-07
-  (110b536, "Delete the paravirt glue") for its own device, so later revisions, and the dma-buf work of
-  2026-11-14/15, need a port of that glue first. reims-vgpu now keeps and warms metal2vulkan's pipeline records
-  itself (records.rs), so reims_primer.py runs only on older revisions; its warm budget is cut to 256 MiB.
-  m2v_copy_in_used.py follows copy_in's new in-flight argument; reims_lenient.py follows `created_or_decided`.
+- **reims-vgpu dae3e6b / metal2vulkan eac9da3** (2026-11-07), from 1fe0acb / 219f013 (2026-10-29): the last
+  reims-vgpu with Apple's ParavirtualizedGraphics glue (upstream deleted it in the next commits, 3db95eb and
+  110b536, for its own device). What rides with it for the tablet:
+  - the guest's RAM gets udmabuf's dma-bufs of its pages (2b8828c): with Turnip, which imports no host pointer,
+    RAM chunks were copies; they can now be imported in place;
+  - metal2vulkan itself compares only the copied host buffers a commit's commands use (what
+    m2v_copy_in_used.py did; only its merge-back cost line stays) and takes textures that render or that a
+    shader writes in place, each checked on the device (what m2v_render_in_place.py did, without the
+    tight-rows condition; the script now does nothing there);
+  - reims-vgpu keeps and warms pipeline records itself (records.rs): reims_primer.py runs only on older
+    revisions, and upstream's warm budget is cut from 4 GiB to 256 MiB;
+  - fixes: GPU writes into the Mac's read-only memory dropped as Metal does, pictures landed in pages imported
+    as dma-bufs, nil for over-long textures, among 109 commits past fe127c1.
+- **Backported** from reims-vgpu's 2026-11-15 dma-buf work (reims_dma_buf_kept.py): udmabuf's limits read
+  once a second, not at every dma-buf (56c7608); each dma-buf source's latest four answers kept and given
+  again as duplicate descriptors (c52a553: upstream found 9 in 10 asks repeated); runs that fit one dma-buf
+  made into it directly (e8ee29f, its second half). Log: "reims-vgpu: (Henge) dma-buf answers: N made, M
+  kept". The rest of that work (region files, grouped dma-bufs, view folding) is for RADV's and NVIDIA's
+  per-submission import lists and needs the later tree.
+- m2v_no_host_import.py follows `DeviceWord::restored`; reims_lenient.py follows `created_or_decided`.
 
 What to expect next, in order:
 

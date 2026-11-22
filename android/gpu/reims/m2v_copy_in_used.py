@@ -265,7 +265,12 @@ const USED: usize = 1 << 16;
 def main() -> None:
     root = pathlib.Path(sys.argv[1])
     changed = 0
+    # metal2vulkan compares only the copies a commit's commands use itself from eac9da3 (2026-11-07,
+    # `CopiesReached`, `copied_copy_ins_unused`): there only the merges' cost line is added.
+    native = 'copied_copy_ins_unused' in (root / 'crates/metal2vulkan-runtime/src/copied.rs').read_text()
     for rel, edits in EDITS.items():
+        if native and not rel.endswith('#merges'):
+            continue
         path = root / rel.split('#')[0] # a file's second group of edits is keyed 'path#name'
         text = path.read_text()
         for old, new in edits:
