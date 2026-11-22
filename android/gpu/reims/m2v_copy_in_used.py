@@ -33,16 +33,29 @@ import sys
 
 EDITS = {
     'crates/metal2vulkan-runtime/src/copied.rs': [
-        ("""    pub(crate) fn copy_in(&self, counts: &Counters, tally: &DirtyTally) {
+        ("""    pub(crate) fn copy_in(
+        &self,
+        counts: &Counters,
+        tally: &DirtyTally,
+        in_flight: impl FnOnce() -> Vec<Range<u64>>,
+    ) {
         if self.live.load(Ordering::Relaxed) == 0 {
             return;
         }
+        let in_flight = in_flight();
         let asked: Vec<Asked> = (lock(&self.entries).iter())
             .filter_map(|entry| {
-""", """    pub(crate) fn copy_in(&self, counts: &Counters, tally: &DirtyTally, used: &Written) {
+""", """    pub(crate) fn copy_in(
+        &self,
+        counts: &Counters,
+        tally: &DirtyTally,
+        in_flight: impl FnOnce() -> Vec<Range<u64>>,
+        used: &Written,
+    ) {
         if self.live.load(Ordering::Relaxed) == 0 {
             return;
         }
+        let in_flight = in_flight();
         // Henge's Android port (m2v_copy_in_used.py): only the copies the command buffer's commands
         // use are compared (`used`), every copy where M2V_COPY_IN_ALL is set.
         static EVERY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -222,7 +235,11 @@ const USED: usize = 1 << 16;
 """),
     ],
     'crates/metal2vulkan-runtime/src/command_buffer/mod.rs': [
-        ("""        shared.copied.copy_in(&shared.counts, shared.dirty.tally());
+        ("""        shared
+            .copied
+            .copy_in(&shared.counts, shared.dirty.tally(), || {
+                shared.dirty.in_flight()
+            });
 """, """        // Henge's Android port (m2v_copy_in_used.py): the copies its commands use, by the keys of
         // the uses they noted; every copy where a command may reach memory no use names, as the
         // merge back takes every copy as written then (`completion.rs`).
@@ -234,7 +251,12 @@ const USED: usize = 1 << 16;
             lock(&self.0.dirty).copies_used(&mut used);
             used
         };
-        shared.copied.copy_in(&shared.counts, shared.dirty.tally(), &used);
+        shared.copied.copy_in(
+            &shared.counts,
+            shared.dirty.tally(),
+            || shared.dirty.in_flight(),
+            &used,
+        );
 """),
     ],
 }

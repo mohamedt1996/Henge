@@ -12,9 +12,9 @@
 set -eu
 
 REIMS_REPO=https://github.com/steelbrain/reims-vgpu
-REIMS_REV=1fe0acb68b287db36f1e6c7b9f45383940b8a76f
+REIMS_REV=fe127c11172144502622096e0691d2809fe22518
 M2V_REPO=https://github.com/steelbrain/metal2vulkan
-M2V_REV=219f01365dc4c8eb346816c405b5b17403793764 # the commit reims-vgpu's Cargo.toml names
+M2V_REV=6b4b4b06925105ac33a2f45c5b2eeed27dc87200 # the commit reims-vgpu's Cargo.toml names
 API=29                                           # the app's minSdk
 TARGET=aarch64-linux-android
 

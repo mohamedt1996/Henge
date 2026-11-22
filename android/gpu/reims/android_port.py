@@ -225,8 +225,20 @@ def main() -> None:
     # reims-vgpu: what this device lacks is an error the guest sees (Metal's NSError, nil), not the
     # app's death (reims_lenient.py).
     subprocess.run([sys.executable, '-I', str(HERE / 'reims_lenient.py'), str(reims)], check=True)
-    # The shader primer: pipeline records kept across runs and warmed on the next device (reims_primer.py).
-    subprocess.run([sys.executable, '-I', str(HERE / 'reims_primer.py'), str(reims)], check=True)
+    # The shader primer: pipeline records kept across runs and warmed on the next device. reims-vgpu
+    # does this itself from 2026-11 (records.rs); there its warm pass's driver-cache budget is cut from
+    # 4 GiB to 256 MiB, the tablet's RAM holding Turnip's cache. Older revisions take reims_primer.py.
+    records = reims / 'crates/reims-vgpu-vulkan/src/records.rs'
+    if records.exists():
+        text = records.read_text()
+        old = 'pub(crate) const WARM_BUDGET: u64 = 4 << 30;'
+        new = 'pub(crate) const WARM_BUDGET: u64 = 256 << 20; // Henge\'s Android port: 256 MiB, not 4 GiB'
+        if new not in text:
+            if text.count(old) != 1:
+                sys.exit(f'android_port: {records}: WARM_BUDGET not found once; upstream changed')
+            records.write_text(text.replace(old, new))
+    else:
+        subprocess.run([sys.executable, '-I', str(HERE / 'reims_primer.py'), str(reims)], check=True)
     # A Vulkan driver of the app's own (Turnip), opened directly as the ICD (m2v_icd_library.py).
     subprocess.run([sys.executable, '-I', str(HERE / 'm2v_icd_library.py'), str(m2v)], check=True)
     # A commit compares the copied host buffers its commands use, not every one (m2v_copy_in_used.py).

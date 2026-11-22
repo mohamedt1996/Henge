@@ -855,6 +855,18 @@ nearly full. Memory, not the JIT, is what the tablet is short of.
   back by the Mac (balloon)"; the balloon's own lines say what macOS lists and gives. macOS's AppleVirtIOBalloon
   has not been seen on a tablet (nor on upstream's phone): the log says whether it binds.
 
+0.3.69 (test build, branch cpu-gpu-speed, 2026-11-22):
+
+- **JIT**: CONTEXTIDR_EL1 (read and write), PSTATE.UAO (MSR immediate and register) and SCTLR_EL1 writes that change
+  none of M, WXN, E0E or EE are translated inline at EL1, no longer a helper exit each (about a third of the
+  0.3.68 log's ~22 thousand MSR exits a second). A SCTLR write that changes one of those four still takes the helper.
+- **reims-vgpu fe127c1 / metal2vulkan 6b4b4b0** (2026-11-07), from 1fe0acb / 219f013 (2026-10-29): 1373 and 894
+  commits. This is the last reims-vgpu with Apple's ParavirtualizedGraphics glue: upstream deleted it on 2026-11-07
+  (110b536, "Delete the paravirt glue") for its own device, so later revisions, and the dma-buf work of
+  2026-11-14/15, need a port of that glue first. reims-vgpu now keeps and warms metal2vulkan's pipeline records
+  itself (records.rs), so reims_primer.py runs only on older revisions; its warm budget is cut to 256 MiB.
+  m2v_copy_in_used.py follows copy_in's new in-flight argument; reims_lenient.py follows `created_or_decided`.
+
 What to expect next, in order:
 
 - metal2vulkan on the Adreno driver: it needs a Vulkan 1.2 device; what the driver lacks shows as

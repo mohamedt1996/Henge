@@ -55,7 +55,7 @@ EDITS = {
         Ok(v) => Ok(Some(v)),
         Err(Error::Nil(_)) => Ok(None),
         Err(e) if nil.covers(&e) => Ok(None),
-        Err(e) => decide(sel, policy, e),
+        Err(e) => created_or_decided(sel, policy, e),
     }
 }
 """, """    stop_if_task_ended();
@@ -69,7 +69,7 @@ EDITS = {
             log::warn!("{sel}: refused on this device, answered nil: {e}");
             Ok(None)
         }
-        Err(e) => decide(sel, policy, e),
+        Err(e) => created_or_decided(sel, policy, e),
     }
 }
 """),
