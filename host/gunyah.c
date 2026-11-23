@@ -1621,6 +1621,7 @@ static void *clean_thread(void *arg) {
 
 /* The reset vector's report (kpatch): which = 0, the CPU's MPIDR as it arrives; 8, the CPU table pointer as it read it
    with its caches off, set against what memory (through the host's cached view) holds. */
+static int rv_cleaned[HV_MAX_CPUS]; /* this CPU start's RAM clean is done (first report seen) */
 static void rv_report(int id, uint64_t which, uint64_t v) {
     static int n;
     n++;
@@ -1633,11 +1634,18 @@ static void rv_report(int id, uint64_t which, uint64_t v) {
            once XNU checked, at the root mount). This stop is the CPU's first store, before it reads any of that: the
            whole of the Mac's RAM is cleaned to memory now, and the CPU goes on only after. */
         long ms = clean_all_ram_quiet(1);
+        rv_cleaned[id] = 1;
         if (n <= 8)
             fprintf(stderr, "gunyah: vCPU %d reached the kernel's reset vector (MPIDR %#llx): CPU_ON started it; the Mac's RAM "
                             "cleaned to memory for it (%ld ms)\n", id, (unsigned long long)v, ms);
         return;
     }
+    if (!rv_cleaned[id]) { /* its first report did not arrive: clean now, still before it reads its CPU data */
+        long ms = clean_all_ram_quiet(1);
+        fprintf(stderr, "gunyah: vCPU %d is at the kernel's reset vector (its first report missing); the Mac's RAM cleaned "
+                        "to memory for it (%ld ms)\n", id, ms);
+    }
+    rv_cleaned[id] = 0;
     if (n > 16) return;
     const uint8_t *p = rv_rhd ? hv_phys_ptr(M, rv_rhd, 8) : NULL;
     uint64_t mem = p ? rd64(p) : 0;
@@ -1647,6 +1655,7 @@ static void rv_report(int id, uint64_t which, uint64_t v) {
 }
 
 static uint64_t kicks_back[HV_MAX_CPUS];
+static uint64_t saved_exits[HV_MAX_CPUS]; /* exits that came back with a signal (0.3.101: once lost) */
 static void *kick_thread(void *arg) {
     (void)arg;
     thread_altstack();
@@ -1677,15 +1686,30 @@ static void *vcpu_thread(void *arg) {
     hv_host_cpu_thread();
     say("gunyah: vCPU %d enters GH_VCPU_RUN\n", id);
     while (!stop_req) {
+        /* 0.3.101: the driver ends GH_VCPU_RUN with -ERESTARTSYS whenever a signal is pending, also when it has just
+           filled in an MMIO exit (exit_reason MMIO, its state "MMIO read/write"); the next run then resumes that access as
+           handled. Each kick (every 2 ms) that landed so lost a device access: a store dropped, a load answered with
+           whatever data was left in the run area. 0.3.100 lost vCPU 1's first report at the reset vector that way (its
+           first exit seen was the second store), so its RAM was not cleaned and it hung: "cpu 1 failed to boot" again.
+           exit_reason is cleared before each run, and an interrupted run that left an exit behind is handled as one. */
+        r->exit_reason = GH_VCPU_EXIT_UNKNOWN;
         if (ioctl(vcpu_fd[id], GH_VCPU_RUN, 0) < 0) {
             if (errno == EINTR || errno == EAGAIN) {
                 if (kicks_back[id]++ == 0) say("gunyah: vCPU %d came back on a signal: the kicks work\n", id);
-                sched_yield();
-                continue;
+                if (r->exit_reason == GH_VCPU_EXIT_MMIO || r->exit_reason == GH_VCPU_EXIT_STATUS) {
+                    if (saved_exits[id]++ < 3)
+                        say("gunyah: vCPU %d: an exit came back with a signal (%s %#llx): handled, not lost\n", id,
+                            r->exit_reason == GH_VCPU_EXIT_STATUS ? "status" : r->mmio.is_write ? "store to" : "load from",
+                            (unsigned long long)r->mmio.phys_addr);
+                } else {
+                    sched_yield();
+                    continue;
+                }
+            } else {
+                fprintf(stderr, "gunyah: running vCPU %d failed: %s\n", id, strerror(errno));
+                vm_reason = HV_EXIT_UNSUPPORTED;
+                break;
             }
-            fprintf(stderr, "gunyah: running vCPU %d failed: %s\n", id, strerror(errno));
-            vm_reason = HV_EXIT_UNSUPPORTED;
-            break;
         }
         if (r->exit_reason == GH_VCPU_EXIT_MMIO) {
             uint64_t pa = r->mmio.phys_addr;
@@ -1993,6 +2017,9 @@ int hv_gunyah_run(void) {
     hv_gic_external = NULL;
     hv_vm_stop_hook = NULL;
     if (!mac_runs) fprintf(stderr, "gunyah: the shim did not reach the Mac (its last phase: %s)\n", phase_name(shim_rep[0]));
-    fprintf(stderr, "gunyah: vCPU 0 came back on signals %llu times\n", (unsigned long long)kicks_back[0]);
+    fprintf(stderr, "gunyah: vCPU 0 came back on signals %llu times; exits that came back with a signal (once lost):",
+            (unsigned long long)kicks_back[0]);
+    for (int i = 0; i < nvcpu; i++) fprintf(stderr, " vcpu%d %llu", i, (unsigned long long)saved_exits[i]);
+    fputc('\n', stderr);
     return vm_reason < 0 ? 0 : vm_reason;
 }

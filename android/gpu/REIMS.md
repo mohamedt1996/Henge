@@ -1210,3 +1210,12 @@ stacks), and it hangs on reset_vector's "b .". Now the reset vector's first repo
 Mac's RAM is cleaned to memory (about 70 ms), before it reads any of it. Also: the kicker and a stopping vCPU called
 pthread_kill on vCPU threads already joined (the engine's segfault after "the VM stopped"); a thread is signalled
 only while it lives now.
+
+0.3.101 (2026-11-23): 0.3.100 brought CPUs 2 and 3 up (each stopped at the reset vector for the RAM clean, then worked:
+xHCI, PCI) but not CPU 1: its first report never reached Henge (its first exit seen was the second store), so nothing
+was cleaned for it, it read stale CPU data and hung, and XNU panicked "cpu 1 failed to boot" at the root mount. The
+Gunyah driver ends GH_VCPU_RUN with -ERESTARTSYS whenever a signal is pending, also right after filling in an MMIO
+exit, and resumes that access as handled on the next run: every kick (SIGUSR1 each 2 ms) that landed so dropped a
+store or answered a load with stale data, on every vCPU, devices included. exit_reason is now cleared before each run
+and an interrupted run that left an exit behind is handled as one (counted per vCPU at the end). The reset vector's
+second report also cleans the RAM if the first was missed.
