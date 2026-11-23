@@ -23,6 +23,46 @@
 
    Only single, naturally aligned loads and stores at the page: Gunyah can hand Henge only those (no LDP). Memory is
    Device with the MMU off, so the same holds for the tree and for rmbuf. */
+/* A guarded probe: arm the guard, do one access, report the value and whether it faulted. */
+    .macro gpre
+    adr  x16, shim_try
+    mov  x17, #1
+    str  x17, [x16]
+    str  xzr, [x16, #8]
+    mov  x0, #0
+    .endm
+    .macro gpost n
+    str  xzr, [x16]
+    ldr  x17, [x16, #8]
+    str  x0, [x9, #(0x100 + 16 * \n)]
+    str  x17, [x9, #(0x108 + 16 * \n)]
+    .endm
+    .macro gaddr a
+    movz x2, #((\a) & 0xffff)
+    movk x2, #(((\a) >> 16) & 0xffff), lsl #16
+    .endm
+    .macro gld n, a, sz
+    gaddr \a
+    gpre
+    .ifc \sz, w
+    ldr  w0, [x2]
+    .else
+    ldr  x0, [x2]
+    .endif
+    gpost \n
+    .endm
+    .macro gst n, a
+    gaddr \a
+    gpre
+    str  w3, [x2]
+    gpost \n
+    .endm
+    .macro gsys n, op:vararg
+    gpre
+    \op
+    gpost \n
+    .endm
+
     .text
     .balign 4096
     .global hv_gunyah_shim_start, hv_gunyah_shim_end, hv_gunyah_shim_params
@@ -52,6 +92,30 @@ hv_gunyah_shim_start:
     ldr  x17, [x16]
     str  x17, [x9, #0x78]
     str  x0, [x9, #0x70]
+
+    /* 0.3.89: Gunyah's GIC as the kernel's pe_init_fiq will use it, each access under the guard: value at
+       +0x100 + 16 n, then 0 (it ran) or ESR | 1 << 63 (it faulted) at +0x108 + 16 n. */
+    gld  0, 0x10000000, w
+    gld  1, 0x10000004, w
+    gld  2, 0x10010008, x
+    gld  3, 0x10010014, w
+    gld  4, 0x10020080, w
+    movz w3, #0xffff
+    movk w3, #0x81ff, lsl #16
+    gst  5, 0x10020080
+    gld  6, 0x10020080, w
+    gld  7, 0x10020100, w
+    gld  8, 0x10030008, x
+    gld  9, 0x10050008, x
+    gsys 10, mrs x0, s3_0_c12_c12_5
+    mov  x3, #0
+    gsys 11, msr s3_0_c12_c8_3, x3
+    mov  x3, #0xff
+    gsys 12, msr s3_0_c4_c6_0, x3
+    gsys 13, mrs x0, s3_0_c12_c12_4
+    mov  x3, #1
+    gsys 14, msr s3_0_c12_c12_6, x3
+    gsys 15, mrs x0, s3_0_c12_c12_6
     str  xzr, [x16]
 
     bl   rmfind
@@ -385,6 +449,8 @@ hv_gunyah_shim_params:
     .quad 0                             /* the VM's device tree */
 shim_try:
     .quad 0                             /* 1 while a read that may trap is tried: the vectors skip it */
+shim_tryesr:
+    .quad 0                             /* and the skipped access's ESR | 1 << 63 */
 shim_rmbuf:
     .fill 256, 1, 0
 
@@ -395,6 +461,9 @@ shim_vectors:
     ldr  x17, [x16]
     cbz  x17, 1f
     str  xzr, [x16]
+    mrs  x17, esr_el1
+    orr  x17, x17, #(1 << 63)
+    str  x17, [x16, #8]
     mrs  x17, elr_el1
     add  x17, x17, #4
     msr  elr_el1, x17

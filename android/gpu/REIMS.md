@@ -1106,3 +1106,12 @@ log is the same ("failed to find the timer", then "MACH Reboot"), and no "panic(
 this early a panic's text has no buffer and goes only to the video console, drawn into the framebuffer. On a stall the
 engine now writes that framebuffer (from msgbuf's "initialize_screen" line) to Henge/gunyah-screen.bmp, and looks for
 "Debugger called: <...>" in RAM too.
+
+0.3.89 (2026-11-23): where the kernel dies: right after "failed to find the timer" XNU's arm_init runs pe_init_fiq,
+which sets up the GIC redistributor for the timer's FIQ. 0.3.84's register dump already pointed there: x9 0x81ffffff
+(the value XNU writes to GICR_IGROUPR0) and the stale FAR x8 + 0x80 (GICR_IGROUPR0 in the SGI frame), so a data abort
+on Gunyah's redistributor came first, and the PAC panic was its handler. 0.3.88's screen was black and no panic text
+was anywhere: this early a panic has no buffer and no console. Now: (1) the kernel's boot-args get "serial=3 debug=0x8
+keepsyms=1 -v", so its console and any panic (with a symbolicated backtrace) come out on the serial port into this
+log; (2) before the kernel, the shim makes each GIC access pe_init_fiq will make (GICD, GICR RD and SGI frames, the
+ICC group-0 registers) under a guard and logs its value or its fault's ESR.

@@ -434,6 +434,21 @@ static int kpatch(void) {
     uint64_t virt = rd64(b + 8), phys = rd64(b + 16), top = rd64(b + 32), dtva = rd64(b + 96);
     k_virt = virt, k_phys = phys, k_top = top;
     uint32_t dtlen = rd32(b + 104);
+    /* 0.3.89: the kernel's own console on the serial port (this log), panics included. Until now a panic this early had
+       nowhere to go (no panic buffer yet, serial console off, video console not drawn) and showed only as "MACH Reboot".
+       boot_args' CommandLine (offset 108) is edited before the kernel parses it. HV_GUNYAH_BOOT_ARGS replaces what is
+       added ("" adds nothing). */
+    {
+        char *cmd = (char *)B->ram + ba + 108;
+        const char *add = getenv("HV_GUNYAH_BOOT_ARGS");
+        if (!add) add = "serial=3 debug=0x8 keepsyms=1 -v";
+        size_t len = strnlen(cmd, 600);
+        if (*add && !strstr(cmd, "serial=") && len + 1 + strlen(add) < 600) {
+            if (len) cmd[len++] = ' ';
+            strcpy(cmd + len, add);
+        }
+        fprintf(stderr, "gunyah: the kernel's boot-args: \"%.600s\"\n", cmd);
+    }
     fprintf(stderr, "gunyah: boot_args at pa %#llx: kernel at virtual %#llx = physical %#llx, its data to %#llx, device tree "
                     "at %#llx (%u bytes)\n", (unsigned long long)(VMAPPLE_MEM + (uint64_t)ba), (unsigned long long)virt,
             (unsigned long long)phys, (unsigned long long)top, (unsigned long long)dtva, dtlen);
@@ -721,6 +736,21 @@ static void shim_report(uint64_t off, uint64_t v) {
     }
     if (i == 8 && v < 640) say("gunyah: shim: accepting piece %llu (%#llx, %llu MB)\n", (unsigned long long)v,
                                (unsigned long long)handoff[129 + 3 * v], (unsigned long long)(handoff[130 + 3 * v] >> 20));
+    if (i >= 32 && i < 64 && (i & 1)) { /* 0.3.89: the shim's look at Gunyah's GIC before the kernel's */
+        static const char *probe[16] = {"GICD_CTLR", "GICD_TYPER", "GICR_TYPER (vCPU 0, 0x10010008)", "GICR_WAKER",
+                                        "GICR_IGROUPR0 (SGI frame, 0x10020080) read", "GICR_IGROUPR0 write 0x81ffffff",
+                                        "GICR_IGROUPR0 read back", "GICR_ISENABLER0 (0x10020100) read",
+                                        "GICR_TYPER at 0x10030008 (vCPU 1 if the stride is 128K)",
+                                        "GICR_TYPER at 0x10050008 (vCPU 1 if the stride is 256K)", "ICC_SRE_EL1",
+                                        "ICC_BPR0_EL1 write 0", "ICC_PMR_EL1 write 0xff", "ICC_CTLR_EL1",
+                                        "ICC_IGRPEN0_EL1 write 1", "ICC_IGRPEN0_EL1"};
+        unsigned n = (i - 32) / 2;
+        if (v >> 63)
+            say("gunyah: shim: GIC probe %s: FAULTS (ESR %#llx)\n", probe[n], (unsigned long long)(v & ~(1ull << 63)));
+        else
+            say("gunyah: shim: GIC probe %s: %#llx\n", probe[n], (unsigned long long)shim_rep[i - 1]);
+        return;
+    }
     if (i == 10 && v && shim_rep[16] % 16 == 0) say("gunyah: shim: the resource manager's answer: error %#llx%s\n",
                                                    (unsigned long long)v, v == 6 ? " (ARGUMENT_INVALID)" : v == 2 ? " (NORESOURCE)" : "");
     if (i == 16 && v % 16 == 0) say("gunyah: shim: still refused after %llu tries (one each 50 ms; 64 at most)\n", (unsigned long long)v);
