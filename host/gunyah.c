@@ -1727,13 +1727,25 @@ static void rv_report(int id, uint64_t which, uint64_t v) {
 
 static uint64_t kicks_back[HV_MAX_CPUS];
 static uint64_t saved_exits[HV_MAX_CPUS]; /* exits that came back with a signal (0.3.101: once lost) */
+/* 0.3.103: a vCPU is kicked only when it has been inside one GH_VCPU_RUN for 20 ms or more (a long run, or a WFI
+   wait). The driver takes a load's answer from the run area when the run starts and drops it if a signal is already
+   pending then (it returns -ERESTARTSYS before running the vCPU, and the next run resumes the load with 0): a kick
+   landing between an exit's handling and the next run turned device reads into zeros (an ISR read 0: a disk
+   completion missed, APFS waiting for good, and after 60 s with no root device the kernel's "About to reboot into
+   Recovery!", 0.3.102). A vCPU busy with device accesses is left alone now; it comes back to the host on each of
+   them anyway. */
+static volatile uint64_t run_since[HV_MAX_CPUS]; /* when this vCPU's current GH_VCPU_RUN began (0: not in one) */
+static uint64_t kicks_sent[HV_MAX_CPUS];
 static void *kick_thread(void *arg) {
     (void)arg;
     thread_altstack();
     while (!stop_req) {
         usleep((useconds_t)kick_ms * 1000);
-        for (int i = 0; i < nvcpu; i++)
-            kick_vcpu(i);
+        uint64_t now = now_ns();
+        for (int i = 0; i < nvcpu; i++) {
+            uint64_t t = run_since[i];
+            if (t && now > t && now - t >= 20000000ull) kick_vcpu(i), kicks_sent[i]++;
+        }
     }
     return NULL;
 }
@@ -1764,7 +1776,10 @@ static void *vcpu_thread(void *arg) {
            first exit seen was the second store), so its RAM was not cleaned and it hung: "cpu 1 failed to boot" again.
            exit_reason is cleared before each run, and an interrupted run that left an exit behind is handled as one. */
         r->exit_reason = GH_VCPU_EXIT_UNKNOWN;
-        if (ioctl(vcpu_fd[id], GH_VCPU_RUN, 0) < 0) {
+        run_since[id] = now_ns();
+        int rc = ioctl(vcpu_fd[id], GH_VCPU_RUN, 0);
+        run_since[id] = 0;
+        if (rc < 0) {
             if (errno == EINTR || errno == EAGAIN) {
                 if (kicks_back[id]++ == 0) say("gunyah: vCPU %d came back on a signal: the kicks work\n", id);
                 if (r->exit_reason == GH_VCPU_EXIT_MMIO || r->exit_reason == GH_VCPU_EXIT_STATUS) {
@@ -2088,8 +2103,8 @@ int hv_gunyah_run(void) {
     hv_gic_external = NULL;
     hv_vm_stop_hook = NULL;
     if (!mac_runs) fprintf(stderr, "gunyah: the shim did not reach the Mac (its last phase: %s)\n", phase_name(shim_rep[0]));
-    fprintf(stderr, "gunyah: vCPU 0 came back on signals %llu times; exits that came back with a signal (once lost):",
-            (unsigned long long)kicks_back[0]);
+    fprintf(stderr, "gunyah: vCPU 0 came back on signals %llu times (kicks sent: %llu); exits that came back with a signal "
+                    "(once lost):", (unsigned long long)kicks_back[0], (unsigned long long)kicks_sent[0]);
     for (int i = 0; i < nvcpu; i++) fprintf(stderr, " vcpu%d %llu", i, (unsigned long long)saved_exits[i]);
     fputc('\n', stderr);
     return vm_reason < 0 ? 0 : vm_reason;

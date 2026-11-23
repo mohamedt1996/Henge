@@ -1228,3 +1228,13 @@ serial port went quiet, the disk idle and the CPUs nearly so, the kernel's timer
 quiet 3 s the kernel's own log (msgbuf) is copied to this log line by line ("mac:"), its CoreAnalyticsHub timer
 spam counted instead; the Mac's screen is written to gunyah-screen.bmp every 30 s, its place from boot_args' Video
 (the last initialize_screen in msgbuf when there is one); the watch thread runs as long as the Mac does.
+
+0.3.103 (2026-11-23): 0.3.102's run stopped at the root device: APFS mounted disk0s1, then waited (the disk had handed
+back all 168 requests, nothing pending), AppleFileSystemDriver never published boot-uuid-media, and after 60 s the
+kernel wrote boot-command=recover-system and "About to reboot into Recovery!" (that is also why 0.3.101 came up in
+recoveryOS). The screen showed the boot progress bar at a third. The Gunyah driver takes a load's answer from the run
+area as the next GH_VCPU_RUN starts, then drops it if a signal is already pending (-ERESTARTSYS before running the
+vCPU; the next run resumes the load with 0): a kick landing between an exit's handling and the next run turned
+device reads into zeros, here a virtio ISR read, so a completion was never seen. Kicks now go only to a vCPU inside
+one GH_VCPU_RUN for 20 ms or more (long runs and WFI waits, what they are for); a vCPU busy with device accesses
+returns to the host on each of them anyway.
