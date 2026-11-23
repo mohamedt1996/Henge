@@ -1088,3 +1088,9 @@ and the kernel's keys are what Apple's hypervisor would set through the PAC hype
 done. Every MSR SCTLR_EL1 in the kernel now goes through a stub that clears EnIA/EnIB/EnDA/EnDB, and the handed-over
 SCTLR has them clear: all PAC/AUT instructions become no-ops, signing and checking alike, so the kernel's XPAC-and-
 compare checks pass. The Mac runs without pointer authentication (HV_GUNYAH_KEEP_PAC=1 keeps it).
+
+0.3.86 (2026-11-23): 0.3.85 got past the PAC panic: 6 SCTLR writes patched, the kernel made 143 exits (the serial
+port's set-up, last a store to UARTCR at 0x20010030) and then ran on silently with no text and no more exits. Gunyah
+gives no view of a vCPU's registers, so the engine now reads the kernel's own log: when vCPU 0's exits stop for 3 s,
+XNU's msgbuf (magic 0x063061) is found in the kernel's data and its last 3 KB logged ("gunyah: the kernel's log").
+(One run's shim stopped on piece 5 with the resource manager's error 6, ARGUMENT_INVALID; the next run accepted all.)

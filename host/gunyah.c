@@ -385,6 +385,7 @@ static int64_t find_boot_args(void) {
 
 static struct { uint64_t pa, size; } xr[64]; /* the kernel collection's code, by physical address */
 static uint64_t k_virt, k_phys; /* the kernel's static mapping: virtual k_virt is physical k_phys */
+static uint64_t k_top;          /* physical end of the kernel's data (boot_args topOfKernelData) */
 static int nxr;
 
 static void add_exec(uint64_t pa, uint64_t size) {
@@ -430,7 +431,7 @@ static int kpatch(void) {
     if (ba < 0) { fprintf(stderr, "gunyah: no boot_args in the Mac's RAM: this is not the jump into the kernel\n"); return -1; }
     const uint8_t *b = B->ram + ba;
     uint64_t virt = rd64(b + 8), phys = rd64(b + 16), top = rd64(b + 32), dtva = rd64(b + 96);
-    k_virt = virt, k_phys = phys;
+    k_virt = virt, k_phys = phys, k_top = top;
     uint32_t dtlen = rd32(b + 104);
     fprintf(stderr, "gunyah: boot_args at pa %#llx: kernel at virtual %#llx = physical %#llx, its data to %#llx, device tree "
                     "at %#llx (%u bytes)\n", (unsigned long long)(VMAPPLE_MEM + (uint64_t)ba), (unsigned long long)virt,
@@ -914,11 +915,49 @@ static void note_page(int id, uint64_t pa, int write) {
     pthread_mutex_unlock(&seen_mu);
     if (say_it) say("gunyah: the Mac's vCPU %d first touches %#llx (%s)\n", id, (unsigned long long)pa, write ? "store" : "load");
 }
+/* 0.3.86: with PAC off (0.3.85) the kernel ran past its panic, made 143 exits (the serial port's set-up) and went quiet
+   with no text: Gunyah gives no view of a vCPU's registers, so where it waits is read from its own log instead. XNU's
+   msgbuf (struct msgbuf: magic 0x063061, size, write index, read index, buffer pointer) lives in the kernel's data and
+   holds every printf, serial console or not. When vCPU 0's exits stop for 3 s, it is found and its last 3 KB logged. */
+static void dump_msgbuf(void) {
+    if (!k_phys || k_top <= k_phys) return;
+    const uint8_t *k = hv_phys_ptr(M, k_phys, k_top - k_phys);
+    if (!k) { say("gunyah: the kernel's data is not in the Mac's RAM (no log to read)\n"); return; }
+    int found = 0;
+    for (uint64_t o = 0; o + 24 <= k_top - k_phys && found < 4; o += 8) {
+        if (rd32(k + o) != 0x063061u) continue;
+        uint32_t size = rd32(k + o + 4), bufx = rd32(k + o + 8);
+        uint64_t bufc = rd64(k + o + 16);
+        if (size < 4096 || size > (64u << 20) || bufx >= size || bufc < k_virt) continue;
+        const char *buf = hv_phys_ptr(M, bufc - k_virt + k_phys, size);
+        if (!buf) continue;
+        found++;
+        uint32_t take = size < 3072 ? size : 3072;
+        say("gunyah: the kernel's log (msgbuf at pa %#llx, %u bytes, written to %u), its last %u bytes:\n---\n",
+            (unsigned long long)(k_phys + o), size, bufx, take);
+        char out[3073];
+        uint32_t m = 0;
+        for (uint32_t i = 0; i < take; i++) {
+            char c = buf[(bufx + size - take + i) % size];
+            if (!c) continue;
+            out[m++] = (c >= 32 && c < 127) || c == '\n' || c == '\t' ? c : '?';
+        }
+        out[m] = 0;
+        say("%s\n---\n", out);
+    }
+    if (!found) say("gunyah: no kernel log (msgbuf) found in the kernel's data yet\n");
+}
+
 static void *watch_thread(void *arg) {
     (void)arg;
     while (!stop_req && !mac_runs) usleep(10000);
+    uint64_t last0 = ~0ull;
+    int still = 0, dumps = 0;
     for (int s = 1; !stop_req && s <= 600; s++) {
         sleep(1);
+        if (mmio_exits[0] == last0) still++;
+        else still = 0, last0 = mmio_exits[0];
+        if ((still == 3 && dumps < 3) || (still && still % 60 == 0 && dumps < 6)) dump_msgbuf(), dumps++;
         if (s > 60 && s % 10) continue;
         char line[512];
         int n = snprintf(line, sizeof line, "gunyah: %d s on Gunyah:", s);
