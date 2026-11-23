@@ -1094,3 +1094,9 @@ port's set-up, last a store to UARTCR at 0x20010030) and then ran on silently wi
 gives no view of a vCPU's registers, so the engine now reads the kernel's own log: when vCPU 0's exits stop for 3 s,
 XNU's msgbuf (magic 0x063061) is found in the kernel's data and its last 3 KB logged ("gunyah: the kernel's log").
 (One run's shim stopped on piece 5 with the resource manager's error 6, ARGUMENT_INVALID; the next run accepted all.)
+
+0.3.87 (2026-11-23): 0.3.86's kernel log: ... "kprintf initialized", "initialize_screen", "pe_arm_init_interrupts",
+"found interrupt-controller", "failed to find the timer" (ignored by XNU), then "MACH Reboot" 0.25 ms later: the
+panic path's restart, the panic's own text going to the panic buffer and console, not msgbuf. On a stall the engine
+now also logs every "panic(cpu" text in the Mac's RAM. And the shim's piece accept, refused ARGUMENT_INVALID (6) on
+piece 5 or 6 in half the runs, now tries 64 times 50 ms apart (3 s) before giving up, in case it is a moment's state.

@@ -68,14 +68,22 @@ hv_gunyah_shim_start:
     ldr  x13, [x23]                     /* handle */
     ldr  x14, [x23, #8]                 /* address */
     ldr  x15, [x23, #16]                /* size */
-    mov  x24, #4                        /* tries: a refusal may be for the moment (0.3.78: NORESOURCE on piece 1) */
+    mov  x24, #64                       /* tries: a refusal may be for the moment (0.3.78: NORESOURCE on piece 1; 0.3.86:
+                                           ARGUMENT_INVALID on piece 5 or 6 in half the runs, 4 quick tries all refused) */
 3:  bl   accept
     cbz  x0, 4f
     subs x24, x24, #1
     b.eq stop
-    movz x12, #0x0200, lsl #16          /* a while before the next try */
-5:  subs x12, x12, #1
-    b.ne 5b
+    mov  x0, #64
+    sub  x0, x0, x24
+    str  x0, [x9, #0x80]                /* the tries so far */
+    mrs  x12, cntvct_el0                /* 50 ms by the counter (19.2 MHz) before the next: 3 s in all */
+    movz x11, #0x000e, lsl #16
+    movk x11, #0xa600
+    add  x11, x12, x11
+5:  mrs  x12, cntvct_el0
+    cmp  x12, x11
+    b.lo 5b
     b    3b
 4:
     add  x23, x23, #24

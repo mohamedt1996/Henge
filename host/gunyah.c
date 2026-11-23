@@ -720,7 +720,9 @@ static void shim_report(uint64_t off, uint64_t v) {
     }
     if (i == 8 && v < 640) say("gunyah: shim: accepting piece %llu (%#llx, %llu MB)\n", (unsigned long long)v,
                                (unsigned long long)handoff[129 + 3 * v], (unsigned long long)(handoff[130 + 3 * v] >> 20));
-    if (i == 10 && v) say("gunyah: shim: the resource manager's answer: error %#llx\n", (unsigned long long)v);
+    if (i == 10 && v && shim_rep[16] % 16 == 0) say("gunyah: shim: the resource manager's answer: error %#llx%s\n",
+                                                   (unsigned long long)v, v == 6 ? " (ARGUMENT_INVALID)" : v == 2 ? " (NORESOURCE)" : "");
+    if (i == 16 && v % 16 == 0) say("gunyah: shim: still refused after %llu tries (one each 50 ms; 64 at most)\n", (unsigned long long)v);
     if (i == 0) {
         say("gunyah: shim: %s\n", phase_name(v));
         if (v == 2)
@@ -946,6 +948,25 @@ static void dump_msgbuf(void) {
         say("%s\n---\n", out);
     }
     if (!found) say("gunyah: no kernel log (msgbuf) found in the kernel's data yet\n");
+    /* 0.3.87: 0.3.86's log ended "failed to find the timer" (harmless: the JIT's boots print it too), then "MACH Reboot"
+       a quarter millisecond later: that is the panic path's restart (kdp_machine_reboot_type), and a panic's text goes
+       to the panic buffer and the console, not to msgbuf. Every "panic(cpu" in the Mac's RAM is logged with what
+       follows it. */
+    static const char key[] = "panic(cpu ";
+    const uint8_t *ram = B->ram, *end = B->ram + B->ram_size, *p = ram;
+    int hits = 0;
+    while (hits < 6 && (p = memmem(p, (size_t)(end - p), key, sizeof key - 1)) != NULL) {
+        if (p[sizeof key - 1] == '%') { p++; continue; } /* the kernel's own format string */
+        char out[2049];
+        size_t m = 0;
+        for (const uint8_t *q = p; q < end && m < 2048 && *q; q++)
+            out[m++] = (*q >= 32 && *q < 127) || *q == '\n' || *q == '\t' ? (char)*q : '?';
+        out[m] = 0;
+        say("gunyah: panic text in the Mac's RAM at pa %#llx:\n---\n%s\n---\n", (unsigned long long)(VMAPPLE_MEM + (uint64_t)(p - ram)), out);
+        hits++;
+        p += m > 0 ? m : 1;
+    }
+    if (!hits) say("gunyah: no \"panic(cpu\" text in the Mac's RAM\n");
 }
 
 static void *watch_thread(void *arg) {
