@@ -1159,3 +1159,14 @@ PCIe bus moves below 1 GB, after vmapple's last device: ECAM at 0x31000000 (16 M
 0x32000000 (224 MB). Henge's PCIe model also answers there (hv_pcie_alias; the window finds BARs by old or new
 address), and the kernel's tree (each pci node's reg, ranges, bus-range, as arm-io offsets or absolute) is rewritten
 before the kernel reads it; the node is logged whole. The shim reads 0x31000000 to show the host bridge is there.
+
+0.3.96 (2026-11-23): 0.3.95 got the kernel through PCI configuration (8 devices), virtio storage and APFS, then CPU 0
+panicked "cpu 1 failed to boot for the first time" with vCPU 1 at 0 exits. A secondary starts from PSCI CPU_ON with
+its MMU and caches off, and Gunyah has no forced write-back at stage 2 (no S2FWB), so it reads memory past the caches:
+ResetHandlerData, const_boot_args and cpu_ttep, written by CPU 0 with its caches on and never cleaned by XNU (Apple's
+hypervisor forces write-back), can be stale there, and the CPU dies before its first device access. The host now cleans
+the lines to memory itself (DC by address from EL0 reaches every core's cache): all of the Mac's resident RAM once
+before the vCPUs run, then the kernel's image and data every 50 ms for 3 minutes and every second after. The kernel's
+reset_vector reports each CPU it starts and what it read with its caches off against what the caches hold. The helper
+threads are joined before the engine returns (detached, they read the RAM after the machine was gone: the segfault
+after a stop).

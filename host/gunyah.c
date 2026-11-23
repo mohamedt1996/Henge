@@ -319,6 +319,7 @@ static void pac_scan(void) {
         uint32_t *w = (uint32_t *)M->ram[r].host;
         size_t n = M->ram[r].size / 4;
         for (size_t i = 0; i + 1 < n; i++) {
+            if (!(i & 0xfffff) && stop_req) return;
             if (w[i] != HVC0 || w[i + 1] != CBNZ_X0_SELF) continue;
             /* The cbnz first: a CPU already spinning on it leaves at once, with x0 whatever it is. */
             __atomic_store_n(&w[i + 1], NOP, __ATOMIC_RELEASE);
@@ -394,6 +395,8 @@ static int64_t find_boot_args(void) {
 static struct { uint64_t pa, size; } xr[64]; /* the kernel collection's code, by physical address */
 static uint64_t k_virt, k_phys; /* the kernel's static mapping: virtual k_virt is physical k_phys */
 static uint64_t k_top;          /* physical end of the kernel's data (boot_args topOfKernelData) */
+#define RV_MARK 0x4f00u          /* hand-over page offset the reset vector's stub stores to (x16 MPIDR, then +8 its read) */
+static uint64_t rv_rhd, rv_sites; /* where ResetHandlerData.cpu_data_entries is; reset vectors patched */
 static int nxr;
 
 static void add_exec(uint64_t pa, uint64_t size) {
@@ -585,6 +588,46 @@ static int kpatch(void) {
             }
             if (x == HVC0 && i + 1 < n && w[i + 1] == CBNZ_X0_SELF) {
                 w[i] = MOV_X0_0, w[i + 1] = NOP, pac++;
+                continue;
+            }
+            /* 0.3.96: XNU's reset_vector (msr OSLAR_EL1, xzr; msr DAIFSet, #0xf; ... adrp x19, ResetHandlerData ...
+               ldr x1, [x19, #CPU_DATA_ENTRIES]), where PSCI CPU_ON starts a secondary with its MMU and caches off. A stub
+               reports the CPU's arrival and what it reads there (see rv_report); x16 and x17 are free in that code. */
+            if (x == 0xd510109fu && i + 12 < z && w[i + 1] == 0xd5034fdfu && rv_sites < 4) {
+                uint64_t rhd = 0;
+                int ldr_off = -1;
+                for (uint64_t k = i + 2; k < i + 12; k++) {
+                    uint32_t a = w[k];
+                    if ((a & 0x9f00001fu) == 0x90000013u && !rhd) { /* adrp x19 */
+                        int64_t imm = (int64_t)((((a >> 5) & 0x7ffff) << 2) | ((a >> 29) & 3));
+                        if (imm & (1ll << 20)) imm -= 1ll << 21;
+                        rhd = ((xr[r].pa + k * 4) & ~0xfffull) + (uint64_t)(imm << 12);
+                        if ((w[k + 1] & 0xffc003ffu) == 0x91000273u) rhd += (w[k + 1] >> 10) & 0xfff; /* add x19, x19 */
+                    } else if (rhd && (a & 0xffc003ffu) == 0xf9400261u) { /* ldr x1, [x19, #imm] */
+                        ldr_off = (int)((a >> 10) & 0xfff) * 8;
+                        break;
+                    }
+                }
+                if (rhd && ldr_off >= 0 && pool + 10 <= n && (int64_t)((pool - i) * 4) < (120ll << 20)) {
+                    uint64_t site = xr[r].pa + i * 4, stub = xr[r].pa + pool * 4, mark = HANDOFF_PA + RV_MARK;
+                    uint64_t tgt = rhd + (uint64_t)ldr_off, at5 = stub + 20;
+                    int64_t pg = (int64_t)((tgt & ~0xfffull) - (at5 & ~0xfffull)) >> 12;
+                    w[pool] = x;                                                    /* msr oslar_el1, xzr */
+                    w[pool + 1] = 0xd53800b0u;                                      /* mrs x16, mpidr_el1 */
+                    w[pool + 2] = MOVZ_XS(17, (mark >> 16) & 0xffff, 1);
+                    w[pool + 3] = MOVK_X(17, mark & 0xffff, 0);
+                    w[pool + 4] = 0xf9000230u;                                      /* str x16, [x17] */
+                    w[pool + 5] = 0x90000010u | (uint32_t)(pg & 3) << 29 | (uint32_t)((pg >> 2) & 0x7ffff) << 5; /* adrp x16 */
+                    w[pool + 6] = 0x91000210u | (uint32_t)(tgt & 0xfff) << 10;      /* add x16, x16, #lo12 */
+                    w[pool + 7] = 0xf9400210u;                                      /* ldr x16, [x16] (caches off) */
+                    w[pool + 8] = 0xf9000630u;                                      /* str x16, [x17, #8] */
+                    w[pool + 9] = branch(stub + 36, site + 4);
+                    w[i] = branch(site, stub);
+                    pool += 10;
+                    rv_rhd = tgt, rv_sites++;
+                    fprintf(stderr, "gunyah: the kernel's reset vector at pa %#llx reports each CPU it starts (its CPU table "
+                                    "pointer at pa %#llx)\n", (unsigned long long)site, (unsigned long long)tgt);
+                }
                 continue;
             }
             uint32_t top13 = x & 0xfff80000u, crn = (x >> 12) & 15, rt = x & 31;
@@ -1316,6 +1359,115 @@ static void *watch_thread(void *arg) {
     }
     return NULL;
 }
+/* ---- caches: Gunyah maps the Mac's RAM without stage-2 forced write-back (no S2FWB), so a vCPU running with its MMU
+   off (a secondary from PSCI CPU_ON, through reset_vector, start_cpu and common_start) reads memory past the caches.
+   XNU cleans only cpu_data and CpuDataEntries before CPU_ON; ResetHandlerData, const_boot_args and cpu_ttep were written
+   with the caches on and may still sit dirty in a core's cache: the new CPU reads stale values, takes TTBR1 from the
+   stale cpu_ttep and dies before its first device access (0.3.95: "cpu 1 failed to boot", vcpu1 0 exits). Apple's
+   hypervisor forces write-back, so XNU never needed more. The host cleans those lines to memory: DC by virtual address
+   from EL0 (Linux sets SCTLR_EL1.UCI) works on the physical line, in every core's cache. ---- */
+
+static unsigned dline(void) {
+    uint64_t ctr;
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    return 4u << ((ctr >> 16) & 15);
+}
+
+static void dc_range(const uint8_t *p, size_t len, int inval) {
+    unsigned l = dline();
+    uintptr_t a = (uintptr_t)p & ~(uintptr_t)(l - 1), e = (uintptr_t)p + len;
+    if (inval)
+        for (; a < e; a += l) __asm__ volatile("dc civac, %0" ::"r"(a) : "memory");
+    else
+        for (; a < e; a += l) __asm__ volatile("dc cvac, %0" ::"r"(a) : "memory");
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
+/* All of the Mac's RAM the host has pages for (mincore), cleaned and invalidated: what the JIT and the patches wrote,
+   for the boot CPU's own start with its MMU off too. */
+struct clean_part { uint8_t *p; size_t len; uint64_t done; };
+static void *clean_worker(void *arg) {
+    struct clean_part *c = arg;
+    size_t pg = (size_t)sysconf(_SC_PAGESIZE), win = 2u << 20;
+    unsigned char *vec = malloc(win / pg + 1);
+    if (!vec) return NULL;
+    for (size_t o = 0; o < c->len; o += win) {
+        size_t n = c->len - o < win ? c->len - o : win;
+        if (mincore(c->p + o, n, vec) != 0) continue;
+        for (size_t i = 0; i < (n + pg - 1) / pg; i++)
+            if (vec[i] & 1) dc_range(c->p + o + i * pg, pg, 1), c->done += pg;
+    }
+    free(vec);
+    return NULL;
+}
+
+static void clean_all_ram(void) {
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    enum { W = 4 };
+    struct clean_part part[W];
+    pthread_t t[W];
+    size_t step = (B->ram_size / W + (2u << 20) - 1) & ~(size_t)((2u << 20) - 1);
+    int nt = 0;
+    for (int i = 0; i < W; i++) {
+        size_t o = (size_t)i * step;
+        if (o >= B->ram_size) break;
+        part[i] = (struct clean_part){B->ram + o, B->ram_size - o < step ? B->ram_size - o : step, 0};
+        if (pthread_create(&t[nt], NULL, clean_worker, &part[i]) == 0) nt++;
+        else clean_worker(&part[i]);
+    }
+    uint64_t done = 0;
+    for (int i = 0; i < nt; i++) pthread_join(t[i], NULL);
+    for (int i = 0; i < W && (size_t)i * step < B->ram_size; i++) done += part[i].done;
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    fprintf(stderr, "gunyah: %llu MB of the Mac's RAM cleaned from the caches to memory in %ld ms (Gunyah has no forced "
+                    "write-back: a CPU with its MMU off reads memory, not caches)\n", (unsigned long long)(done >> 20),
+            (long)((b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000));
+}
+
+/* The kernel's image and data (physBase to topOfKernelData), cleaned again and again while the Mac runs: every 50 ms
+   for the first 3 minutes (secondaries start, each reading what CPU 0 wrote long before), then every second (a CPU
+   coming back from a powered-down idle comes through the reset vector the same way). */
+static void *clean_thread(void *arg) {
+    (void)arg;
+    uint64_t lo = k_phys & ~0x3fffull, hi = k_top;
+    if (hi <= lo || hi - lo > (1ull << 30)) return NULL;
+    const uint8_t *p = hv_phys_ptr(M, lo, hi - lo);
+    if (!p) return NULL;
+    struct timespec t0, a, b;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int n = 0; !stop_req; n++) {
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        dc_range(p, hi - lo, 0);
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        long us = (long)((b.tv_sec - a.tv_sec) * 1000000 + (b.tv_nsec - a.tv_nsec) / 1000);
+        if (n == 0)
+            fprintf(stderr, "gunyah: the kernel's %llu MB (pa %#llx-%#llx) is cleaned to memory all along (%ld us a pass)\n",
+                    (unsigned long long)((hi - lo) >> 20), (unsigned long long)lo, (unsigned long long)hi, us);
+        long ms = b.tv_sec - t0.tv_sec < 180 ? 50 : 1000;
+        if (ms < us / 100) ms = us / 100; /* never more than 10% of a core */
+        for (long s = 0; s < ms && !stop_req; s += 10) usleep(10000);
+    }
+    return NULL;
+}
+
+/* The reset vector's report (kpatch): which = 0, the CPU's MPIDR as it arrives; 8, the CPU table pointer as it read it
+   with its caches off, set against what memory (through the host's cached view) holds. */
+static void rv_report(int id, uint64_t which, uint64_t v) {
+    static int n;
+    if (n++ > 32) return;
+    if (which == 0) {
+        fprintf(stderr, "gunyah: vCPU %d reached the kernel's reset vector (MPIDR %#llx): CPU_ON started it\n", id,
+                (unsigned long long)v);
+        return;
+    }
+    const uint8_t *p = rv_rhd ? hv_phys_ptr(M, rv_rhd, 8) : NULL;
+    uint64_t mem = p ? rd64(p) : 0;
+    fprintf(stderr, "gunyah: vCPU %d, caches off, reads the kernel's CPU table pointer as %#llx; the caches hold %#llx%s\n", id,
+            (unsigned long long)v, (unsigned long long)mem,
+            v == mem ? " (the same)" : " (STALE: memory was behind the caches)");
+}
+
 static uint64_t kicks_back[HV_MAX_CPUS];
 static void *kick_thread(void *arg) {
     (void)arg;
@@ -1367,7 +1519,8 @@ static void *vcpu_thread(void *arg) {
                 uint64_t off = pa - HANDOFF_PA, v = 0;
                 if (r->mmio.is_write) {
                     memcpy(&v, r->mmio.data, len);
-                    if (off >= 0x4000) shim_report(off - 0x4000, v);
+                    if (off == RV_MARK || off == RV_MARK + 8) rv_report(id, off - RV_MARK, v);
+                    else if (off >= 0x4000) shim_report(off - 0x4000, v);
                 } else {
                     if (off < 0x4000) v = handoff[off / 8];
                     memset(r->mmio.data, 0, sizeof r->mmio.data);
@@ -1619,26 +1772,26 @@ int hv_gunyah_run(void) {
     sigaction(SIGUSR1, &sa, NULL);
     mark("run the vCPUs (the shim, then the Mac's kernel)");
 
-    pthread_t t;
-    pthread_create(&t, NULL, device_thread, NULL);
-    pthread_detach(t);
-    pthread_create(&t, NULL, pac_thread, NULL);
-    pthread_detach(t);
-    pthread_create(&t, NULL, watch_thread, NULL);
-    pthread_detach(t);
+    clean_all_ram();
+    /* 0.3.96: the helpers are joined before this returns: detached, they went on reading the Mac's RAM (the PAC scan,
+       the stall dump) and Henge's devices after the machine was taken down, the "Segmentation fault" after a stop. */
+    pthread_t helper[6];
+    int nhelper = 0;
+    void *(*helpers[])(void *) = {device_thread, pac_thread, watch_thread, clean_thread};
+    for (unsigned h = 0; h < sizeof helpers / sizeof *helpers; h++)
+        if (pthread_create(&helper[nhelper], NULL, helpers[h], NULL) == 0) nhelper++;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 8u << 20);
     for (int i = 0; i < nvcpu; i++) pthread_create(&vcpu_thread_id[i], &attr, vcpu_thread, (void *)(intptr_t)i);
     if (getenv("HV_GUNYAH_KICK_MS")) kick_ms = atoi(getenv("HV_GUNYAH_KICK_MS"));
-    if (kick_ms > 0) {
-        pthread_create(&t, NULL, kick_thread, NULL);
-        pthread_detach(t);
-    }
+    if (kick_ms > 0 && pthread_create(&helper[nhelper], NULL, kick_thread, NULL) == 0) nhelper++;
     for (int i = 0; i < nvcpu; i++) pthread_join(vcpu_thread_id[i], NULL);
-    for (int i = 0; i < nvcpu; i++) vcpu_thread_id[i] = 0;
     stop_req = 1;
-    usleep(20000);
+    for (int i = 0; i < nhelper; i++) pthread_join(helper[i], NULL);
+    for (int i = 0; i < nvcpu; i++) vcpu_thread_id[i] = 0;
+    hv_gic_external = NULL;
+    hv_vm_stop_hook = NULL;
     if (!mac_runs) fprintf(stderr, "gunyah: the shim did not reach the Mac (its last phase: %s)\n", phase_name(shim_rep[0]));
     fprintf(stderr, "gunyah: vCPU 0 came back on signals %llu times\n", (unsigned long long)kicks_back[0]);
     return vm_reason < 0 ? 0 : vm_reason;
