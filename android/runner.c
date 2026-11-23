@@ -656,6 +656,47 @@ static int resume_restore(void) {
     return ok;
 }
 
+/* 0.3.90: a Gunyah engine runs as root, so it outlives the app when Android kills the app (an update, the low-memory
+   killer): it keeps its VM, the reserved RAM shared into it, and the VNC and sound ports. The next start then could not
+   share that RAM ("Invalid argument") or bind the ports. Any other engine still running is ended first (it holds a
+   VM that is no use to anyone), and its VM's memory is given back once its descriptors close. */
+static void end_stale_engines(void) {
+    DIR *d = opendir("/proc");
+    if (!d) return;
+    pid_t me = getpid(), mine[16];
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && n < 16) {
+        pid_t pid = (pid_t)atoi(e->d_name);
+        if (pid <= 1 || pid == me) continue;
+        char path[64], cmd[512];
+        snprintf(path, sizeof path, "/proc/%d/cmdline", (int)pid);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        size_t len = fread(cmd, 1, sizeof cmd - 1, f);
+        fclose(f);
+        cmd[len] = 0;
+        const char *base = strrchr(cmd, '/');
+        base = base ? base + 1 : cmd;
+        if (strcmp(base, "libhengevm.so") && strcmp(base, "hengevm") && strcmp(base, "hengevm-android")) continue;
+        fprintf(stderr, "hengevm: an engine from an earlier start is still running (pid %d, %s): ending it\n", (int)pid, cmd);
+        kill(pid, SIGTERM);
+        mine[n++] = pid;
+    }
+    closedir(d);
+    for (int i = 0; i < n; i++) {
+        char path[32];
+        snprintf(path, sizeof path, "/proc/%d", (int)mine[i]);
+        for (int t = 0; t < 50 && access(path, F_OK) == 0; t++) usleep(100000);
+        if (access(path, F_OK) == 0) {
+            kill(mine[i], SIGKILL);
+            for (int t = 0; t < 50 && access(path, F_OK) == 0; t++) usleep(100000);
+        }
+        fprintf(stderr, "hengevm: pid %d %s\n", (int)mine[i], access(path, F_OK) == 0 ? "did not end: reboot the tablet" : "ended");
+    }
+    if (n) sleep(1); /* its VM torn down, its memory reclaimed */
+}
+
 int main(int argc, char **argv) {
     int vnc_port = 5900;
     int stats_seconds = 0; /* --stats N: the engine's own statistics every N s (core/dispatch.c print_stats), as host/main.c has */
@@ -747,6 +788,7 @@ int main(int argc, char **argv) {
     }
     if (!vc.rom || !vc.disk || !vc.aux) usage();
     int gunyah = !strcmp(engine, "gunyah");
+    if (gunyah) end_stale_engines();
     if (!gunyah && strcmp(engine, "jit")) usage();
     if (gunyah) {
         /* Henge's CPUs run the boot ROM and iBoot, Gunyah's the Mac from the jump into the kernel on (host/gunyah.c).

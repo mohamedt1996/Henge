@@ -1115,3 +1115,7 @@ was anywhere: this early a panic has no buffer and no console. Now: (1) the kern
 keepsyms=1 -v", so its console and any panic (with a symbolicated backtrace) come out on the serial port into this
 log; (2) before the kernel, the shim makes each GIC access pe_init_fiq will make (GICD, GICR RD and SGI frames, the
 ICC group-0 registers) under a guard and logs its value or its fault's ESR.
+
+0.3.90 (2026-11-23): 0.3.89 never reached the kernel: the 0.3.88 engine (root) outlived its app when the update killed
+the app, kept its Gunyah VM with the reserved RAM shared into it and the VNC and sound ports, so the new start's first
+share failed ("Invalid argument") and the ports were taken. A Gunyah start now ends any engine still running first.
