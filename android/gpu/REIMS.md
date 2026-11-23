@@ -1076,3 +1076,8 @@ carry over is what they learned about macOS's GPU clients, and the Turnip route:
 0.3.83 (2026-11-23): 0.3.82 named the trapping word: 0xe7ffdeff, XNU's own TRAP_DEBUGGER, not a CPU gap. The kernel
 called panic() this early (x0 3 = DBOP_PANIC), still on SP1, and the trap handler loses the panic's text. The engine
 now reads x0..x3 off the first register dump and rebuilds the panic's message from the Mac's RAM ("gunyah: THE PANIC:").
+
+0.3.84 (2026-11-23): 0.3.83 rebuilt the real panic: "Synchronous exception taken while SP1 selected at pc
+0xfffffe0019e6404c", a fault in the kernel's earliest C code (x8 0xfffffe001e504000; the trap's stale FAR,
+0xfffffe001e504080 = x8 + 0x80, past the kernel's data). Its text was cut at x27 (format longer than 512 bytes), losing
+ESR and FAR. The format buffer is now 3 KB, and the instructions at the first fault's pc and (PAC-stripped) lr are logged.

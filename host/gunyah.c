@@ -780,7 +780,7 @@ static int kstr(uint64_t va, char *out, size_t cap) {
 }
 
 static void kformat(uint64_t fmt_va, uint64_t args_va, char *out, size_t cap) {
-    char fmt[512];
+    char fmt[3072];
     size_t o = 0;
     if (!kstr(fmt_va, fmt, sizeof fmt)) { snprintf(out, cap, "(format unreadable)"); return; }
     for (const char *f = fmt; *f && o + 1 < cap; f++) {
@@ -815,7 +815,7 @@ static void kformat(uint64_t fmt_va, uint64_t args_va, char *out, size_t cap) {
 static int panic_told;
 static void panic_text(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3) {
     panic_told = 1;
-    char msg[256], text[1024];
+    static char msg[256], text[6144];
     say("gunyah: the panic's call: op %llu%s, message %#llx, format %#llx, args %#llx\n", (unsigned long long)x0,
         x0 == 3 ? " (DBOP_PANIC)" : "", (unsigned long long)x1, (unsigned long long)x2, (unsigned long long)x3);
     if (x1 && kstr(x1, msg, sizeof msg)) say("gunyah: the panic's message: \"%s\"\n", msg);
@@ -824,6 +824,14 @@ static void panic_text(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3) {
     if (x2) {
         kformat(x2, args, text, sizeof text);
         say("gunyah: THE PANIC: \"%s\"\n", text);
+        /* 0.3.84: the panic's own text names the first fault's pc and lr (signed: strip PAC); look both up too */
+        const char *s = strstr(text, "at pc 0x");
+        if (s) panic_pc(strtoull(s + 8, NULL, 16));
+        s = strstr(text, "lr 0x");
+        if (s) {
+            uint64_t lr = strtoull(s + 5, NULL, 16);
+            panic_pc((lr & 0x0000ffffffffffffull) | 0xffff000000000000ull);
+        }
     }
     if (args) {
         const uint64_t *a;
