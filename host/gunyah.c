@@ -737,6 +737,7 @@ static void decode_word(uint32_t w, char *out, size_t cap) {
     } else if ((w & 0xffe0001fu) == 0xd4000002u) snprintf(out, cap, "HVC #%u", w >> 5 & 0xffff);
     else if ((w & 0xffe0001fu) == 0xd4000003u) snprintf(out, cap, "SMC #%u", w >> 5 & 0xffff);
     else if ((w & 0xffe0001fu) == 0xd4200000u) snprintf(out, cap, "BRK #%#x", w >> 5 & 0xffff);
+    else if (w == 0xe7ffdeffu || w == 0xe7ffdefeu) snprintf(out, cap, "XNU's TRAP_DEBUGGER (panic/debugger entry, on purpose)");
     else if ((w & 0xfffff000u) == 0x00201000u) snprintf(out, cap, "Apple AMX/GXF space (0x0020xxxx)");
     else snprintf(out, cap, "-");
 }
@@ -756,6 +757,93 @@ static void panic_pc(uint64_t pc) {
     }
 }
 
+/* 0.3.83: 0.3.82 showed the "undefined instruction" is 0xe7ffdeff, XNU's own TRAP_DEBUGGER: panic() called
+   DebuggerTrapWithState(DBOP_PANIC = 3 in x0, message in x1, the panic's format in x2, its va_list in x3) this early,
+   still on SP1, and the trap handler can only say "Unexpected debugger trap" and lose the real panic text. The first
+   register dump's x0..x3 are read off the serial line and the panic's text is rebuilt from the Mac's RAM. */
+static int kva_ok(uint64_t va, size_t n, const void **p) {
+    if (!k_virt || va < k_virt) return 0;
+    *p = hv_phys_ptr(M, va - k_virt + k_phys, n);
+    return *p != NULL;
+}
+
+static int kstr(uint64_t va, char *out, size_t cap) {
+    size_t n = 0;
+    while (n + 1 < cap) {
+        const char *p;
+        if (!kva_ok(va + n, 1, (const void **)&p)) break;
+        if (!*p) break;
+        out[n++] = (*p >= 32 && *p < 127) || *p == '\n' || *p == '\t' ? *p : '?';
+    }
+    out[n] = 0;
+    return n > 0;
+}
+
+static void kformat(uint64_t fmt_va, uint64_t args_va, char *out, size_t cap) {
+    char fmt[512];
+    size_t o = 0;
+    if (!kstr(fmt_va, fmt, sizeof fmt)) { snprintf(out, cap, "(format unreadable)"); return; }
+    for (const char *f = fmt; *f && o + 1 < cap; f++) {
+        if (*f != '%') { out[o++] = *f; continue; }
+        char spec[32] = "%";
+        size_t s = 1;
+        f++;
+        while (*f && strchr("-+ #0123456789.", *f) && s < 20) spec[s++] = *f++;
+        while (*f && strchr("hlqzjt", *f)) f++;
+        if (!*f) break;
+        if (*f == '%') { out[o++] = '%'; continue; }
+        uint64_t a = 0;
+        const uint64_t *ap;
+        if (kva_ok(args_va, 8, (const void **)&ap)) a = *ap;
+        args_va += 8;
+        char tmp[256];
+        switch (*f) {
+        case 's': { char str[200]; if (!kstr(a, str, sizeof str)) snprintf(str, sizeof str, "(%#llx)", (unsigned long long)a);
+                    spec[s++] = 's'; spec[s] = 0; snprintf(tmp, sizeof tmp, spec, str); break; }
+        case 'd': case 'i': spec[s++] = 'l'; spec[s++] = 'l'; spec[s++] = 'd'; spec[s] = 0; snprintf(tmp, sizeof tmp, spec, (long long)a); break;
+        case 'u': case 'x': case 'X': case 'o':
+            spec[s++] = 'l'; spec[s++] = 'l'; spec[s++] = *f; spec[s] = 0; snprintf(tmp, sizeof tmp, spec, (unsigned long long)a); break;
+        case 'p': snprintf(tmp, sizeof tmp, "%#llx", (unsigned long long)a); break;
+        case 'c': snprintf(tmp, sizeof tmp, "%c", (int)(a & 0xff)); break;
+        default: snprintf(tmp, sizeof tmp, "<%%%c %#llx>", *f, (unsigned long long)a); break;
+        }
+        for (const char *t = tmp; *t && o + 1 < cap; t++) out[o++] = *t;
+    }
+    out[o] = 0;
+}
+
+static int panic_told;
+static void panic_text(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3) {
+    panic_told = 1;
+    char msg[256], text[1024];
+    say("gunyah: the panic's call: op %llu%s, message %#llx, format %#llx, args %#llx\n", (unsigned long long)x0,
+        x0 == 3 ? " (DBOP_PANIC)" : "", (unsigned long long)x1, (unsigned long long)x2, (unsigned long long)x3);
+    if (x1 && kstr(x1, msg, sizeof msg)) say("gunyah: the panic's message: \"%s\"\n", msg);
+    const uint64_t *vl;
+    uint64_t args = x3 && kva_ok(x3, 8, (const void **)&vl) ? *vl : 0;
+    if (x2) {
+        kformat(x2, args, text, sizeof text);
+        say("gunyah: THE PANIC: \"%s\"\n", text);
+    }
+    if (args) {
+        const uint64_t *a;
+        if (kva_ok(args, 64, (const void **)&a))
+            say("gunyah: the panic's first args: %#llx %#llx %#llx %#llx %#llx %#llx %#llx %#llx\n",
+                (unsigned long long)a[0], (unsigned long long)a[1], (unsigned long long)a[2], (unsigned long long)a[3],
+                (unsigned long long)a[4], (unsigned long long)a[5], (unsigned long long)a[6], (unsigned long long)a[7]);
+    }
+}
+
+static int reg_of(const char *line, const char *key, uint64_t *v) {
+    const char *s = strstr(line, key);
+    if (!s) return 0;
+    s += strlen(key);
+    while (*s == ' ') s++;
+    if (strncmp(s, "0x", 2)) return 0;
+    *v = strtoull(s + 2, NULL, 16);
+    return 1;
+}
+
 static void uart_char(char c) {
     if (c != '\n' && uart_n < (int)sizeof uart_line - 1) { uart_line[uart_n++] = c; return; }
     uart_line[uart_n] = 0;
@@ -765,6 +853,10 @@ static void uart_char(char c) {
         const char *s = strstr(uart_line, keys[k]);
         if (s) panic_pc(strtoull(s + strlen(keys[k]), NULL, 16));
     }
+    uint64_t r0, r1, r2, r3;
+    if (!panic_told && npcs && reg_of(uart_line, "x0:", &r0) && reg_of(uart_line, "x1:", &r1) &&
+        reg_of(uart_line, "x2:", &r2) && reg_of(uart_line, "x3:", &r3))
+        panic_text(r0, r1, r2, r3);
 }
 
 /* ---- the vCPU ---- */

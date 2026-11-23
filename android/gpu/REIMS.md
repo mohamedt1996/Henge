@@ -1072,3 +1072,7 @@ carry over is what they learned about macOS's GPU clients, and the Turnip route:
 | `applegfx` | libapplegfx-vulkan (`pvg_applegfx.c`) | a second, independent PVG host, built into the engine by CI (`android/applegfx/build.sh`). On select it creates the real lagfx device + display with the engine's guest RAM and GIC wired, and logs its version; the screen stays on `pvg_lite` until the apple-gfx MMIO↔PCI transport bridge is written |
 
 `vmapple.c` tries the external hosts in order (`hv_pvg_applegfx_create`, then reims's `hv_pvg_external_create`), each gated by its own `HV_GPU_*` variable, then `pvg_lite`. Adding a backend is: a `pvg_*.c` that defines its `hv_pvg_*_create` (0 when not chosen or not built), a `--gpu` name in `runner.c`, the object on the engine link in `android/Makefile`, and a `GPU_MODES` entry in the app. libapplegfx-vulkan is Apple's **PCI** paravirtual-GPU variant (one BAR + MSI-X), while `vmapple` exposes the **MMIO** variant (two windows + GIC) that reims matches. `pvg_applegfx.c` already wires the library's memory and interrupt callbacks to the engine; the remaining work to make it drive the screen is a bridge between the two transports, plus feeding its frames to the presenter.
+
+0.3.83 (2026-11-23): 0.3.82 named the trapping word: 0xe7ffdeff, XNU's own TRAP_DEBUGGER, not a CPU gap. The kernel
+called panic() this early (x0 3 = DBOP_PANIC), still on SP1, and the trap handler loses the panic's text. The engine
+now reads x0..x3 off the first register dump and rebuilds the panic's message from the Mac's RAM ("gunyah: THE PANIC:").
