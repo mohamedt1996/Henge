@@ -107,6 +107,7 @@ struct ghsm_share_blob { int32_t vm_fd; uint32_t label, flags, mem_handle; uint6
 extern void (*hv_vm_stop_hook)(void);
 void hv_host_cpu_thread(void); /* the core this thread's CPU has (android/runner.c; a no-op elsewhere) */
 extern const uint8_t hv_gunyah_shim_start[], hv_gunyah_shim_end[], hv_gunyah_shim_params[];
+extern const uint8_t hv_gunyah_fix_start[], hv_gunyah_fix_end[];
 
 static HvMachine *M;
 static HvVmapple *B;
@@ -481,10 +482,13 @@ static int kpatch(void) {
             (unsigned long long)(code >> 20));
 
     uint64_t impl_r = 0, impl_w = 0, midr = 0, midr_left = 0, pac = 0, sctlr = 0;
+    uint64_t vec[8], pools[64];
+    int nvec = 0;
     const char *kp = getenv("HV_GUNYAH_KEEP_PAC");
     int keep_pac = kp && *kp == '1';
     for (int r = 0; r < nxr; r++) {
         uint32_t *w = hv_phys_ptr(M, xr[r].pa, xr[r].size);
+        pools[r] = xr[r].size / 4;
         if (!w) continue;
         uint64_t n = xr[r].size / 4;
         /* The stub pool: the zeros at the code's end (page padding), less a margin. */
@@ -493,6 +497,22 @@ static int kpatch(void) {
         uint64_t pool = z + 16 < n ? z + 16 : n;
         for (uint64_t i = 0; i < z; i++) {
             uint32_t x = w[i];
+            if ((x & ~31u) == 0xd518c000u && nvec < 8) { /* MSR VBAR_EL1, Xt: where its ADRP (+ADD) points */
+                unsigned t = x & 31;
+                for (uint64_t j = i; j > 0 && j + 12 > i; j--) {
+                    uint32_t a = w[j - 1];
+                    if ((a & 0x9f00001fu) != (0x90000000u | t)) continue;
+                    int64_t imm = (int64_t)((((a >> 5) & 0x7ffff) << 2) | ((a >> 29) & 3));
+                    if (imm & (1ll << 20)) imm -= 1ll << 21;
+                    uint64_t tgt = ((xr[r].pa + (j - 1) * 4) & ~0xfffull) + (uint64_t)(imm << 12);
+                    for (uint64_t k = j; k < i; k++) /* ADD Xt, Xt, #imm12 */
+                        if ((w[k] & 0xffc003ffu) == (0x91000000u | t << 5 | t)) tgt += (w[k] >> 10) & 0xfff;
+                    int dup = 0;
+                    for (int v = 0; v < nvec; v++) dup |= vec[v] == tgt;
+                    if (!dup && !(tgt & 0x7ff)) vec[nvec++] = tgt;
+                    break;
+                }
+            }
             if (x == HVC0 && i + 1 < n && w[i + 1] == CBNZ_X0_SELF) {
                 w[i] = MOV_X0_0, w[i + 1] = NOP, pac++;
                 continue;
@@ -530,8 +550,61 @@ static int kpatch(void) {
                 else w[i] = NOP, impl_w++;
             }
         }
+        pools[r] = pool;
     }
     pac_patched += pac;
+    /* 0.3.92: device accesses Gunyah cannot emulate (writeback LDR/STR: ESR ISV 0, a synchronous external abort back
+       to the kernel; XNU's pe_init_fiq has `str w9, [x8, #0x80]!` on the GIC). Each kernel exception table's EL1
+       synchronous entries (SP0 at +0, SPx at +0x200) first go through host/gunyah_fixup.S, which carries such an access
+       out as a plain one and goes on. */
+    int vfixed = 0;
+    {
+        size_t flen = (size_t)(hv_gunyah_fix_end - hv_gunyah_fix_start), fw = flen / 4;
+        for (int v = 0; v < nvec; v++) {
+            for (int e = 0; e < 2; e++) {
+                uint64_t ent = vec[v] + (e ? 0x200 : 0);
+                uint32_t *ew = hv_phys_ptr(M, ent, 4);
+                if (!ew) continue;
+                uint32_t first = *ew;
+                /* The displaced instruction runs elsewhere: an unconditional B (XNU's BRANCH_TO_KVA_VECTOR) is
+                   re-aimed from there; nothing else PC-relative (ADR/ADRP, BL, conditional branches, literals). */
+                int64_t btgt = -1;
+                if ((first & 0xfc000000u) == 0x14000000u) {
+                    int64_t off = (int64_t)(first & 0x3ffffff);
+                    if (off & (1ll << 25)) off -= 1ll << 26;
+                    btgt = (int64_t)ent + off * 4;
+                } else if ((first & 0x1f000000u) == 0x10000000u || (first & 0x7c000000u) == 0x14000000u ||
+                    (first & 0x7e000000u) == 0x34000000u || (first & 0x7e000000u) == 0x36000000u ||
+                    (first & 0xff000010u) == 0x54000000u || (first & 0x3b000000u) == 0x18000000u) {
+                    fprintf(stderr, "gunyah: exception vector %#llx starts PC-relative (%08x): not fixed up\n", (unsigned long long)ent, first);
+                    continue;
+                }
+                int done = 0;
+                for (int r = 0; r < nxr && !done; r++) {
+                    uint64_t room = xr[r].size / 4 - pools[r];
+                    uint64_t at = xr[r].pa + pools[r] * 4;
+                    if (room < fw + 4 || (at > ent ? at - ent : ent - at) >= (120ull << 20)) continue;
+                    uint32_t *dst = hv_phys_ptr(M, at, flen);
+                    if (!dst) continue;
+                    memcpy(dst, hv_gunyah_fix_start, flen);
+                    if (btgt >= 0) {
+                        uint64_t d = (uint64_t)btgt > at ? (uint64_t)btgt - at : at - (uint64_t)btgt;
+                        if (d >= (120ull << 20)) continue;
+                        dst[fw - 2] = branch(at + (fw - 2) * 4, (uint64_t)btgt);
+                        dst[fw - 1] = NOP;
+                    } else {
+                        dst[fw - 2] = first;
+                        dst[fw - 1] = branch(at + (fw - 1) * 4, ent + 4);
+                    }
+                    *ew = branch(ent, at);
+                    pools[r] += fw + 1;
+                    vfixed++, done = 1;
+                }
+                if (!done) fprintf(stderr, "gunyah: no room near exception vector %#llx for its fix-up\n", (unsigned long long)ent);
+            }
+        }
+        fprintf(stderr, "gunyah: %d exception tables found, %d synchronous entries now carry out device accesses Gunyah cannot\n", nvec, vfixed);
+    }
     fprintf(stderr, "gunyah: kernel patched for this CPU: %llu reads and %llu writes of Apple's own registers (now 0 and "
                     "ignored), %llu MIDR reads (now Apple's %#llx)%s, %llu PAC hypercalls (now success), %llu SCTLR writes (pointer "
                     "authentication off)\n",

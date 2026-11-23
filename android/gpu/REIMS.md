@@ -1128,3 +1128,12 @@ written and read back, every ICC group-0 register fine. So the kernel addresses 
 now logged and set to Gunyah's layout if it differs, and the panic's saved state (pc, lr, x0-x28, far, esr) is read
 from RAM with the faulting instructions decoded (load/store forms, writeback and pairs, which a hypervisor cannot
 emulate, named).
+
+0.3.92 (2026-11-23): 0.3.91 named the faulting instruction: `str w9, [x8, #0x80]!` (b8080d09) in pe_init_fiq, the
+GICR_IGROUPR0 store, pre-indexed. A store that also updates its base gives a hypervisor no syndrome (ESR.ISV 0), and
+Gunyah answers such a device access with a synchronous external abort (0x96000010); Apple's hypervisor and Henge's
+JIT decode the instruction instead. The kernel's GIC layout was right (+0x10000, 4 MB). Fix: kpatch finds the kernel's
+exception tables (each MSR VBAR_EL1's ADRP/ADD) and puts host/gunyah_fixup.S in front of their EL1 synchronous
+entries: an external abort without a syndrome from an integer LDR/STR pre/post-indexed is carried out as a plain
+access (which Gunyah emulates) plus the base update, and execution goes on after it; anything else reaches XNU's
+handler as before (its first instruction, a B, re-aimed). Any device, not only the GIC.
