@@ -423,8 +423,11 @@ void hv_machine_halt(HvMachine *m, enum HvHaltReason reason) {
 }
 
 /* Device work is for CPU 0, which polls the devices. */
+void (*hv_machine_wake_hook)(void); /* another engine runs the CPUs (gunyah.c): its device thread is what to wake */
+
 void hv_machine_wake(HvMachine *m) {
     if (m->stats_interval) m->stats.kick_src[3]++;
+    if (hv_machine_wake_hook) hv_machine_wake_hook();
     if (m->cpu) hv_cpu_wake(m->cpu);
 }
 

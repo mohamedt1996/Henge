@@ -442,5 +442,6 @@ void hv_cpu_kick(HvCpu *cpu);
 /* From any thread: device work is waiting for the CPU thread's tick. Makes a
    running block leave and ends a WFI sleep. */
 void hv_machine_wake(HvMachine *m);
+extern void (*hv_machine_wake_hook)(void);
 
 #endif

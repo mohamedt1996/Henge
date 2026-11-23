@@ -1176,3 +1176,13 @@ lines) and the kernel went on past "Creating 7 util devices", then waited for go
 (0x32015000, 0x32019000) 150,000 times a second: "interrupt 71 has no doorbell". Apple's pcie,vmapple1 gives slot s
 the INTx line interrupt-base + s (64 + s) and the doorbells stopped at 67, so devices in slots 4-7 (the util storage
 device among them) could not interrupt. Doorbells now cover 64-95, every slot.
+
+0.3.98 (2026-11-23): 0.3.97 had every slot's doorbell (127) and CPUs 1-3 up, then the kernel's serial output stopped
+right after PCI configuration while CPU 0 read two virtio devices' ISR registers (0x32001000, 0x32019000) 150,000
+times a second; at 75 s the engine died of SIGSEGV with no report. Now: after 5 s of serial silence with the CPUs
+still running (and every 60 s of it, 4 times), the log names the addresses each vCPU hits most (device, BAR offset,
+register, last value), every PCI device's state (virtio status and ISR, its INTx line and doorbell rings, each queue:
+made available by the driver, taken and handed back by the device), how often the device thread ran, and the
+kernel's own log from its memory (what serial had not printed yet). Every Gunyah thread has a signal stack and 8 MB
+of stack, so a crash names its place. A finished disk request wakes the device thread at once instead of waiting
+for its next 1 ms pass (hv_machine_wake_hook).

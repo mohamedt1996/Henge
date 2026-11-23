@@ -53,6 +53,7 @@
 #include "machine.h"
 #include "vm.h"
 #include "vmapple.h"
+#include "virtio.h"
 
 /* Android common kernel include/uapi/linux/gunyah.h (android14-6.1). */
 #define GH_IOCTL_TYPE 'G'
@@ -119,6 +120,9 @@ static pthread_t vcpu_thread_id[HV_MAX_CPUS];
 static volatile uint64_t mmio_exits[HV_MAX_CPUS];
 static int irq_fd[NIRQ];
 static volatile uint8_t irq_level[NIRQ];
+static volatile uint64_t rings[NIRQ];  /* doorbell rings per interrupt (0.3.98: the silence report shows them) */
+static volatile uint64_t dev_ticks;    /* device-thread passes (each runs the devices' completions) */
+static volatile uint64_t uart_last_ns; /* when the kernel last wrote the serial port */
 static uint64_t handoff[2048];  /* the hand-over pages, as the shim reads them (16 KB) */
 static uint64_t shim_rep[512];  /* its reports (+0x4000) */
 static volatile int mac_runs;   /* the shim jumped to the Mac */
@@ -288,6 +292,7 @@ static size_t build_dtb(uint8_t *out, size_t cap, int ncpus, uint64_t size_max) 
 static void raise_line(int intid) {
     if (intid < 0 || intid >= NIRQ || irq_fd[intid] < 0) return;
     uint64_t one = 1;
+    rings[intid]++;
     if (write(irq_fd[intid], &one, sizeof one) < 0) { /* the counter is full: it is pending anyway */ }
 }
 
@@ -332,8 +337,16 @@ static void pac_scan(void) {
     }
 }
 
+/* 0.3.98: 0.3.97 died of SIGSEGV with nothing said: the engine's handler (vm.c on_ill) names the place, but a thread
+   that overflowed its stack has nowhere to run it. Every thread here gets a signal stack of its own. */
+static void thread_altstack(void) {
+    stack_t ss = {.ss_sp = malloc(1u << 16), .ss_size = 1u << 16, .ss_flags = 0};
+    if (ss.ss_sp) sigaltstack(&ss, NULL);
+}
+
 static void *pac_thread(void *arg) {
     (void)arg;
+    thread_altstack();
     uint64_t reported = pac_patched;
     while (!stop_req) {
         /* The kernel's own calls were rewritten before the start (kpatch); this is for code loaded later (the
@@ -353,12 +366,14 @@ static void *pac_thread(void *arg) {
 
 static void *device_thread(void *arg) {
     (void)arg;
+    thread_altstack();
     HvCpu *cpu0 = hv_vm_cpu(0);
     struct pollfd p = {.fd = dev_kick, .events = POLLIN};
     uint64_t n = 0;
     while (!stop_req) {
         if (poll(&p, 1, 1) > 0) { uint64_t v; if (read(dev_kick, &v, sizeof v) < 0) { } }
         if (M->tick) M->tick(M, cpu0);
+        dev_ticks++;
         /* Lines a device still holds high: ring again, in case the guest finished with the last ring. */
         if ((++n & 1) == 0)
             for (int i = 32; i < NIRQ; i++)
@@ -1141,7 +1156,14 @@ static int reg_of(const char *line, const char *key, uint64_t *v) {
     return 1;
 }
 
+static uint64_t now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
 static void uart_char(char c) {
+    uart_last_ns = now_ns();
     if (c != '\n' && uart_n < (int)sizeof uart_line - 1) { uart_line[uart_n++] = c; return; }
     uart_line[uart_n] = 0;
     uart_n = 0;
@@ -1339,16 +1361,124 @@ static void dump_msgbuf(void) {
     dump_screen();
 }
 
+/* ---- 0.3.98: what the kernel is doing when its serial output stops ----
+   0.3.97 stopped printing right after PCI configuration while CPU 0 went on reading two device registers (0x32001000
+   and 0x32019000, offset 0x1000 of two virtio devices' BAR: the ISR) 150,000 times a second. The addresses each vCPU
+   reads and writes most are counted with the last value; after 5 s of silence on the serial port (and every 60 s
+   of it) the watch thread names them (device, BAR offset), shows every PCI device's state (virtio status, ISR, its
+   INTx line, its queues: what the driver made available against what the device took and handed back), the
+   doorbell rings per line, how often the device thread ran (it hands back completions), and the kernel's own log
+   from its memory, which holds what the serial port had not printed yet. */
+#define HOT 6
+static struct { uint64_t pa, n, v; int w; } hot[HV_MAX_CPUS][HOT];
+static void hot_note(int id, uint64_t pa, uint64_t v, int w) {
+    int k, min = 0;
+    for (k = 0; k < HOT; k++) {
+        if (hot[id][k].pa == pa && hot[id][k].n) { hot[id][k].n++, hot[id][k].v = v, hot[id][k].w = w; return; }
+        if (hot[id][k].n < hot[id][min].n) min = k;
+    }
+    hot[id][min].pa = pa, hot[id][min].n = 1, hot[id][min].v = v, hot[id][min].w = w;
+}
+
+static const char *pci_name(const HvPciDev *d, char *buf, size_t n) {
+    uint16_t ven = (uint16_t)(d->config[0] | d->config[1] << 8), dev = (uint16_t)(d->config[2] | d->config[3] << 8);
+    const char *what = "?";
+    if (ven == 0x1af4) {
+        switch (dev - 0x1040) {
+        case 1: what = "virtio-net"; break;
+        case 2: what = "virtio-blk"; break;
+        case 18: what = "virtio-input"; break;
+        case 25: what = "virtio-snd"; break;
+        case 5: what = "virtio-balloon"; break;
+        default: what = "virtio"; break;
+        }
+    } else if ((d->config[11] == 0x0c && d->config[10] == 0x03)) what = "xhci";
+    snprintf(buf, n, "slot %d %s %04x:%04x", d->slot, what, ven, dev);
+    return buf;
+}
+
+static const HvPciDev *pci_at(uint64_t pa, int *bar, uint64_t *off) {
+    HvPcie *p = B->pcie;
+    if (!p) return NULL;
+    for (int s = 0; s < HV_PCI_SLOTS; s++) {
+        const HvPciDev *d = p->dev[s];
+        if (!d) continue;
+        for (int b = 0; b < 6; b++) {
+            if (!d->bar_size[b]) continue;
+            uint64_t a = hv_pci_bar_addr((HvPciDev *)d, b);
+            if (a && pa >= a && pa < a + d->bar_size[b]) { *bar = b, *off = pa - a; return d; }
+        }
+    }
+    return NULL;
+}
+
+static void silence_report(double quiet_s) {
+    say("gunyah: the kernel has printed nothing for %.0f s while its CPUs run: what they are doing\n", quiet_s);
+    for (int id = 0; id < nvcpu; id++) {
+        for (int k = 0; k < HOT; k++) {
+            if (!hot[id][k].n) continue;
+            int bar = -1;
+            uint64_t off = 0;
+            char nm[64];
+            const HvPciDev *d = pci_at(hot[id][k].pa, &bar, &off);
+            const char *reg = "";
+            if (d && d->config[0] == 0xf4 && d->config[1] == 0x1a)
+                reg = off < 0x1000 ? " (common config)" : off < 0x2000 ? " (ISR)" : off < 0x3000 ? " (device config)" : " (notify)";
+            say("gunyah:   vCPU %d %s %#llx %llu times (last %#llx)%s%s%s BAR%d+%#llx%s\n", id, hot[id][k].w ? "stores to" : "loads from",
+                (unsigned long long)hot[id][k].pa, (unsigned long long)hot[id][k].n, (unsigned long long)hot[id][k].v,
+                d ? ": " : "", d ? pci_name(d, nm, sizeof nm) : "", d ? "" : "", bar, (unsigned long long)off, reg);
+            hot[id][k].n = 0;
+        }
+    }
+    HvPcie *p = B->pcie;
+    for (int s = 0; p && s < HV_PCI_SLOTS; s++) {
+        const HvPciDev *d = p->dev[s];
+        if (!d) continue;
+        char nm[64], q[512];
+        int line = p->intx_base + d->slot, n = 0;
+        uint16_t cmd = (uint16_t)(d->config[4] | d->config[5] << 8);
+        q[0] = 0;
+        if (d->config[0] == 0xf4 && d->config[1] == 0x1a) {
+            const HvVirtio *v = d->opaque;
+            n += snprintf(q + n, sizeof q - (size_t)n, " status %#x isr %#x", v->status, v->isr);
+            for (int i = 0; i < v->nq && n < (int)sizeof q - 80; i++) {
+                const HvVirtq *vq = &v->q[i];
+                if (!vq->enabled) continue;
+                const uint16_t *av = hv_phys_ptr(M, vq->avail, 4), *us = hv_phys_ptr(M, vq->used, 4);
+                n += snprintf(q + n, sizeof q - (size_t)n, " | q%d size %u: driver made %u available, device took %u, handed back %u", i,
+                              vq->size, av ? av[1] : 0, vq->last_avail, us ? us[1] : 0);
+            }
+        }
+        say("gunyah:   %s: BAR %#llx, command %#x, INTx %d -> interrupt %d (%s, %llu rings)%s\n", pci_name(d, nm, sizeof nm),
+            (unsigned long long)hv_pci_bar_addr((HvPciDev *)d, 4) ? (unsigned long long)hv_pci_bar_addr((HvPciDev *)d, 4)
+                                                                    : (unsigned long long)hv_pci_bar_addr((HvPciDev *)d, 0),
+            cmd, d->intx, line, line < NIRQ && irq_level[line] ? "high" : "low", line < NIRQ ? (unsigned long long)rings[line] : 0ull, q);
+    }
+    char r[512];
+    int n = snprintf(r, sizeof r, "gunyah:   doorbell rings:");
+    for (int i = 32; i < NIRQ && n < (int)sizeof r - 24; i++)
+        if (rings[i]) n += snprintf(r + n, sizeof r - (size_t)n, " %d:%llu%s", i, (unsigned long long)rings[i], irq_level[i] ? "^" : "");
+    say("%s; the device thread ran %llu times\n", r, (unsigned long long)dev_ticks);
+    dump_msgbuf();
+}
+
 static void *watch_thread(void *arg) {
     (void)arg;
+    thread_altstack();
     while (!stop_req && !mac_runs) usleep(10000);
     uint64_t last0 = ~0ull;
-    int still = 0, dumps = 0;
+    int still = 0, dumps = 0, quiet_reports = 0, in_quiet = 0;
+    double quiet_at = 0;
     for (int s = 1; !stop_req && s <= 600; s++) {
         sleep(1);
         if (mmio_exits[0] == last0) still++;
         else still = 0, last0 = mmio_exits[0];
         if ((still == 3 && dumps < 3) || (still && still % 60 == 0 && dumps < 6)) dump_msgbuf(), dumps++;
+        double quiet = uart_last_ns ? (double)(now_ns() - uart_last_ns) / 1e9 : 0;
+        if (quiet >= 5 && !still) {
+            if ((!in_quiet || quiet - quiet_at >= 60) && quiet_reports < 4) silence_report(quiet), quiet_reports++, quiet_at = quiet;
+            in_quiet = 1;
+        } else if (quiet < 5) in_quiet = 0;
         if (s > 60 && s % 10) continue;
         char line[512];
         int n = snprintf(line, sizeof line, "gunyah: %d s on Gunyah:", s);
@@ -1430,6 +1560,7 @@ static void clean_all_ram(void) {
    coming back from a powered-down idle comes through the reset vector the same way). */
 static void *clean_thread(void *arg) {
     (void)arg;
+    thread_altstack();
     uint64_t lo = k_phys & ~0x3fffull, hi = k_top;
     if (hi <= lo || hi - lo > (1ull << 30)) return NULL;
     const uint8_t *p = hv_phys_ptr(M, lo, hi - lo);
@@ -1471,6 +1602,7 @@ static void rv_report(int id, uint64_t which, uint64_t v) {
 static uint64_t kicks_back[HV_MAX_CPUS];
 static void *kick_thread(void *arg) {
     (void)arg;
+    thread_altstack();
     while (!stop_req) {
         usleep((useconds_t)kick_ms * 1000);
         for (int i = 0; i < nvcpu; i++)
@@ -1485,6 +1617,7 @@ static void on_sigusr(int s) { (void)s; }
 static void *vcpu_thread(void *arg) {
     int id = (int)(intptr_t)arg;
     struct gh_vcpu_run *r = run[id];
+    thread_altstack();
     uint64_t unknown = 0, gic_exits = 0, low = 0;
     time_t last_report = time(NULL);
     /* The JIT's CPU 0 thread blocked the signals this one needs (a stop breaks GH_VCPU_RUN with SIGUSR1), and bound
@@ -1513,6 +1646,7 @@ static void *vcpu_thread(void *arg) {
             if (mmio_exits[id]++ == 0) say("gunyah: vCPU %d runs (its first exit: %s %#llx)\n", id, r->mmio.is_write ? "a store to" : "a load from",
                                            (unsigned long long)pa);
             note_page(id, pa, r->mmio.is_write);
+            if (r->mmio.is_write) { uint64_t wv = 0; memcpy(&wv, r->mmio.data, len); hot_note(id, pa, wv, 1); }
             /* Always the hand-over page's (vmapple has nothing there): the shim loads x0-x30 from it after it reports
                the jump, and 0.3.80 sent those 31 loads to Henge's devices, which answered 0: the kernel got all zeros. */
             if (pa >= HANDOFF_PA && pa < HANDOFF_PA + 0x5000) {
@@ -1544,6 +1678,9 @@ static void *vcpu_thread(void *arg) {
                 memset(r->mmio.data, 0, sizeof r->mmio.data);
                 if (hv_phys_read(M, pa, r->mmio.data, len) != 0 && unknown++ < 16)
                     fprintf(stderr, "gunyah: vCPU %d read of nothing at %llx\n", id, (unsigned long long)pa);
+                uint64_t rv = 0;
+                memcpy(&rv, r->mmio.data, len);
+                hot_note(id, pa, rv, 0);
             }
         } else if (r->exit_reason == GH_VCPU_EXIT_STATUS) {
             uint32_t reason = 0;
@@ -1778,18 +1915,20 @@ int hv_gunyah_run(void) {
     pthread_t helper[6];
     int nhelper = 0;
     void *(*helpers[])(void *) = {device_thread, pac_thread, watch_thread, clean_thread};
-    for (unsigned h = 0; h < sizeof helpers / sizeof *helpers; h++)
-        if (pthread_create(&helper[nhelper], NULL, helpers[h], NULL) == 0) nhelper++;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 8u << 20);
+    hv_machine_wake_hook = kick_devices; /* a finished disk request reaches the device thread at once, not at its next 1 ms */
+    for (unsigned h = 0; h < sizeof helpers / sizeof *helpers; h++)
+        if (pthread_create(&helper[nhelper], &attr, helpers[h], NULL) == 0) nhelper++;
     for (int i = 0; i < nvcpu; i++) pthread_create(&vcpu_thread_id[i], &attr, vcpu_thread, (void *)(intptr_t)i);
     if (getenv("HV_GUNYAH_KICK_MS")) kick_ms = atoi(getenv("HV_GUNYAH_KICK_MS"));
-    if (kick_ms > 0 && pthread_create(&helper[nhelper], NULL, kick_thread, NULL) == 0) nhelper++;
+    if (kick_ms > 0 && pthread_create(&helper[nhelper], &attr, kick_thread, NULL) == 0) nhelper++;
     for (int i = 0; i < nvcpu; i++) pthread_join(vcpu_thread_id[i], NULL);
     stop_req = 1;
     for (int i = 0; i < nhelper; i++) pthread_join(helper[i], NULL);
     for (int i = 0; i < nvcpu; i++) vcpu_thread_id[i] = 0;
+    hv_machine_wake_hook = NULL;
     hv_gic_external = NULL;
     hv_vm_stop_hook = NULL;
     if (!mac_runs) fprintf(stderr, "gunyah: the shim did not reach the Mac (its last phase: %s)\n", phase_name(shim_rep[0]));
