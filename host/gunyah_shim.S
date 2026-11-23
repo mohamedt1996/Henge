@@ -116,6 +116,9 @@ hv_gunyah_shim_start:
     mov  x3, #1
     gsys 14, msr s3_0_c12_c12_6, x3
     gsys 15, mrs x0, s3_0_c12_c12_6
+    gld  16, 0x40000000, w              /* 0.3.93: the PCIe windows, where the kernel's PCI configuration faulted */
+    gld  17, 0x40008000, w
+    gld  18, 0x50000000, w
     str  xzr, [x16]
 
     bl   rmfind

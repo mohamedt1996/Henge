@@ -834,14 +834,16 @@ static void shim_report(uint64_t off, uint64_t v) {
     }
     if (i == 8 && v < 640) say("gunyah: shim: accepting piece %llu (%#llx, %llu MB)\n", (unsigned long long)v,
                                (unsigned long long)handoff[129 + 3 * v], (unsigned long long)(handoff[130 + 3 * v] >> 20));
-    if (i >= 32 && i < 64 && (i & 1)) { /* 0.3.89: the shim's look at Gunyah's GIC before the kernel's */
-        static const char *probe[16] = {"GICD_CTLR", "GICD_TYPER", "GICR_TYPER (vCPU 0, 0x10010008)", "GICR_WAKER",
+    if (i >= 32 && i < 70 && (i & 1)) { /* 0.3.89: the shim's look at Gunyah's GIC before the kernel's */
+        static const char *probe[19] = {"GICD_CTLR", "GICD_TYPER", "GICR_TYPER (vCPU 0, 0x10010008)", "GICR_WAKER",
                                         "GICR_IGROUPR0 (SGI frame, 0x10020080) read", "GICR_IGROUPR0 write 0x81ffffff",
                                         "GICR_IGROUPR0 read back", "GICR_ISENABLER0 (0x10020100) read",
                                         "GICR_TYPER at 0x10030008 (vCPU 1 if the stride is 128K)",
                                         "GICR_TYPER at 0x10050008 (vCPU 1 if the stride is 256K)", "ICC_SRE_EL1",
                                         "ICC_BPR0_EL1 write 0", "ICC_PMR_EL1 write 0xff", "ICC_CTLR_EL1",
-                                        "ICC_IGRPEN0_EL1 write 1", "ICC_IGRPEN0_EL1"};
+                                        "ICC_IGRPEN0_EL1 write 1", "ICC_IGRPEN0_EL1",
+                                        "PCIe ECAM 0x40000000 (bus 0 device 0) read", "PCIe ECAM 0x40008000 (device 1) read",
+                                        "PCIe MMIO 0x50000000 read"};
         unsigned n = (i - 32) / 2;
         if (v >> 63)
             say("gunyah: shim: GIC probe %s: FAULTS (ESR %#llx)\n", probe[n], (unsigned long long)(v & ~(1ull << 63)));
@@ -1047,6 +1049,39 @@ static void uart_char(char c) {
                     (unsigned long long)(i + 3 < 29 ? r[i + 3] : 0));
             panic_pc(r[32]);
             panic_pc((r[30] & 0x0000ffffffffffffull) | 0xffff000000000000ull);
+        }
+    }
+    /* 0.3.93: a panic's backtrace (its "lr: 0x... fp: 0x..." lines): the frame after the exception's (the return
+       address that shows up twice) called the code that faulted. Its call and the called function are logged. */
+    static uint64_t bt[40];
+    static int nbt, bt_done;
+    const char *lrp = strstr(uart_line, "lr: 0x");
+    if (lrp && strstr(uart_line, "fp: 0x") && nbt < 40) bt[nbt++] = strtoull(lrp + 6, NULL, 16);
+    if (!bt_done && nbt > 2 && strstr(uart_line, "Kernel Extensions in backtrace")) {
+        bt_done = 1;
+        for (int k = 1; k < nbt - 1; k++) {
+            int rep = 0;
+            for (int j = 0; j < k; j++) rep |= bt[j] == bt[k];
+            if (!rep) continue;
+            uint64_t ret = bt[k + 1];
+            say("gunyah: the faulting code was called from %#llx (the frame after the exception's):\n", (unsigned long long)ret);
+            panic_pc(ret - 4);
+            const uint32_t *cw;
+            if (kva_ok(ret - 4, 4, (const void **)&cw) && (*cw & 0xfc000000u) == 0x94000000u) {
+                int64_t off = (int64_t)(*cw & 0x3ffffff);
+                if (off & (1ll << 25)) off -= 1ll << 26;
+                uint64_t fn = ret - 4 + (uint64_t)(off * 4);
+                const uint32_t *fw;
+                if (kva_ok(fn, 4 * 32, (const void **)&fw)) {
+                    say("gunyah: the function it called, at %#llx:\n", (unsigned long long)fn);
+                    for (int i = 0; i < 32; i++) {
+                        char d[128];
+                        decode_word(fw[i], d, sizeof d);
+                        say("gunyah:      %#llx: %08x  %s\n", (unsigned long long)(fn + 4 * (uint64_t)i), fw[i], d);
+                    }
+                }
+            }
+            break;
         }
     }
     uint64_t r0, r1, r2, r3;

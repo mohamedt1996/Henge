@@ -1,24 +1,128 @@
-/* The Mac kernel's device accesses that Gunyah cannot carry out (0.3.92).
+/* The Mac kernel's device accesses that Gunyah cannot carry out (0.3.92, widened in 0.3.93).
 
    A hypervisor emulates a device access from the syndrome the CPU gives it (ESR.ISV: size, register, direction).
-   Loads and stores that also update their base register (pre- or post-indexed) give none, and Gunyah answers them
-   with a synchronous external abort (ESR 0x96000010, DFSC 0x10, ISV 0) instead. XNU's own GIC set-up uses one,
-   `str w9, [x8, #0x80]!` in pe_init_fiq, and panicked on it. Apple's hypervisor and Henge's JIT decode the
-   instruction themselves.
+   Some loads and stores give none: those that also update their base register (pre/post-indexed), pairs (LDP/STP)
+   and SIMD&FP registers. Gunyah answers such a device access with a synchronous external abort (ESR 0x96000010,
+   DFSC 0x10, ISV 0) instead. Apple's hypervisor and Henge's JIT decode the instruction themselves.
 
    gunyah.c copies this, once per kernel exception vector it patches (EL1 synchronous, SP0 and SPx), into the
    kernel's code padding and makes the vector's first instruction a branch here. Here, on SP_EL1 as the vector would
-   be: an external abort without a syndrome, from an integer LDR/STR (zero-extending, 1-8 bytes) pre- or
-   post-indexed on a base other than SP, is done as a plain access (which Gunyah can emulate) plus the base's update,
-   and the instruction is skipped. Anything else goes on to the vector: its displaced first instruction, then a
-   branch back (the last two words, which gunyah.c fills in for each copy).
+   be: an external abort without a syndrome from one of
+     - LDR/STR (integer, zero-extending, 1-8 bytes) pre- or post-indexed,
+     - LDP/STP (32 or 64-bit integer registers), any addressing,
+     - LDR/STR of a SIMD&FP register (B, H, S, D, Q), unsigned offset or pre/post-indexed,
+     - LDP/STP of SIMD&FP registers (S, D, Q), any addressing,
+   on a base other than SP is carried out as plain integer accesses (which Gunyah can emulate) plus the base's
+   update, and the instruction is skipped. Anything else goes on to the vector: its displaced first instruction, then
+   a branch back (the last two words, which gunyah.c fills in for each copy).
 
-   Frame on SP_EL1: x0-x5 at 0-40, x16/x17 at 48/56, then ELR at 64, the new base at 72, Rt at 80. */
+   Frame on SP_EL1 (128 bytes): x0-x5 at 0-40, x16/x17 at 48/56; 64 ELR, 72 the new base, 80 Rt, 88 Rt2, 96 the
+   address, 104 the element size, 112 Rn, 120 the instruction. */
+
+    .macro MEMLD                        /* x2 = [x0], x4 bytes (1, 2, 4, 8) */
+    cmp  x4, #1
+    b.ne .Lml2\@
+    ldrb w2, [x0]
+    b    .Lmld\@
+.Lml2\@:
+    cmp  x4, #2
+    b.ne .Lml4\@
+    ldrh w2, [x0]
+    b    .Lmld\@
+.Lml4\@:
+    cmp  x4, #4
+    b.ne .Lml8\@
+    ldr  w2, [x0]
+    b    .Lmld\@
+.Lml8\@:
+    ldr  x2, [x0]
+.Lmld\@:
+    .endm
+
+    .macro MEMST                        /* [x0] = x2, x4 bytes (1, 2, 4, 8) */
+    cmp  x4, #1
+    b.ne .Lms2\@
+    strb w2, [x0]
+    b    .Lmsd\@
+.Lms2\@:
+    cmp  x4, #2
+    b.ne .Lms4\@
+    strh w2, [x0]
+    b    .Lmsd\@
+.Lms4\@:
+    cmp  x4, #4
+    b.ne .Lms8\@
+    str  w2, [x0]
+    b    .Lmsd\@
+.Lms8\@:
+    str  x2, [x0]
+.Lmsd\@:
+    .endm
+
+    .macro VLD                          /* x2 (low), x5 (high) = [x0], x4 bytes (1-16) */
+    cmp  x4, #16
+    b.ne .Lvl\@
+    ldr  x2, [x0]
+    ldr  x5, [x0, #8]
+    b    .Lvld\@
+.Lvl\@:
+    MEMLD
+    mov  x5, #0
+.Lvld\@:
+    .endm
+
+    .macro VST                          /* [x0] = x2 (low), x5 (high), x4 bytes (1-16) */
+    cmp  x4, #16
+    b.ne .Lvs\@
+    str  x2, [x0]
+    str  x5, [x0, #8]
+    b    .Lvsd\@
+.Lvs\@:
+    MEMST
+.Lvsd\@:
+    .endm
+
+    .macro CALL fn                      /* the helpers return through x17 */
+    adr  x17, .Lret\@
+    b    \fn
+.Lret\@:
+    .endm
+
+    .macro FP_SIZE                      /* x4 = a SIMD&FP LDR/STR's size (size, opc<1>), at [sp, #104]; declines a bad one */
+    ldr  x3, [sp, #120]
+    ubfx x1, x3, #30, #2
+    mov  x4, #1
+    lsl  x4, x4, x1
+    tbz  x3, #23, .Lfs\@               /* opc<1>: 128-bit when size is 0 */
+    cbnz x1, decline
+    mov  x4, #16
+.Lfs\@:
+    str  x4, [sp, #104]
+    .endm
+
+    .macro PAIR_ADDR                    /* x4 the element size: the new base (base + imm7 * size) at 72, the address at
+                                           96 (post-indexed: the old base) */
+    ldr  x3, [sp, #120]
+    sbfx x1, x3, #15, #7
+    mul  x1, x1, x4
+    str  x1, [sp, #96]
+    ldr  x1, [sp, #112]
+    CALL getreg
+    ldr  x1, [sp, #96]
+    add  x4, x2, x1
+    str  x4, [sp, #72]
+    ldr  x3, [sp, #120]
+    ubfx x1, x3, #23, #2
+    cmp  x1, #1
+    csel x0, x2, x4, eq
+    str  x0, [sp, #96]
+    .endm
+
     .text
     .balign 4
     .global hv_gunyah_fix_start, hv_gunyah_fix_end
 hv_gunyah_fix_start:
-    sub  sp, sp, #96
+    sub  sp, sp, #128
     stp  x0, x1, [sp, #0]
     stp  x2, x3, [sp, #16]
     stp  x4, x5, [sp, #32]
@@ -32,89 +136,252 @@ hv_gunyah_fix_start:
     cmp  x1, #0x10                      /* synchronous external abort */
     b.ne decline
     mrs  x0, elr_el1
+    str  x0, [sp, #64]
     ldr  w3, [x0]                       /* the instruction */
-    movz w1, #0x0400
+    str  x3, [sp, #120]
+    ubfx x5, x3, #5, #5                 /* Rn */
+    cmp  x5, #31
+    b.eq decline                        /* SP: never a device */
+    str  x5, [sp, #112]
+    ubfx x1, x3, #0, #5
+    str  x1, [sp, #80]                  /* Rt */
+    ubfx x1, x3, #10, #5
+    str  x1, [sp, #88]                  /* Rt2 (pairs) */
+
+    movz w1, #0x0400                    /* integer LDR/STR, pre/post-indexed */
     movk w1, #0x3f20, lsl #16
     and  w1, w3, w1
     movz w4, #0x0400
     movk w4, #0x3800, lsl #16
-    cmp  w1, w4                         /* LDR/STR (immediate), pre/post-indexed, integer */
-    b.ne decline
+    cmp  w1, w4
+    b.eq gpr1
+    and  w1, w3, #0x3e000000            /* integer LDP/STP */
+    movz w4, #0x2800, lsl #16
+    cmp  w1, w4
+    b.eq gpr2
+    and  w1, w3, #0x3f000000            /* SIMD&FP LDR/STR, unsigned offset */
+    movz w4, #0x3d00, lsl #16
+    cmp  w1, w4
+    b.eq fp1u
+    movz w1, #0x0400                    /* SIMD&FP LDR/STR, pre/post-indexed */
+    movk w1, #0x3f20, lsl #16
+    and  w1, w3, w1
+    movz w4, #0x0400
+    movk w4, #0x3c00, lsl #16
+    cmp  w1, w4
+    b.eq fp1i
+    and  w1, w3, #0x3e000000            /* SIMD&FP LDP/STP */
+    movz w4, #0x2c00, lsl #16
+    cmp  w1, w4
+    b.eq fp2
+    b    decline
+
+/* ---- integer LDR/STR pre/post: imm9, one access */
+gpr1:
     ubfx x4, x3, #22, #2                /* opc: 0 store, 1 load (zero-extending); signed loads not here */
     cmp  x4, #1
     b.hi decline
-    ubfx x5, x3, #5, #5                 /* Rn */
-    cmp  x5, #31
-    b.eq decline                        /* SP: never a device */
-    str  x0, [sp, #64]
-    mov  x1, x5
-    adr  x17, 1f
-    b    getreg
-1:  sbfx x1, x3, #12, #9                /* imm9 */
-    add  x4, x2, x1                     /* the new base */
-    tst  x3, #0x800                     /* pre-indexed: the access at the new base */
-    csel x0, x4, x2, ne
+    ubfx x4, x3, #30, #2
+    mov  x1, #1
+    lsl  x4, x1, x4                     /* size */
+    str  x4, [sp, #104]
+    sbfx x1, x3, #12, #9
+    str  x1, [sp, #96]                  /* (offset, for the moment) */
+    ldr  x1, [sp, #112]
+    CALL getreg                         /* x2 = base */
+    ldr  x1, [sp, #96]
+    add  x4, x2, x1                     /* new base */
     str  x4, [sp, #72]
-    ubfx x1, x3, #0, #5                 /* Rt */
-    str  x1, [sp, #80]
-    ubfx x4, x3, #30, #2                /* size */
-    tbnz x3, #22, load
-    adr  x17, 2f
-    b    getreg
-2:  cmp  x4, #0
-    b.ne 3f
-    strb w2, [x0]
+    ldr  x3, [sp, #120]
+    tst  x3, #0x800                     /* pre-indexed: at the new base */
+    csel x0, x4, x2, ne
+    str  x0, [sp, #96]
+    ldr  x4, [sp, #104]
+    tbnz x3, #22, 1f
+    ldr  x1, [sp, #80]
+    CALL getreg
+    ldr  x0, [sp, #96]
+    ldr  x4, [sp, #104]
+    MEMST
     b    wb
-3:  cmp  x4, #1
-    b.ne 4f
-    strh w2, [x0]
+1:  MEMLD
+    ldr  x1, [sp, #80]
+    CALL setreg
     b    wb
-4:  cmp  x4, #2
-    b.ne 5f
-    str  w2, [x0]
+
+/* ---- integer LDP/STP: imm7 scaled, two accesses; modes 0/2 offset, 1 post, 3 pre */
+gpr2:
+    ubfx x1, x3, #30, #2                /* opc: 0 32-bit, 2 64-bit (1 LDPSW: not here) */
+    mov  x4, #4
+    cbz  x1, 1f
+    cmp  x1, #2
+    b.ne decline
+    mov  x4, #8
+1:  str  x4, [sp, #104]
+    PAIR_ADDR
+    ldr  x3, [sp, #120]
+    tbnz x3, #22, 2f
+    ldr  x1, [sp, #80]                  /* store: Rt, then Rt2 */
+    CALL getreg
+    ldr  x0, [sp, #96]
+    ldr  x4, [sp, #104]
+    MEMST
+    ldr  x1, [sp, #88]
+    CALL getreg
+    ldr  x0, [sp, #96]
+    ldr  x4, [sp, #104]
+    add  x0, x0, x4
+    MEMST
+    b    pairwb
+2:  ldr  x0, [sp, #96]                  /* load: both read before either register changes (Rt may be the base) */
+    ldr  x4, [sp, #104]
+    MEMLD
+    str  x2, [sp, #80 + 0]              /* (Rt's number is re-read below from the instruction) */
+    ldr  x0, [sp, #96]
+    ldr  x4, [sp, #104]
+    add  x0, x0, x4
+    MEMLD
+    ldr  x3, [sp, #120]
+    ubfx x1, x3, #10, #5
+    CALL setreg                         /* Rt2 */
+    ldr  x2, [sp, #80]
+    ldr  x3, [sp, #120]
+    ubfx x1, x3, #0, #5
+    CALL setreg                         /* Rt */
+    b    pairwb
+
+/* ---- SIMD&FP LDR/STR, unsigned offset: imm12 scaled */
+fp1u:
+    FP_SIZE
+    ldr  x3, [sp, #120]
+    ubfx x1, x3, #10, #12
+    mul  x1, x1, x4
+    str  x1, [sp, #96]
+    ldr  x1, [sp, #112]
+    CALL getreg
+    ldr  x1, [sp, #96]
+    add  x0, x2, x1
+    str  x0, [sp, #96]
+    str  x2, [sp, #72]                  /* no writeback: the base stays */
+    b    fp1go
+/* ---- SIMD&FP LDR/STR pre/post: imm9 */
+fp1i:
+    FP_SIZE
+    ldr  x3, [sp, #120]
+    sbfx x1, x3, #12, #9
+    str  x1, [sp, #96]
+    ldr  x1, [sp, #112]
+    CALL getreg
+    ldr  x1, [sp, #96]
+    add  x4, x2, x1
+    str  x4, [sp, #72]
+    ldr  x3, [sp, #120]
+    tst  x3, #0x800
+    csel x0, x4, x2, ne
+    str  x0, [sp, #96]
+fp1go:
+    ldr  x3, [sp, #120]
+    ldr  x0, [sp, #96]
+    ldr  x4, [sp, #104]
+    tbnz x3, #22, 1f
+    ldr  x1, [sp, #80]
+    CALL getv                           /* x2, x5 */
+    ldr  x0, [sp, #96]
+    ldr  x4, [sp, #104]
+    VST
     b    wb
-5:  str  x2, [x0]
+1:  VLD
+    ldr  x1, [sp, #80]
+    ldr  x4, [sp, #104]
+    CALL setv
     b    wb
-load:
-    cmp  x4, #0
-    b.ne 6f
-    ldrb w2, [x0]
-    b    7f
-6:  cmp  x4, #1
-    b.ne 8f
-    ldrh w2, [x0]
-    b    7f
-8:  cmp  x4, #2
-    b.ne 9f
-    ldr  w2, [x0]
-    b    7f
-9:  ldr  x2, [x0]
-7:  ldr  x1, [sp, #80]
-    adr  x17, wb
-    b    setreg
-wb: ldr  x2, [sp, #72]
-    mov  x1, x5
-    adr  x17, 10f
-    b    setreg
-10: ldr  x0, [sp, #64]
+
+/* ---- SIMD&FP LDP/STP: opc 0 S, 1 D, 2 Q */
+fp2:
+    ubfx x1, x3, #30, #2
+    cmp  x1, #2
+    b.hi decline
+    add  x1, x1, #2
+    mov  x4, #1
+    lsl  x4, x4, x1
+    str  x4, [sp, #104]
+    PAIR_ADDR
+    ldr  x3, [sp, #120]
+    tbnz x3, #22, 2f
+    ldr  x1, [sp, #80]
+    CALL getv
+    ldr  x0, [sp, #96]
+    ldr  x4, [sp, #104]
+    VST
+    ldr  x1, [sp, #88]
+    CALL getv
+    ldr  x0, [sp, #96]
+    ldr  x4, [sp, #104]
+    add  x0, x0, x4
+    VST
+    b    pairwb
+2:  ldr  x0, [sp, #96]
+    ldr  x4, [sp, #104]
+    VLD
+    ldr  x1, [sp, #80]
+    ldr  x4, [sp, #104]
+    CALL setv
+    ldr  x0, [sp, #96]
+    ldr  x4, [sp, #104]
+    add  x0, x0, x4
+    VLD
+    ldr  x1, [sp, #88]
+    ldr  x4, [sp, #104]
+    CALL setv
+    b    pairwb
+
+/* Pairs: modes 1 and 3 write the base back. */
+pairwb:
+    ldr  x3, [sp, #120]
+    ubfx x1, x3, #23, #2
+    cmp  x1, #1
+    b.eq wb
+    cmp  x1, #3
+    b.eq wb
+    b    done
+wb: ldr  x3, [sp, #120]
+    and  w1, w3, #0x3f000000            /* unsigned-offset forms never write back */
+    movz w4, #0x3d00, lsl #16
+    cmp  w1, w4
+    b.eq done
+    ldr  x2, [sp, #72]
+    ldr  x1, [sp, #112]
+    CALL setreg
+done:
+    ldr  x0, [sp, #64]
     add  x0, x0, #4
     msr  elr_el1, x0
     ldp  x0, x1, [sp, #0]
     ldp  x2, x3, [sp, #16]
     ldp  x4, x5, [sp, #32]
     ldp  x16, x17, [sp, #48]
-    add  sp, sp, #96
+    add  sp, sp, #128
     eret
 
-/* x2 = register x1 (31: zero) as the faulting code had it; returns to x17. Uses x16. */
+/* x2 = integer register x1 (31: zero) as the faulting code had it; returns to x17. Uses x16. */
 getreg:
     adr  x16, gtab
     add  x16, x16, x1, lsl #3
     br   x16
-/* register x1 = x2; returns to x17. Uses x16. */
+/* integer register x1 = x2; returns to x17. Uses x16. */
 setreg:
     adr  x16, stab
     add  x16, x16, x1, lsl #3
+    br   x16
+/* x2, x5 = SIMD&FP register x1's low and high halves; returns to x17. Uses x16. */
+getv:
+    adr  x16, gvtab
+    add  x16, x16, x1, lsl #4
+    br   x16
+/* SIMD&FP register x1 = x2 (low), x5 (high, when x4 is 16; else zero, as a load does); returns to x17. */
+setv:
+    adr  x16, svtab
+    add  x16, x16, x1, lsl #4
     br   x16
 
     .balign 8
@@ -156,13 +423,28 @@ stab:
     .endr
     nop
     br   x17
+    .balign 16
+gvtab:
+    .irp r, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fmov x2, d\r
+    mov  x5, v\r\().d[1]
+    br   x17
+    nop
+    .endr
+svtab:
+    .irp r, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fmov d\r, x2
+    tbz  x4, #4, . + 8
+    mov  v\r\().d[1], x5
+    br   x17
+    .endr
 
 decline:
     ldp  x0, x1, [sp, #0]
     ldp  x2, x3, [sp, #16]
     ldp  x4, x5, [sp, #32]
     ldp  x16, x17, [sp, #48]
-    add  sp, sp, #96
+    add  sp, sp, #128
     .word 0                             /* the vector's own first instruction (gunyah.c) */
     .word 0                             /* b vector + 4 (gunyah.c) */
 hv_gunyah_fix_end:

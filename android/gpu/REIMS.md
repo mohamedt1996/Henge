@@ -1137,3 +1137,12 @@ exception tables (each MSR VBAR_EL1's ADRP/ADD) and puts host/gunyah_fixup.S in 
 entries: an external abort without a syndrome from an integer LDR/STR pre/post-indexed is carried out as a plain
 access (which Gunyah emulates) plus the base update, and execution goes on after it; anything else reaches XNU's
 handler as before (its first instruction, a B, re-aimed). Any device, not only the GIC.
+
+0.3.93 (2026-11-23): 0.3.92 worked: 2 exception tables, 4 entries fixed up, and the Mac's kernel booted far on
+Gunyah: "Darwin Kernel Version 24.6.0 ... RELEASE_ARM64_VMAPPLE", the VM, IOKit, AMFI, sandbox, AES, PSCI, the
+credential manager, BSD ("The Regents of the University of California"), up to "[ PCI configuration begin ]", where
+IOPCIFamily (from AppleVirtualPlatform) took another external abort, far ...08000 (PCIe ECAM, device 1). The fix-up now
+also carries out integer LDP/STP and SIMD&FP LDR/STR/LDP/STP (any addressing) on devices, the likely forms of a
+config-space copy. If it is something else: the panic's backtrace is read (the frame after the exception's) and the
+call and the called function are decoded; the shim also reads ECAM at 0x40000000/0x40008000 and PCIe MMIO
+0x50000000 to show whether Gunyah passes those windows to Henge at all.
