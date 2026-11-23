@@ -1198,3 +1198,15 @@ tree and calls doorbell_mask(cap, all, all) (every ring one assertion that clear
 all); the bell nodes also say source-can-clear, so the host's own call works where the resource manager honours it.
 If the kernel is still silent 45 s on, vCPU 0's most-read device address is answered once with an abort (MMIO
 resume "fault"), so its panic backtrace names the loop. The silence report knows the disks' Apple IDs (106b:1a00).
+
+0.3.100 (2026-11-23): 0.3.99 ended the interrupt storm (127 doorbells clear on delivery) and the kernel ran on: PCI,
+the util storage devices, AppleCredentialManager, networking, NFS, the USB keyboard and Magic Trackpad enumerated,
+BootPolicy, and APFS mounting disk0s1-s3 for the root volume. Then CPU 0 panicked "cpu 1 failed to boot for the first
+time": CPUs 1-3 had reached the reset vector and read the right CPU table, and then nothing (PC 0 in the panic); in a
+second run CPU 2 came up and worked (xHCI), 1 and 3 did not. XNU's flush_dcache is only a DSB on Apple platforms
+(__ARM_COHERENT_CACHE__), so cpu_start's flush of the new CPU's cpu_data and CpuDataEntries cleans nothing: written
+just before CPU_ON, after the last periodic clean, they are read stale by the CPU with its caches off (reset handler,
+stacks), and it hangs on reset_vector's "b .". Now the reset vector's first report stops the CPU while the whole of the
+Mac's RAM is cleaned to memory (about 70 ms), before it reads any of it. Also: the kicker and a stopping vCPU called
+pthread_kill on vCPU threads already joined (the engine's segfault after "the VM stopped"); a thread is signalled
+only while it lives now.

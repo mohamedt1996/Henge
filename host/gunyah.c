@@ -117,6 +117,16 @@ static int vcpu_fd[HV_MAX_CPUS];
 static struct gh_vcpu_run *run[HV_MAX_CPUS];
 static volatile int stop_req, vm_reason = -1;
 static pthread_t vcpu_thread_id[HV_MAX_CPUS];
+/* 0.3.100: a vCPU thread's id is signalled only while the thread lives (vcpu_alive, under kill_mu). The kicker and a
+   stopping vCPU signalled threads the main thread had already joined: pthread_kill on a freed thread, the engine's
+   "Segmentation fault" right after "the VM stopped" (0.3.99's first run). */
+static pthread_mutex_t kill_mu = PTHREAD_MUTEX_INITIALIZER;
+static int vcpu_alive[HV_MAX_CPUS];
+static void kick_vcpu(int i) {
+    pthread_mutex_lock(&kill_mu);
+    if (vcpu_alive[i] && !pthread_equal(vcpu_thread_id[i], pthread_self())) pthread_kill(vcpu_thread_id[i], SIGUSR1);
+    pthread_mutex_unlock(&kill_mu);
+}
 static volatile uint64_t mmio_exits[HV_MAX_CPUS];
 static int irq_fd[NIRQ];
 static volatile uint8_t irq_level[NIRQ];
@@ -1554,7 +1564,9 @@ static void *clean_worker(void *arg) {
     return NULL;
 }
 
-static void clean_all_ram(void) {
+static long clean_all_ram_quiet(int quiet);
+static void clean_all_ram(void) { clean_all_ram_quiet(0); }
+static long clean_all_ram_quiet(int quiet) {
     struct timespec a, b;
     clock_gettime(CLOCK_MONOTONIC, &a);
     enum { W = 4 };
@@ -1573,9 +1585,11 @@ static void clean_all_ram(void) {
     for (int i = 0; i < nt; i++) pthread_join(t[i], NULL);
     for (int i = 0; i < W && (size_t)i * step < B->ram_size; i++) done += part[i].done;
     clock_gettime(CLOCK_MONOTONIC, &b);
-    fprintf(stderr, "gunyah: %llu MB of the Mac's RAM cleaned from the caches to memory in %ld ms (Gunyah has no forced "
-                    "write-back: a CPU with its MMU off reads memory, not caches)\n", (unsigned long long)(done >> 20),
-            (long)((b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000));
+    long ms = (long)((b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000);
+    if (!quiet)
+        fprintf(stderr, "gunyah: %llu MB of the Mac's RAM cleaned from the caches to memory in %ld ms (Gunyah has no forced "
+                        "write-back: a CPU with its MMU off reads memory, not caches)\n", (unsigned long long)(done >> 20), ms);
+    return ms;
 }
 
 /* The kernel's image and data (physBase to topOfKernelData), cleaned again and again while the Mac runs: every 50 ms
@@ -1609,12 +1623,22 @@ static void *clean_thread(void *arg) {
    with its caches off, set against what memory (through the host's cached view) holds. */
 static void rv_report(int id, uint64_t which, uint64_t v) {
     static int n;
-    if (n++ > 32) return;
+    n++;
     if (which == 0) {
-        fprintf(stderr, "gunyah: vCPU %d reached the kernel's reset vector (MPIDR %#llx): CPU_ON started it\n", id,
-                (unsigned long long)v);
+        /* 0.3.100: XNU's flush_dcache is only a DSB on Apple platforms (__ARM_COHERENT_CACHE__: Apple's cores, and
+           Apple's hypervisor with forced write-back, keep caches-off reads coherent), so cpu_start's "flush" of the
+           new CPU's cpu_data and CpuDataEntries cleans nothing. Those were written just before CPU_ON, after the last
+           periodic clean: the CPU, caches off, read stale reset-handler and stack fields and hung on reset_vector's
+           "b ." (0.3.99: CPUs 1 and 3 never came up, CPU 2 did in one run, none in the other; "cpu 1 failed to boot"
+           once XNU checked, at the root mount). This stop is the CPU's first store, before it reads any of that: the
+           whole of the Mac's RAM is cleaned to memory now, and the CPU goes on only after. */
+        long ms = clean_all_ram_quiet(1);
+        if (n <= 8)
+            fprintf(stderr, "gunyah: vCPU %d reached the kernel's reset vector (MPIDR %#llx): CPU_ON started it; the Mac's RAM "
+                            "cleaned to memory for it (%ld ms)\n", id, (unsigned long long)v, ms);
         return;
     }
+    if (n > 16) return;
     const uint8_t *p = rv_rhd ? hv_phys_ptr(M, rv_rhd, 8) : NULL;
     uint64_t mem = p ? rd64(p) : 0;
     fprintf(stderr, "gunyah: vCPU %d, caches off, reads the kernel's CPU table pointer as %#llx; the caches hold %#llx%s\n", id,
@@ -1629,7 +1653,7 @@ static void *kick_thread(void *arg) {
     while (!stop_req) {
         usleep((useconds_t)kick_ms * 1000);
         for (int i = 0; i < nvcpu; i++)
-            if (vcpu_thread_id[i]) pthread_kill(vcpu_thread_id[i], SIGUSR1);
+            kick_vcpu(i);
     }
     return NULL;
 }
@@ -1734,6 +1758,9 @@ static void *vcpu_thread(void *arg) {
         }
     }
     hv_gunyah_stop(); /* one vCPU stopping (the VM exited or crashed) stops them all */
+    pthread_mutex_lock(&kill_mu);
+    vcpu_alive[id] = 0;
+    pthread_mutex_unlock(&kill_mu);
     return NULL;
 }
 
@@ -1741,7 +1768,7 @@ void hv_gunyah_stop(void) {
     stop_req = 1;
     for (int i = 0; i < nvcpu; i++) {
         if (run[i]) run[i]->immediate_exit = 1;
-        if (vcpu_thread_id[i] && !pthread_equal(vcpu_thread_id[i], pthread_self())) pthread_kill(vcpu_thread_id[i], SIGUSR1);
+        kick_vcpu(i);
     }
 }
 
@@ -1952,7 +1979,10 @@ int hv_gunyah_run(void) {
     hv_machine_wake_hook = kick_devices; /* a finished disk request reaches the device thread at once, not at its next 1 ms */
     for (unsigned h = 0; h < sizeof helpers / sizeof *helpers; h++)
         if (pthread_create(&helper[nhelper], &attr, helpers[h], NULL) == 0) nhelper++;
-    for (int i = 0; i < nvcpu; i++) pthread_create(&vcpu_thread_id[i], &attr, vcpu_thread, (void *)(intptr_t)i);
+    pthread_mutex_lock(&kill_mu); /* the ids are written before any kick reads them */
+    for (int i = 0; i < nvcpu; i++)
+        if (pthread_create(&vcpu_thread_id[i], &attr, vcpu_thread, (void *)(intptr_t)i) == 0) vcpu_alive[i] = 1;
+    pthread_mutex_unlock(&kill_mu);
     if (getenv("HV_GUNYAH_KICK_MS")) kick_ms = atoi(getenv("HV_GUNYAH_KICK_MS"));
     if (kick_ms > 0 && pthread_create(&helper[nhelper], &attr, kick_thread, NULL) == 0) nhelper++;
     for (int i = 0; i < nvcpu; i++) pthread_join(vcpu_thread_id[i], NULL);
