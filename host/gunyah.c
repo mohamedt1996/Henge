@@ -422,6 +422,8 @@ static int64_t find_boot_args(void) {
 static struct { uint64_t pa, size; } xr[64]; /* the kernel collection's code, by physical address */
 static uint64_t k_virt, k_phys; /* the kernel's static mapping: virtual k_virt is physical k_phys */
 static uint64_t k_top;          /* physical end of the kernel's data (boot_args topOfKernelData) */
+static uint64_t fb_pa;            /* the Mac's screen: boot_args' Video at first, initialize_screen's once the kernel says */
+static uint32_t fb_w, fb_h, fb_rb;
 #define RV_MARK 0x4f00u          /* hand-over page offset the reset vector's stub stores to (x16 MPIDR, then +8 its read) */
 static uint64_t rv_rhd, rv_sites; /* where ResetHandlerData.cpu_data_entries is; reset vectors patched */
 static int nxr;
@@ -534,6 +536,11 @@ static int kpatch(void) {
     const uint8_t *b = B->ram + ba;
     uint64_t virt = rd64(b + 8), phys = rd64(b + 16), top = rd64(b + 32), dtva = rd64(b + 96);
     k_virt = virt, k_phys = phys, k_top = top;
+    { /* 0.3.102: boot_args' Video (base, display, rowBytes, width, height, depth at +40): the screen iBoot set up */
+        uint64_t vb = rd64(b + 40), vr = rd64(b + 56), vw = rd64(b + 64), vh = rd64(b + 72);
+        if (vb >= VMAPPLE_MEM && vw && vh && vw <= 8192 && vh <= 8192 && vr >= vw * 4)
+            fb_pa = vb, fb_w = (uint32_t)vw, fb_h = (uint32_t)vh, fb_rb = (uint32_t)vr;
+    }
     uint32_t dtlen = rd32(b + 104);
     /* 0.3.89: the kernel's own console on the serial port (this log), panics included. Until now a panic this early had
        nowhere to go (no panic buffer yet, serial console off, video console not drawn) and showed only as "MACH Reboot".
@@ -1283,8 +1290,6 @@ static void note_page(int id, uint64_t pa, int write) {
 /* 0.3.88: 0.3.87 found no "panic(cpu" text anywhere in the Mac's RAM, yet "MACH Reboot" is the panic path's restart:
    this early the panic log has no buffer and its text goes only to the video console, drawn as pixels into the
    framebuffer XNU named in "initialize_screen". That framebuffer is written to a picture the user can send. */
-static uint64_t fb_pa;
-static uint32_t fb_w, fb_h, fb_rb;
 
 static void dump_screen(void) {
     if (!fb_pa || !fb_w || !fb_h || fb_w > 8192 || fb_h > 8192 || fb_rb < fb_w * 4) return;
@@ -1310,8 +1315,10 @@ static void dump_screen(void) {
         for (uint32_t y = 0; y < fb_h; y++) fwrite(fb + (uint64_t)y * fb_rb, 4, fb_w, f);
         fclose(f);
         chmod(path, 0644);
-        say("gunyah: the Mac's screen (%ux%u at pa %#llx) is in %s: send it, it may show the panic\n", fb_w, fb_h,
-            (unsigned long long)fb_pa, path);
+        static int told;
+        if (!told++)
+            say("gunyah: the Mac's screen (%ux%u at pa %#llx) is in %s (written again every 30 s): send it\n", fb_w, fb_h,
+                (unsigned long long)fb_pa, path);
         return;
     }
     say("gunyah: could not write the Mac's screen to a picture\n");
@@ -1342,10 +1349,16 @@ static void dump_msgbuf(void) {
         }
         out[m] = 0;
         say("%s\n---\n", out);
-        const char *is = strstr(out, "initialize_screen: b=");
-        unsigned long long b, w, h, rb;
-        if (is && sscanf(is, "initialize_screen: b=%llx, w=%llx, h=%llx, r=%llx", &b, &w, &h, &rb) == 4)
-            fb_pa = b, fb_w = (uint32_t)w, fb_h = (uint32_t)h, fb_rb = (uint32_t)rb;
+        /* The screen's place: the last initialize_screen anywhere in the buffer (0.3.101's tail held only timer spam). */
+        for (uint32_t i = 0; i + 64 < size; i++) {
+            if (buf[i] != 'i' || memcmp(buf + i, "initialize_screen: b=", 21)) continue;
+            char t[96];
+            memcpy(t, buf + i, sizeof t - 1);
+            t[sizeof t - 1] = 0;
+            unsigned long long b, w, h, rb;
+            if (sscanf(t, "initialize_screen: b=%llx, w=%llx, h=%llx, r=%llx", &b, &w, &h, &rb) == 4 && w && h)
+                fb_pa = b, fb_w = (uint32_t)w, fb_h = (uint32_t)h, fb_rb = (uint32_t)rb;
+        }
     }
     if (!found) say("gunyah: no kernel log (msgbuf) found in the kernel's data yet\n");
     /* 0.3.87: 0.3.86's log ended "failed to find the timer" (harmless: the JIT's boots print it too), then "MACH Reboot"
@@ -1487,6 +1500,62 @@ static void silence_report(double quiet_s) {
     dump_msgbuf();
 }
 
+/* ---- 0.3.102: the kernel's log, followed ----
+   0.3.101 reached launchd ("BaseSystem environment starting", boot task mount-phase-1), then the serial port went quiet
+   and the CPUs idled while the kernel's own log (msgbuf) kept growing; its tail was all CoreAnalyticsHub's timer line.
+   Once the serial port has been quiet 3 s, each new line of msgbuf is copied here ("mac:"), but for lines seen often
+   (the timer's), each counted instead: one line every 30 s says how many. */
+static uint64_t mb_pa;      /* msgbuf's header in the Mac's RAM */
+static uint32_t mb_seen;    /* its write index as far as copied */
+static int mb_started;
+static void mb_find(void) {
+    if (mb_pa || !k_phys || k_top <= k_phys) return;
+    const uint8_t *k = hv_phys_ptr(M, k_phys, k_top - k_phys);
+    if (!k) return;
+    for (uint64_t o = 0; o + 24 <= k_top - k_phys; o += 8) {
+        if (rd32(k + o) != 0x063061u) continue;
+        uint32_t size = rd32(k + o + 4), bufx = rd32(k + o + 8);
+        uint64_t bufc = rd64(k + o + 16);
+        if (size < 4096 || size > (64u << 20) || bufx >= size || bufc < k_virt) continue;
+        mb_pa = k_phys + o;
+        return;
+    }
+}
+static void mb_follow(int force_start) {
+    static uint32_t spam_n;
+    static time_t spam_t;
+    mb_find();
+    if (!mb_pa) return;
+    const uint8_t *h = hv_phys_ptr(M, mb_pa, 24);
+    if (!h) return;
+    uint32_t size = rd32(h + 4), bufx = rd32(h + 8);
+    uint64_t bufc = rd64(h + 16);
+    const char *buf = bufc >= k_virt ? hv_phys_ptr(M, bufc - k_virt + k_phys, size) : NULL;
+    if (!buf || bufx >= size) return;
+    if (!mb_started) {
+        if (!force_start) { mb_seen = bufx; return; }
+        mb_started = 1;
+        say("gunyah: the serial port is quiet: the kernel's own log follows (\"mac:\")\n");
+    }
+    uint32_t n = (bufx + size - mb_seen) % size, lines = 0, i;
+    static char line[512]; /* a line half-written when read is finished next time */
+    static int m;
+    for (i = 0; i < n && lines < 120; i++) {
+        char c = buf[(mb_seen + i) % size];
+        if (c && c != '\n' && m < (int)sizeof line - 1) { line[m++] = (c >= 32 && c < 127) || c == '\t' ? c : '?'; continue; }
+        if (c != '\n') continue;
+        line[m] = 0;
+        m = 0;
+        if (strstr(line, "handleNagTimerExpiry")) { spam_n++; continue; }
+        if (line[0]) say("mac: %s\n", line), lines++;
+    }
+    mb_seen = (mb_seen + i) % size;
+    if (spam_n && time(NULL) - spam_t >= 30) {
+        say("mac: (CoreAnalyticsHub's timer line %u more times)\n", spam_n);
+        spam_n = 0, spam_t = time(NULL);
+    }
+}
+
 static void *watch_thread(void *arg) {
     (void)arg;
     thread_altstack();
@@ -1494,12 +1563,14 @@ static void *watch_thread(void *arg) {
     uint64_t last0 = ~0ull;
     int still = 0, dumps = 0, quiet_reports = 0, in_quiet = 0, probed = 0;
     double quiet_at = 0;
-    for (int s = 1; !stop_req && s <= 600; s++) {
+    for (int s = 1; !stop_req && s <= 86400; s++) {
         sleep(1);
         if (mmio_exits[0] == last0) still++;
         else still = 0, last0 = mmio_exits[0];
         if ((still == 3 && dumps < 3) || (still && still % 60 == 0 && dumps < 6)) dump_msgbuf(), dumps++;
         double quiet = uart_last_ns ? (double)(now_ns() - uart_last_ns) / 1e9 : 0;
+        mb_follow(quiet >= 3);
+        if (s % 30 == 0) dump_screen(); /* 0.3.102: what the Mac shows, every 30 s (gunyah-screen.bmp) */
         if (quiet >= 5 && !still) {
             if ((!in_quiet || quiet - quiet_at >= 60) && quiet_reports < 4) silence_report(quiet), quiet_reports++, quiet_at = quiet;
             /* 0.3.99: still stuck 45 s on: one of vCPU 0's polling reads gets an abort, so the kernel panics with a

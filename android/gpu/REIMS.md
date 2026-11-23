@@ -1219,3 +1219,12 @@ exit, and resumes that access as handled on the next run: every kick (SIGUSR1 ea
 store or answered a load with stale data, on every vCPU, devices included. exit_reason is now cleared before each run
 and an interrupted run that left an exit behind is handled as one (counted per vCPU at the end). The reset vector's
 second report also cleans the RAM if the first was missed.
+
+0.3.102 (2026-11-23): 0.3.101 booted macOS's kernel to the end on Gunyah: all 4 CPUs up (113/38/26/30 MMIO exits came
+back with a signal and were handled, each once lost), the root volume Macintosh HD mounted (snapshot, root hash
+validated), then the kernel pivoted to the Recovery volume's BaseSystem and started launchd ("BaseSystem environment
+starting": recoveryOS, chosen by iBoot before the hand-over), which ran its boot tasks up to mount-phase-1. Then the
+serial port went quiet, the disk idle and the CPUs nearly so, the kernel's timers still firing. Now: once serial is
+quiet 3 s the kernel's own log (msgbuf) is copied to this log line by line ("mac:"), its CoreAnalyticsHub timer
+spam counted instead; the Mac's screen is written to gunyah-screen.bmp every 30 s, its place from boot_args' Video
+(the last initialize_screen in msgbuf when there is one); the watch thread runs as long as the Mac does.
