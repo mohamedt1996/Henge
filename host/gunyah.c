@@ -418,6 +418,7 @@ static void exec_segments(uint64_t hdr_pa, uint64_t base_vm, int depth) {
 }
 
 #define MOVZ_X(rt) (0xd2800000u | (rt))
+#define SCTLR_W 0xd5181000u /* MSR SCTLR_EL1, Xt */
 #define MOVK_X(rt, imm16, hw) (0xf2800000u | (uint32_t)(hw) << 21 | (uint32_t)(imm16) << 5 | (rt))
 #define MOVZ_XS(rt, imm16, hw) (0xd2800000u | (uint32_t)(hw) << 21 | (uint32_t)(imm16) << 5 | (rt))
 
@@ -462,7 +463,9 @@ static int kpatch(void) {
             rd32(hv_phys_ptr(M, hdr, 32) + 12) == 12 ? "fileset" : "kernel", (unsigned long long)base_vm, nxr,
             (unsigned long long)(code >> 20));
 
-    uint64_t impl_r = 0, impl_w = 0, midr = 0, midr_left = 0, pac = 0;
+    uint64_t impl_r = 0, impl_w = 0, midr = 0, midr_left = 0, pac = 0, sctlr = 0;
+    const char *kp = getenv("HV_GUNYAH_KEEP_PAC");
+    int keep_pac = kp && *kp == '1';
     for (int r = 0; r < nxr; r++) {
         uint32_t *w = hv_phys_ptr(M, xr[r].pa, xr[r].size);
         if (!w) continue;
@@ -488,6 +491,23 @@ static int kpatch(void) {
                 pool += 3, midr++;
                 continue;
             }
+            /* 0.3.85: the panic was ESR 0x72000002, a PAC failure (EC 0x1c, DA key) at AUTDA x2, x3: this CPU has FEAT_FPAC,
+               so a failed AUT* faults at once, and the kernel's keys are what Apple's hypervisor would set through the
+               PAC hypercalls (now answered "success" with nothing done). Every MSR SCTLR_EL1 goes through a stub that
+               clears EnIA, EnIB, EnDA and EnDB first: all PAC and AUT instructions are then no-ops, signing and checking alike, so the
+               kernel's own checks (XPAC and compare) pass. The Mac runs without pointer authentication. */
+            if ((x & ~31u) == SCTLR_W && rt != 31 && !keep_pac) {
+                if (pool + 5 > n || (int64_t)((pool - i) * 4) >= (128ll << 20)) { midr_left++; continue; }
+                uint64_t site = xr[r].pa + i * 4, stub = xr[r].pa + pool * 4;
+                w[pool] = 0x9260f400u | rt << 5 | rt;     /* and xt, xt, #~(EnIA|EnIB) */
+                w[pool + 1] = 0x9264f800u | rt << 5 | rt; /* and xt, xt, #~EnDA */
+                w[pool + 2] = 0x9272f800u | rt << 5 | rt; /* and xt, xt, #~EnDB */
+                w[pool + 3] = x;                          /* msr sctlr_el1, xt */
+                w[pool + 4] = branch(stub + 16, site + 4);
+                w[i] = branch(site, stub);
+                pool += 5, sctlr++;
+                continue;
+            }
             if ((top13 == 0xd5380000u || top13 == 0xd5180000u) && (crn == 15 || crn == 11)) { /* implementation defined */
                 if (top13 == 0xd5380000u) w[i] = rt == 31 ? NOP : MOVZ_X(rt), impl_r++;
                 else w[i] = NOP, impl_w++;
@@ -496,9 +516,10 @@ static int kpatch(void) {
     }
     pac_patched += pac;
     fprintf(stderr, "gunyah: kernel patched for this CPU: %llu reads and %llu writes of Apple's own registers (now 0 and "
-                    "ignored), %llu MIDR reads (now Apple's %#llx)%s, %llu PAC hypercalls (now success)\n",
+                    "ignored), %llu MIDR reads (now Apple's %#llx)%s, %llu PAC hypercalls (now success), %llu SCTLR writes (pointer "
+                    "authentication off)\n",
             (unsigned long long)impl_r, (unsigned long long)impl_w, (unsigned long long)midr, (unsigned long long)APPLE_MIDR,
-            midr_left ? " (some left: no room for their stubs)" : "", (unsigned long long)pac);
+            midr_left ? " (some left: no room for their stubs)" : "", (unsigned long long)pac, (unsigned long long)sctlr);
 
     /* The timebase: the kernel's tree says the 24 MHz Henge's JIT counts; Gunyah gives the CPU's own counter. */
     uint64_t f;
@@ -662,7 +683,7 @@ static void fill_state(const HvCpu *c) {
     s[32] = c->pc;
     s[33] = (c->nzcv & 0xf0000000ull) | (c->daif & 0x3c0ull) | (c->pstate_extra & ((1ull << 22) | (1ull << 23) | (1ull << 12))) |
             ((uint64_t)c->el << 2) | (c->spsel ? 1 : 0);
-    s[34] = c->sctlr_el1, s[35] = c->ttbr0_el1, s[36] = c->ttbr1_el1, s[37] = c->tcr_el1, s[38] = c->mair_el1;
+    s[34] = c->sctlr_el1 & ~(uint64_t)(0xC0000000u | 1u << 27 | 1u << 13), s[35] = c->ttbr0_el1, s[36] = c->ttbr1_el1, s[37] = c->tcr_el1, s[38] = c->mair_el1;
     s[39] = c->amair_el1, s[40] = c->vbar_el1, s[41] = c->contextidr_el1, s[42] = c->tpidr_el0, s[43] = c->tpidrro_el0;
     s[44] = c->tpidr_el1, s[46] = c->cpacr_el1, s[47] = c->cntkctl_el1, s[48] = c->fpcr, s[49] = c->fpsr, s[50] = c->mdscr_el1;
     fprintf(stderr, "gunyah: CPU 0 goes on at pc %#llx (EL%u, MMU %s), x0 %#llx x1 %#llx x2 %#llx x3 %#llx, SP_EL1 %#llx\n",

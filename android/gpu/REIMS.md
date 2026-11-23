@@ -1081,3 +1081,10 @@ now reads x0..x3 off the first register dump and rebuilds the panic's message fr
 0xfffffe0019e6404c", a fault in the kernel's earliest C code (x8 0xfffffe001e504000; the trap's stale FAR,
 0xfffffe001e504080 = x8 + 0x80, past the kernel's data). Its text was cut at x27 (format longer than 512 bytes), losing
 ESR and FAR. The format buffer is now 3 KB, and the instructions at the first fault's pc and (PAC-stripped) lr are logged.
+
+0.3.85 (2026-11-23): 0.3.84's full panic: ESR 0x72000002 = EC 0x1c, a pointer-authentication failure (DA key) at
+AUTDA x2, x3 (pc's word 0xdac11862) on a NULL pointer. The tablet's CPU has FEAT_FPAC (a failed AUT faults at once),
+and the kernel's keys are what Apple's hypervisor would set through the PAC hypercalls, answered "success" with nothing
+done. Every MSR SCTLR_EL1 in the kernel now goes through a stub that clears EnIA/EnIB/EnDA/EnDB, and the handed-over
+SCTLR has them clear: all PAC/AUT instructions become no-ops, signing and checking alike, so the kernel's XPAC-and-
+compare checks pass. The Mac runs without pointer authentication (HV_GUNYAH_KEEP_PAC=1 keeps it).
