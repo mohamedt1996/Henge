@@ -550,6 +550,7 @@ static int kpatch(void) {
                u32 length (bit 31: a placeholder), value padded to 4}, then its children. */
             uint8_t *p = dt, *end = dt + dtlen;
             uint32_t stack[64];
+            int gics = 0;
             int depth = 0;
             stack[0] = 1;
             while (depth >= 0 && p + 8 <= end) {
@@ -557,9 +558,14 @@ static int kpatch(void) {
                 stack[depth]--;
                 uint32_t np = rd32(p), nc = rd32(p + 4);
                 p += 8;
+                char nname[33] = "";
+                uint8_t *nreg = NULL;
+                uint32_t nreglen = 0;
                 for (uint32_t i = 0; i < np && p + 36 <= end; i++) {
                     uint32_t len = rd32(p + 32) & 0x7fffffffu;
                     if (p + 36 + len > end) { p = end; break; }
+                    if (!strncmp((const char *)p, "name", 32)) snprintf(nname, sizeof nname, "%.*s", (int)(len < 32 ? len : 32), (const char *)p + 36);
+                    if (!strncmp((const char *)p, "reg", 32)) nreg = p + 36, nreglen = len;
                     if (!strncmp((const char *)p, "timebase-frequency", 32) && (len == 4 || len == 8)) {
                         uint32_t v = rd32(p + 36);
                         if (v != (uint32_t)f) {
@@ -570,6 +576,25 @@ static int kpatch(void) {
                         }
                     }
                     p += 36 + ((len + 3) & ~3u);
+                }
+                /* 0.3.91: the kernel's GIC (/arm-io/gic reg: GICD offset, size, GICR offset, size, from the SoC base
+                   0x10000000), against where Gunyah has it: the shim found the redistributors at 0x10010000, 128 KB
+                   apart (GICR_TYPER there 0, then vCPU 1 at 0x10030000, vCPU 2 at 0x10050000). The kernel's FAR,
+                   0x80 past its SGI frame, faults on Gunyah while the shim's IGROUPR0 there works. */
+                if (!strcmp(nname, "gic") && nreg && nreglen >= 32 && gics++ < 2) {
+                    uint64_t g[4];
+                    memcpy(g, nreg, 32);
+                    fprintf(stderr, "gunyah: the kernel's GIC: distributor at +%#llx (%#llx bytes), redistributors at +%#llx "
+                                    "(%#llx bytes)%s\n", (unsigned long long)g[0], (unsigned long long)g[1], (unsigned long long)g[2],
+                            (unsigned long long)g[3], nreglen > 32 ? " and more" : "");
+                    uint64_t want_r = VMAPPLE_GIC_REDIST - VMAPPLE_GIC_DIST, want_s = 0x20000ull * (uint64_t)hv_vm_ncpus();
+                    if (g[2] != want_r || g[3] < want_s) {
+                        g[2] = want_r;
+                        if (g[3] < want_s) g[3] = want_s;
+                        memcpy(nreg, g, 32);
+                        fprintf(stderr, "gunyah: the kernel's GIC redistributors set to Gunyah's: +%#llx, %#llx bytes\n",
+                                (unsigned long long)g[2], (unsigned long long)g[3]);
+                    }
                 }
                 if (nc && depth < 63) stack[++depth] = nc;
             }
@@ -794,6 +819,20 @@ static void decode_word(uint32_t w, char *out, size_t cap) {
     else if ((w & 0xffe0001fu) == 0xd4200000u) snprintf(out, cap, "BRK #%#x", w >> 5 & 0xffff);
     else if (w == 0xe7ffdeffu || w == 0xe7ffdefeu) snprintf(out, cap, "XNU's TRAP_DEBUGGER (panic/debugger entry, on purpose)");
     else if ((w & 0xfffff000u) == 0x00201000u) snprintf(out, cap, "Apple AMX/GXF space (0x0020xxxx)");
+    else if ((w & 0x3b000000u) == 0x39000000u) { /* LDR/STR, unsigned offset: Gunyah can emulate (ISV=1) */
+        unsigned sz = w >> 30, opc = w >> 22 & 3, rn = w >> 5 & 31, rt = w & 31, imm = (w >> 10 & 0xfff) << sz;
+        snprintf(out, cap, "%s %c%u, [x%u, #%#x] (%u bytes)", opc ? "LDR" : "STR", sz == 3 ? 'x' : 'w', rt, rn, imm, 1u << sz);
+    } else if ((w & 0x3b200400u) == 0x38000400u) { /* pre/post-indexed: writeback, ISV=0 */
+        unsigned sz = w >> 30, opc = w >> 22 & 3, rn = w >> 5 & 31, rt = w & 31;
+        snprintf(out, cap, "%s %c%u, [x%u] %s-indexed (%u bytes, WRITEBACK: no syndrome for a hypervisor)", opc ? "LDR" : "STR",
+                 sz == 3 ? 'x' : 'w', rt, rn, w >> 11 & 1 ? "pre" : "post", 1u << sz);
+    } else if ((w & 0x3b200c00u) == 0x38200800u) {
+        unsigned sz = w >> 30, opc = w >> 22 & 3, rn = w >> 5 & 31, rt = w & 31, rm = w >> 16 & 31;
+        snprintf(out, cap, "%s %c%u, [x%u, x%u] (%u bytes)", opc ? "LDR" : "STR", sz == 3 ? 'x' : 'w', rt, rn, rm, 1u << sz);
+    } else if ((w & 0x3a000000u) == 0x28000000u)
+        snprintf(out, cap, "%s pair, [x%u] (LDP/STP: no syndrome for a hypervisor)", w >> 22 & 1 ? "LDP" : "STP", w >> 5 & 31);
+    else if ((w & 0x7f800000u) == 0x12800000u) snprintf(out, cap, "MOVN w/x%u, #%#x, lsl #%u", w & 31, w >> 5 & 0xffff, (w >> 21 & 3) * 16);
+    else if ((w & 0x7f800000u) == 0x11000000u) snprintf(out, cap, "ADD x%u, x%u, #%#x%s", w & 31, w >> 5 & 31, w >> 10 & 0xfff, w >> 22 & 1 ? ", lsl #12" : "");
     else snprintf(out, cap, "-");
 }
 
@@ -915,6 +954,27 @@ static void uart_char(char c) {
     for (int k = 0; k < 3; k++) {
         const char *s = strstr(uart_line, keys[k]);
         if (s) panic_pc(strtoull(s + strlen(keys[k]), NULL, 16));
+    }
+    /* 0.3.91: a kernel exception's panic names its saved state ("state=0x..."): struct arm_saved_state, header 8
+       bytes, then x0-x28, fp, lr, sp, pc, cpsr, far, esr. */
+    const char *st = strstr(uart_line, "state=0x");
+    static int states;
+    if (st && states < 2) {
+        uint64_t va = strtoull(st + 8, NULL, 16);
+        const uint64_t *ss;
+        if (kva_ok(va, 296, (const void **)&ss)) {
+            states++;
+            const uint64_t *r = ss + 1;
+            say("gunyah: the faulting state: pc %#llx lr %#llx sp %#llx far %#llx esr %#llx cpsr %#llx\n", (unsigned long long)r[32],
+                (unsigned long long)r[30], (unsigned long long)r[31], (unsigned long long)r[34], (unsigned long long)r[35],
+                (unsigned long long)(r[33] & 0xffffffffu));
+            for (int i = 0; i < 29; i += 4)
+                say("gunyah:   x%-2d %#018llx x%-2d %#018llx x%-2d %#018llx x%-2d %#018llx\n", i, (unsigned long long)r[i], i + 1,
+                    (unsigned long long)(i + 1 < 29 ? r[i + 1] : 0), i + 2, (unsigned long long)(i + 2 < 29 ? r[i + 2] : 0), i + 3,
+                    (unsigned long long)(i + 3 < 29 ? r[i + 3] : 0));
+            panic_pc(r[32]);
+            panic_pc((r[30] & 0x0000ffffffffffffull) | 0xffff000000000000ull);
+        }
     }
     uint64_t r0, r1, r2, r3;
     if (!panic_told && npcs && reg_of(uart_line, "x0:", &r0) && reg_of(uart_line, "x1:", &r1) &&

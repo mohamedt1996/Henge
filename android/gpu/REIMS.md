@@ -1119,3 +1119,12 @@ ICC group-0 registers) under a guard and logs its value or its fault's ESR.
 0.3.90 (2026-11-23): 0.3.89 never reached the kernel: the 0.3.88 engine (root) outlived its app when the update killed
 the app, kept its Gunyah VM with the reserved RAM shared into it and the VNC and sound ports, so the new start's first
 share failed ("Invalid argument") and the ports were taken. A Gunyah start now ends any engine still running first.
+
+0.3.91 (2026-11-23): 0.3.90's serial console gave the panic: "Unhandled Unknown implementation specific error ...
+esr=0x96000010 far=...504080": a synchronous external abort (DFSC 0x10), what Gunyah injects for a GIC access it will
+not emulate, 0x80 past the kernel's GICR SGI frame. Yet the shim's GIC probes all worked: GICD_TYPER 0x161001f,
+redistributors at 0x10010000 128 KB apart (vCPU 1 at 0x10030000, vCPU 2 at 0x10050000), GICR_IGROUPR0 at 0x10020080
+written and read back, every ICC group-0 register fine. So the kernel addresses it differently: its /arm-io/gic reg is
+now logged and set to Gunyah's layout if it differs, and the panic's saved state (pc, lr, x0-x28, far, esr) is read
+from RAM with the faulting instructions decoded (load/store forms, writeback and pairs, which a hypervisor cannot
+emulate, named).
