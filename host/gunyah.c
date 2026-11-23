@@ -224,6 +224,12 @@ static size_t build_dtb(uint8_t *out, size_t cap, int ncpus, uint64_t size_max) 
     begin(&f, "gunyah-vm-config");
     prop_str(&f, "image-name", "henge-vmapple");
     prop_str(&f, "os-type", "linux");
+    /* 0.3.94: the IPA ranges whose faults Gunyah hands to Henge (VMMIO). Without this property the resource manager
+       uses its legacy default, [0, 1 GB): every vmapple device below 0x40000000 reached Henge, but the PCIe ECAM
+       (0x40000000) and PCIe MMIO (0x50000000) windows got external aborts, and XNU's PCI configuration panicked on
+       its first config read past device 0. Now everything below the Mac's RAM and the VM's own region. */
+    uint32_t vmmio[4] = {0, 0, (uint32_t)(BOOT_PA >> 32), (uint32_t)BOOT_PA};
+    prop_u32s(&f, "vmmio-ranges", vmmio, 4);
     begin(&f, "memory");
     prop_u32(&f, "#address-cells", 2);
     prop_u32(&f, "#size-cells", 2);

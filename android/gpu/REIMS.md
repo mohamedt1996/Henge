@@ -1146,3 +1146,9 @@ also carries out integer LDP/STP and SIMD&FP LDR/STR/LDP/STP (any addressing) on
 config-space copy. If it is something else: the panic's backtrace is read (the frame after the exception's) and the
 call and the called function are decoded; the shim also reads ECAM at 0x40000000/0x40008000 and PCIe MMIO
 0x50000000 to show whether Gunyah passes those windows to Henge at all.
+
+0.3.94 (2026-11-23): 0.3.93's probes found it: ECAM 0x40000000 read fine, but ECAM 0x40008000 and PCIe MMIO 0x50000000
+fault in the shim too, with a plain LDR (so not an instruction form). Gunyah hands a fault to the host only inside the
+VM's VMMIO ranges, and the resource manager's default when the VM's tree names none is [0, 1 GB) ("vmmio-ranges not
+set, using legacy default"). The VM's gunyah-vm-config node now has vmmio-ranges = [0, 0x6fe00000): every vmapple
+device window, PCIe ECAM and MMIO included, reaches Henge.
