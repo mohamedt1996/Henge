@@ -37,6 +37,8 @@ typedef struct HvPcie {
 
 HvPcie *hv_pcie_create(HvMachine *m, HvGic *gic, uint64_t ecam_pa, uint64_t ecam_size, uint64_t mmio_pa,
                        uint64_t mmio_size, int intx_intid);
+/* The same bus also at other addresses (an ECAM and an MMIO window). */
+int hv_pcie_alias(HvPcie *p, uint64_t ecam_pa, uint64_t ecam_size, uint64_t mmio_pa, uint64_t mmio_size);
 /* Fills in the header; the caller then adds BARs and capabilities. */
 void hv_pci_init(HvPciDev *d, uint16_t vendor, uint16_t device, uint32_t class_rev, uint16_t sub_vendor,
                  uint16_t sub_id);

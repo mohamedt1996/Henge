@@ -156,3 +156,35 @@ HvPcie *hv_pcie_create(HvMachine *m, HvGic *gic, uint64_t ecam_pa, uint64_t ecam
     hv_machine_add_mmio(m, mmio_pa, mmio_size, p, window_read, window_write, "pcie-mmio");
     return p;
 }
+
+/* A second view of the bus at other addresses (0.3.95, Gunyah: its VMMIO default ends at 1 GB, below vmapple's
+   ECAM and MMIO windows). The alias window finds BARs by either address, since the kernel may program them with the
+   PCI addresses of either the old or the new window. */
+typedef struct { HvPcie *p; uint64_t base; } PcieAlias;
+
+static uint64_t alias_window_read(void *opaque, uint64_t off, unsigned size) {
+    PcieAlias *a = opaque;
+    int bar;
+    uint64_t boff;
+    HvPciDev *d = bar_lookup(a->p, a->base + off, &bar, &boff);
+    if (!d) d = bar_lookup(a->p, a->p->mmio_base + off, &bar, &boff);
+    if (!d || !d->bar_read) return ~0ull;
+    return d->bar_read(d, bar, boff, size);
+}
+
+static void alias_window_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
+    PcieAlias *a = opaque;
+    int bar;
+    uint64_t boff;
+    HvPciDev *d = bar_lookup(a->p, a->base + off, &bar, &boff);
+    if (!d) d = bar_lookup(a->p, a->p->mmio_base + off, &bar, &boff);
+    if (d && d->bar_write) d->bar_write(d, bar, boff, v, size);
+}
+
+int hv_pcie_alias(HvPcie *p, uint64_t ecam_pa, uint64_t ecam_size, uint64_t mmio_pa, uint64_t mmio_size) {
+    PcieAlias *a = calloc(1, sizeof *a);
+    if (!a) return -1;
+    a->p = p, a->base = mmio_pa;
+    if (hv_machine_add_mmio(p->m, ecam_pa, ecam_size, p, ecam_read, ecam_write, "pcie-ecam-alias") < 0) return -1;
+    return hv_machine_add_mmio(p->m, mmio_pa, mmio_size, a, alias_window_read, alias_window_write, "pcie-mmio-alias");
+}

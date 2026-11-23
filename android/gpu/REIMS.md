@@ -1152,3 +1152,10 @@ fault in the shim too, with a plain LDR (so not an instruction form). Gunyah han
 VM's VMMIO ranges, and the resource manager's default when the VM's tree names none is [0, 1 GB) ("vmmio-ranges not
 set, using legacy default"). The VM's gunyah-vm-config node now has vmmio-ranges = [0, 0x6fe00000): every vmapple
 device window, PCIe ECAM and MMIO included, reaches Henge.
+
+0.3.95 (2026-11-23): 0.3.94's vmmio-ranges changed nothing (the tree grew by it, the shim's ECAM 0x40008000 and MMIO
+0x50000000 reads still fault): this tablet's resource manager keeps the [0, 1 GB) VMMIO default. So under Gunyah the
+PCIe bus moves below 1 GB, after vmapple's last device: ECAM at 0x31000000 (16 MB, buses 0-15), MMIO window at
+0x32000000 (224 MB). Henge's PCIe model also answers there (hv_pcie_alias; the window finds BARs by old or new
+address), and the kernel's tree (each pci node's reg, ranges, bus-range, as arm-io offsets or absolute) is rewritten
+before the kernel reads it; the node is logged whole. The shim reads 0x31000000 to show the host bridge is there.

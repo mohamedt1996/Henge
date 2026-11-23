@@ -119,6 +119,7 @@ hv_gunyah_shim_start:
     gld  16, 0x40000000, w              /* 0.3.93: the PCIe windows, where the kernel's PCI configuration faulted */
     gld  17, 0x40008000, w
     gld  18, 0x50000000, w
+    gld  19, 0x31000000, w              /* 0.3.95: where the PCIe ECAM moves (Henge's host bridge: 0x00081b36) */
     str  xzr, [x16]
 
     bl   rmfind

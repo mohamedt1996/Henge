@@ -433,6 +433,70 @@ static void exec_segments(uint64_t hdr_pa, uint64_t base_vm, int depth) {
 
 static uint32_t branch(uint64_t from, uint64_t to) { return 0x14000000u | (uint32_t)(((int64_t)(to - from) >> 2) & 0x3ffffff); }
 
+/* 0.3.95: Gunyah hands Henge only faults inside the VM's VMMIO ranges, and this tablet's resource manager keeps its
+   default [0, 1 GB) whatever the VM's tree says (0.3.94's vmmio-ranges changed nothing: ECAM 0x40008000 and MMIO
+   0x50000000 still fault in the shim). vmapple's PCIe ECAM (0x40000000) and MMIO window (0x50000000) sit above it.
+   So under Gunyah the bus moves below 1 GB, into the free space after vmapple's last device: ECAM at 0x31000000
+   (16 MB: buses 0-15; Henge has bus 0 only), MMIO at 0x32000000 (224 MB; Henge's BARs are 16-64 KB). Henge's PCIe
+   model answers there too (hv_pcie_alias), and the kernel's tree is told: in each pci node, the old addresses (as
+   the arm-io offsets 0x30000000/0x40000000 or as 0x40000000/0x50000000), their sizes and bus-range become the new. */
+#define PCIE_ECAM_NEW 0x31000000ull
+#define PCIE_ECAM_NEW_SIZE 0x01000000ull
+#define PCIE_MMIO_NEW 0x32000000ull
+#define PCIE_MMIO_NEW_SIZE 0x0e000000ull
+static int pcie_moved;
+
+static void pcie_node(const char *name, uint8_t *node, uint8_t *end) {
+    uint32_t np = rd32(node);
+    uint8_t *q = node + 8;
+    int abs = -1; /* 1: the addresses are absolute, 0: offsets from arm-io's 0x10000000 */
+    for (int pass = 0; pass < 2; pass++) {
+        q = node + 8;
+        for (uint32_t i = 0; i < np && q + 36 <= end; i++) {
+            char pn[33];
+            snprintf(pn, sizeof pn, "%.32s", (const char *)q);
+            uint32_t len = rd32(q + 32) & 0x7fffffffu;
+            uint8_t *v = q + 36;
+            if (v + len > end) return;
+            if (pass == 0) {
+                char hex[3 * 64 + 1];
+                size_t h = 0;
+                for (uint32_t k = 0; k < len && k < 64; k++) h += (size_t)snprintf(hex + h, sizeof hex - h, "%02x ", v[k]);
+                hex[h] = 0;
+                int printable = len > 0 && len < 64;
+                for (uint32_t k = 0; k + 1 < len && printable; k++) printable = v[k] >= 32 && v[k] < 127;
+                fprintf(stderr, "gunyah: the kernel's %s: %s (%u bytes): %s%s%.*s%s\n", name, pn, len, printable ? "\"" : "",
+                        printable ? "" : hex, printable ? (int)len : 0, printable ? (const char *)v : "", printable ? "\"" : "");
+                for (uint32_t k = 0; k + 4 <= len && (!strcmp(pn, "reg") || !strcmp(pn, "ranges")); k += 4) {
+                    uint32_t x = rd32(v + k);
+                    if (!strcmp(pn, "reg") && x == 0x30000000u) abs = 0;            /* ECAM as an arm-io offset */
+                    else if (abs < 0 && (x == 0x40000000u || x == 0x50000000u)) abs = 1;
+                }
+            } else if (abs >= 0 && (!strcmp(pn, "reg") || !strcmp(pn, "ranges") || !strcmp(pn, "bus-range"))) {
+                for (uint32_t k = 0; k + 4 <= len; k += 4) {
+                    uint32_t x = rd32(v + k), nx = x;
+                    const uint32_t rel = (uint32_t)VMAPPLE_GIC_DIST; /* arm-io's base, 0x10000000 */
+                    int reg = !strcmp(pn, "reg");
+                    if (!strcmp(pn, "bus-range")) { if (k == 4 && x == 255) nx = 15; }
+                    else if (x == 0x50000000u) nx = (uint32_t)PCIE_MMIO_NEW;                     /* MMIO, absolute */
+                    else if (reg && x == 0x30000000u) nx = (uint32_t)PCIE_ECAM_NEW - rel;         /* ECAM, offset */
+                    else if (reg && x == 0x40000000u) nx = abs ? (uint32_t)PCIE_ECAM_NEW : (uint32_t)PCIE_MMIO_NEW - rel;
+                    else if (!reg && x == 0x40000000u) nx = (uint32_t)PCIE_MMIO_NEW - rel;       /* ranges: MMIO, offset */
+                    else if (reg && x == 0x10000000u) nx = (uint32_t)PCIE_ECAM_NEW_SIZE;
+                    else if (x == 0x1fff0000u) nx = (uint32_t)PCIE_MMIO_NEW_SIZE;
+                    if (nx != x) {
+                        memcpy(v + k, &nx, 4);
+                        pcie_moved++;
+                        fprintf(stderr, "gunyah: the kernel's %s %s +%u: %#x -> %#x\n", name, pn, k, x, nx);
+                    }
+                }
+            }
+            q += 36 + ((len + 3) & ~3u);
+        }
+        if (pass == 0 && abs < 0) fprintf(stderr, "gunyah: the kernel's %s: its PCIe addresses not recognized, left as they are\n", name);
+    }
+}
+
 /* The patches. Returns 0, or -1 when the kernel was not found (the hand-over does not happen). */
 static int kpatch(void) {
     int64_t ba = find_boot_args();
@@ -629,13 +693,14 @@ static int kpatch(void) {
                u32 length (bit 31: a placeholder), value padded to 4}, then its children. */
             uint8_t *p = dt, *end = dt + dtlen;
             uint32_t stack[64];
-            int gics = 0;
+            int gics = 0, pcies = 0;
             int depth = 0;
             stack[0] = 1;
             while (depth >= 0 && p + 8 <= end) {
                 if (!stack[depth]) { depth--; continue; }
                 stack[depth]--;
                 uint32_t np = rd32(p), nc = rd32(p + 4);
+                uint8_t *pnode = p;
                 p += 8;
                 char nname[33] = "";
                 uint8_t *nreg = NULL;
@@ -660,6 +725,7 @@ static int kpatch(void) {
                    0x10000000), against where Gunyah has it: the shim found the redistributors at 0x10010000, 128 KB
                    apart (GICR_TYPER there 0, then vCPU 1 at 0x10030000, vCPU 2 at 0x10050000). The kernel's FAR,
                    0x80 past its SGI frame, faults on Gunyah while the shim's IGROUPR0 there works. */
+                if (strstr(nname, "pci") && pcies++ < 4) pcie_node(nname, pnode, p);
                 if (!strcmp(nname, "gic") && nreg && nreglen >= 32 && gics++ < 2) {
                     uint64_t g[4];
                     memcpy(g, nreg, 32);
@@ -680,6 +746,11 @@ static int kpatch(void) {
         }
     }
     fprintf(stderr, "gunyah: the kernel's timebase-frequency: %d set to the CPU's %llu Hz\n", changed, (unsigned long long)f);
+    if (pcie_moved && B->pcie) {
+        int e = hv_pcie_alias(B->pcie, PCIE_ECAM_NEW, PCIE_ECAM_NEW_SIZE, PCIE_MMIO_NEW, PCIE_MMIO_NEW_SIZE);
+        fprintf(stderr, "gunyah: PCIe moved below Gunyah's 1 GB VMMIO limit: ECAM %#llx, MMIO %#llx (%d values in the tree)%s\n",
+                (unsigned long long)PCIE_ECAM_NEW, (unsigned long long)PCIE_MMIO_NEW, pcie_moved, e < 0 ? "; Henge's alias FAILED" : "");
+    }
     return 0;
 }
 
@@ -840,8 +911,8 @@ static void shim_report(uint64_t off, uint64_t v) {
     }
     if (i == 8 && v < 640) say("gunyah: shim: accepting piece %llu (%#llx, %llu MB)\n", (unsigned long long)v,
                                (unsigned long long)handoff[129 + 3 * v], (unsigned long long)(handoff[130 + 3 * v] >> 20));
-    if (i >= 32 && i < 70 && (i & 1)) { /* 0.3.89: the shim's look at Gunyah's GIC before the kernel's */
-        static const char *probe[19] = {"GICD_CTLR", "GICD_TYPER", "GICR_TYPER (vCPU 0, 0x10010008)", "GICR_WAKER",
+    if (i >= 32 && i < 72 && (i & 1)) { /* 0.3.89: the shim's look at Gunyah's GIC before the kernel's */
+        static const char *probe[20] = {"GICD_CTLR", "GICD_TYPER", "GICR_TYPER (vCPU 0, 0x10010008)", "GICR_WAKER",
                                         "GICR_IGROUPR0 (SGI frame, 0x10020080) read", "GICR_IGROUPR0 write 0x81ffffff",
                                         "GICR_IGROUPR0 read back", "GICR_ISENABLER0 (0x10020100) read",
                                         "GICR_TYPER at 0x10030008 (vCPU 1 if the stride is 128K)",
@@ -849,7 +920,7 @@ static void shim_report(uint64_t off, uint64_t v) {
                                         "ICC_BPR0_EL1 write 0", "ICC_PMR_EL1 write 0xff", "ICC_CTLR_EL1",
                                         "ICC_IGRPEN0_EL1 write 1", "ICC_IGRPEN0_EL1",
                                         "PCIe ECAM 0x40000000 (bus 0 device 0) read", "PCIe ECAM 0x40008000 (device 1) read",
-                                        "PCIe MMIO 0x50000000 read"};
+                                        "PCIe MMIO 0x50000000 read", "PCIe ECAM moved, 0x31000000 (bus 0 device 0) read"};
         unsigned n = (i - 32) / 2;
         if (v >> 63)
             say("gunyah: shim: GIC probe %s: FAULTS (ESR %#llx)\n", probe[n], (unsigned long long)(v & ~(1ull << 63)));
