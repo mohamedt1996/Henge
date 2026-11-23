@@ -1100,3 +1100,9 @@ XNU's msgbuf (magic 0x063061) is found in the kernel's data and its last 3 KB lo
 panic path's restart, the panic's own text going to the panic buffer and console, not msgbuf. On a stall the engine
 now also logs every "panic(cpu" text in the Mac's RAM. And the shim's piece accept, refused ARGUMENT_INVALID (6) on
 piece 5 or 6 in half the runs, now tries 64 times 50 ms apart (3 s) before giving up, in case it is a moment's state.
+
+0.3.88 (2026-11-23): 0.3.87: the 3 s accept retry worked (one NORESOURCE on piece 9, then all 12 accepted). The kernel
+log is the same ("failed to find the timer", then "MACH Reboot"), and no "panic(cpu" text is anywhere in the Mac's RAM:
+this early a panic's text has no buffer and goes only to the video console, drawn into the framebuffer. On a stall the
+engine now writes that framebuffer (from msgbuf's "initialize_screen" line) to Henge/gunyah-screen.bmp, and looks for
+"Debugger called: <...>" in RAM too.

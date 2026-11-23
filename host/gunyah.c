@@ -40,6 +40,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <poll.h>
+#include <sys/stat.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -921,6 +922,43 @@ static void note_page(int id, uint64_t pa, int write) {
    with no text: Gunyah gives no view of a vCPU's registers, so where it waits is read from its own log instead. XNU's
    msgbuf (struct msgbuf: magic 0x063061, size, write index, read index, buffer pointer) lives in the kernel's data and
    holds every printf, serial console or not. When vCPU 0's exits stop for 3 s, it is found and its last 3 KB logged. */
+/* 0.3.88: 0.3.87 found no "panic(cpu" text anywhere in the Mac's RAM, yet "MACH Reboot" is the panic path's restart:
+   this early the panic log has no buffer and its text goes only to the video console, drawn as pixels into the
+   framebuffer XNU named in "initialize_screen". That framebuffer is written to a picture the user can send. */
+static uint64_t fb_pa;
+static uint32_t fb_w, fb_h, fb_rb;
+
+static void dump_screen(void) {
+    if (!fb_pa || !fb_w || !fb_h || fb_w > 8192 || fb_h > 8192 || fb_rb < fb_w * 4) return;
+    const uint8_t *fb = hv_phys_ptr(M, fb_pa, (uint64_t)fb_rb * fb_h);
+    if (!fb) { say("gunyah: the Mac's screen at pa %#llx is not in its RAM\n", (unsigned long long)fb_pa); return; }
+    const char *dirs[] = {"/storage/emulated/0/Henge", "/sdcard/Henge", "/data/local/tmp"};
+    for (int d = 0; d < 3; d++) {
+        char path[128];
+        snprintf(path, sizeof path, "%s/gunyah-screen.bmp", dirs[d]);
+        FILE *f = fopen(path, "wb");
+        if (!f) continue;
+        uint32_t img = fb_w * 4 * fb_h, hdr[13] = {0};
+        uint8_t bm[2] = {'B', 'M'};
+        hdr[0] = 54 + img;                /* file size */
+        hdr[2] = 54;                      /* pixels' offset */
+        hdr[3] = 40;                      /* BITMAPINFOHEADER */
+        hdr[4] = fb_w;
+        hdr[5] = (uint32_t)-(int32_t)fb_h; /* top-down */
+        hdr[6] = 1 | 32u << 16;           /* planes, bits */
+        hdr[8] = img;
+        fwrite(bm, 1, 2, f);
+        fwrite(hdr, 4, 13, f);
+        for (uint32_t y = 0; y < fb_h; y++) fwrite(fb + (uint64_t)y * fb_rb, 4, fb_w, f);
+        fclose(f);
+        chmod(path, 0644);
+        say("gunyah: the Mac's screen (%ux%u at pa %#llx) is in %s: send it, it may show the panic\n", fb_w, fb_h,
+            (unsigned long long)fb_pa, path);
+        return;
+    }
+    say("gunyah: could not write the Mac's screen to a picture\n");
+}
+
 static void dump_msgbuf(void) {
     if (!k_phys || k_top <= k_phys) return;
     const uint8_t *k = hv_phys_ptr(M, k_phys, k_top - k_phys);
@@ -946,6 +984,10 @@ static void dump_msgbuf(void) {
         }
         out[m] = 0;
         say("%s\n---\n", out);
+        const char *is = strstr(out, "initialize_screen: b=");
+        unsigned long long b, w, h, rb;
+        if (is && sscanf(is, "initialize_screen: b=%llx, w=%llx, h=%llx, r=%llx", &b, &w, &h, &rb) == 4)
+            fb_pa = b, fb_w = (uint32_t)w, fb_h = (uint32_t)h, fb_rb = (uint32_t)rb;
     }
     if (!found) say("gunyah: no kernel log (msgbuf) found in the kernel's data yet\n");
     /* 0.3.87: 0.3.86's log ended "failed to find the timer" (harmless: the JIT's boots print it too), then "MACH Reboot"
@@ -967,6 +1009,16 @@ static void dump_msgbuf(void) {
         p += m > 0 ? m : 1;
     }
     if (!hits) say("gunyah: no \"panic(cpu\" text in the Mac's RAM\n");
+    const uint8_t *d = ram;
+    while ((d = memmem(d, (size_t)(end - d), "Debugger called: <", 18)) != NULL && d[18] == '%') d++;
+    if (d) {
+        char out[257];
+        size_t m = 0;
+        for (const uint8_t *q = d; q < end && m < 256 && *q >= 32 && *q < 127; q++) out[m++] = (char)*q;
+        out[m] = 0;
+        say("gunyah: in the Mac's RAM at pa %#llx: %s\n", (unsigned long long)(VMAPPLE_MEM + (uint64_t)(d - ram)), out);
+    }
+    dump_screen();
 }
 
 static void *watch_thread(void *arg) {
