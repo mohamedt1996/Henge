@@ -80,7 +80,7 @@ struct gh_vcpu_run {
     uint8_t immediate_exit, padding[7];
     uint32_t exit_reason;
     union {
-        struct { uint64_t phys_addr; uint8_t data[8]; uint32_t len; uint8_t is_write; } mmio;
+        struct { uint64_t phys_addr; uint8_t data[8]; uint32_t len; uint8_t is_write, resume_action; } mmio; /* resume: 0 done, 1 fault */
         struct { uint32_t status; uint16_t type, pad; uint32_t reason_size; uint8_t reason[8]; } status;
     };
 };
@@ -123,6 +123,7 @@ static volatile uint8_t irq_level[NIRQ];
 static volatile uint64_t rings[NIRQ];  /* doorbell rings per interrupt (0.3.98: the silence report shows them) */
 static volatile uint64_t dev_ticks;    /* device-thread passes (each runs the devices' completions) */
 static volatile uint64_t uart_last_ns; /* when the kernel last wrote the serial port */
+static volatile uint64_t fault_pa;     /* 0.3.99: the next read here by vCPU 0 is answered with an abort (see watch_thread) */
 static uint64_t handoff[2048];  /* the hand-over pages, as the shim reads them (16 KB) */
 static uint64_t shim_rep[512];  /* its reports (+0x4000) */
 static volatile int mac_runs;   /* the shim jumped to the Mac */
@@ -267,6 +268,7 @@ static size_t build_dtb(uint8_t *out, size_t cap, int ncpus, uint64_t size_max) 
         prop_str(&f, "generate", path);
         prop_u32(&f, "label", (uint32_t)id);
         prop(&f, "peer-default", NULL, 0);
+        prop(&f, "source-can-clear", NULL, 0); /* 0.3.99: Henge's send capability may clear and mask it too (dbfind) */
         uint32_t irq[3] = {0, (uint32_t)(id - 32), irq_is_msi(id) ? 1u : 4u}; /* SPI, edge for MSIs, level otherwise */
         prop_u32s(&f, "interrupts", irq, 3);
         end(&f);
@@ -988,6 +990,12 @@ static void shim_report(uint64_t off, uint64_t v) {
     }
     if (i == 10 && v && shim_rep[16] % 16 == 0) say("gunyah: shim: the resource manager's answer: error %#llx%s\n",
                                                    (unsigned long long)v, v == 6 ? " (ARGUMENT_INVALID)" : v == 2 ? " (NORESOURCE)" : "");
+    if (i == 17) {
+        char e[64] = "";
+        if (shim_rep[18]) snprintf(e, sizeof e, " (doorbell_mask's first error %#llx)", (unsigned long long)shim_rep[18]);
+        say("gunyah: shim: %llu interrupt doorbells now clear themselves once delivered%s (first capability %#llx)\n",
+            (unsigned long long)v, e, (unsigned long long)shim_rep[19]);
+    }
     if (i == 16 && v % 16 == 0) say("gunyah: shim: still refused after %llu tries (one each 50 ms; 64 at most)\n", (unsigned long long)v);
     if (i == 0) {
         say("gunyah: shim: %s\n", phase_name(v));
@@ -1380,6 +1388,12 @@ static void hot_note(int id, uint64_t pa, uint64_t v, int w) {
     hot[id][min].pa = pa, hot[id][min].n = 1, hot[id][min].v = v, hot[id][min].w = w;
 }
 
+/* Henge's virtio devices: 1af4:104x, and Apple's own IDs for the disks (106b:1a00, virtio_blk.c's apple_variant). */
+static int pci_is_virtio(const HvPciDev *d) {
+    uint16_t ven = (uint16_t)(d->config[0] | d->config[1] << 8);
+    return ven == 0x1af4 || ven == 0x106b;
+}
+
 static const char *pci_name(const HvPciDev *d, char *buf, size_t n) {
     uint16_t ven = (uint16_t)(d->config[0] | d->config[1] << 8), dev = (uint16_t)(d->config[2] | d->config[3] << 8);
     const char *what = "?";
@@ -1392,7 +1406,8 @@ static const char *pci_name(const HvPciDev *d, char *buf, size_t n) {
         case 5: what = "virtio-balloon"; break;
         default: what = "virtio"; break;
         }
-    } else if ((d->config[11] == 0x0c && d->config[10] == 0x03)) what = "xhci";
+    } else if (ven == 0x106b) what = "virtio-blk (Apple's IDs)";
+    else if ((d->config[11] == 0x0c && d->config[10] == 0x03)) what = "xhci";
     snprintf(buf, n, "slot %d %s %04x:%04x", d->slot, what, ven, dev);
     return buf;
 }
@@ -1422,7 +1437,7 @@ static void silence_report(double quiet_s) {
             char nm[64];
             const HvPciDev *d = pci_at(hot[id][k].pa, &bar, &off);
             const char *reg = "";
-            if (d && d->config[0] == 0xf4 && d->config[1] == 0x1a)
+            if (d && pci_is_virtio(d))
                 reg = off < 0x1000 ? " (common config)" : off < 0x2000 ? " (ISR)" : off < 0x3000 ? " (device config)" : " (notify)";
             say("gunyah:   vCPU %d %s %#llx %llu times (last %#llx)%s%s%s BAR%d+%#llx%s\n", id, hot[id][k].w ? "stores to" : "loads from",
                 (unsigned long long)hot[id][k].pa, (unsigned long long)hot[id][k].n, (unsigned long long)hot[id][k].v,
@@ -1438,7 +1453,7 @@ static void silence_report(double quiet_s) {
         int line = p->intx_base + d->slot, n = 0;
         uint16_t cmd = (uint16_t)(d->config[4] | d->config[5] << 8);
         q[0] = 0;
-        if (d->config[0] == 0xf4 && d->config[1] == 0x1a) {
+        if (pci_is_virtio(d)) {
             const HvVirtio *v = d->opaque;
             n += snprintf(q + n, sizeof q - (size_t)n, " status %#x isr %#x", v->status, v->isr);
             for (int i = 0; i < v->nq && n < (int)sizeof q - 80; i++) {
@@ -1467,7 +1482,7 @@ static void *watch_thread(void *arg) {
     thread_altstack();
     while (!stop_req && !mac_runs) usleep(10000);
     uint64_t last0 = ~0ull;
-    int still = 0, dumps = 0, quiet_reports = 0, in_quiet = 0;
+    int still = 0, dumps = 0, quiet_reports = 0, in_quiet = 0, probed = 0;
     double quiet_at = 0;
     for (int s = 1; !stop_req && s <= 600; s++) {
         sleep(1);
@@ -1477,6 +1492,14 @@ static void *watch_thread(void *arg) {
         double quiet = uart_last_ns ? (double)(now_ns() - uart_last_ns) / 1e9 : 0;
         if (quiet >= 5 && !still) {
             if ((!in_quiet || quiet - quiet_at >= 60) && quiet_reports < 4) silence_report(quiet), quiet_reports++, quiet_at = quiet;
+            /* 0.3.99: still stuck 45 s on: one of vCPU 0's polling reads gets an abort, so the kernel panics with a
+               backtrace of the loop (HV_GUNYAH_NO_PROBE=1: never). */
+            if (quiet >= 45 && !probed && !getenv("HV_GUNYAH_NO_PROBE")) {
+                int best = -1;
+                for (int k = 0; k < HOT; k++)
+                    if (!hot[0][k].w && hot[0][k].n > 1000 && (best < 0 || hot[0][k].n > hot[0][best].n)) best = k;
+                if (best >= 0) fault_pa = hot[0][best].pa, probed = 1;
+            }
             in_quiet = 1;
         } else if (quiet < 5) in_quiet = 0;
         if (s > 60 && s % 10) continue;
@@ -1643,6 +1666,14 @@ static void *vcpu_thread(void *arg) {
         if (r->exit_reason == GH_VCPU_EXIT_MMIO) {
             uint64_t pa = r->mmio.phys_addr;
             unsigned len = r->mmio.len > 8 ? 8 : r->mmio.len;
+            r->mmio.resume_action = 0;
+            if (id == 0 && fault_pa && pa == fault_pa && !r->mmio.is_write) {
+                fault_pa = 0;
+                r->mmio.resume_action = 1; /* GH_VCPU_RESUME_FAULT: Gunyah gives the kernel a data abort there */
+                say("gunyah: vCPU 0's read at %#llx is answered with an abort: the kernel's panic names the code that loops\n",
+                    (unsigned long long)pa);
+                continue;
+            }
             if (mmio_exits[id]++ == 0) say("gunyah: vCPU %d runs (its first exit: %s %#llx)\n", id, r->mmio.is_write ? "a store to" : "a load from",
                                            (unsigned long long)pa);
             note_page(id, pa, r->mmio.is_write);

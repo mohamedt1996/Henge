@@ -1186,3 +1186,15 @@ made available by the driver, taken and handed back by the device), how often th
 kernel's own log from its memory (what serial had not printed yet). Every Gunyah thread has a signal stack and 8 MB
 of stack, so a crash names its place. A finished disk request wakes the device thread at once instead of waiting
 for its next 1 ms pass (hv_machine_wake_hook).
+
+0.3.99 (2026-11-23): 0.3.98's report found it: the two devices CPU 0 polls (slot 2's disk, slot 7's sound) are the
+two whose interrupt lines had rung (66 and 71, twice each); their ISR reads 0 every time and their requests were all
+handed back. An interrupt storm: a Gunyah doorbell's flags stay set until its receiver clears them or its ack mask
+does, and only a receiver may set the masks. The host's irqfd asks for level behaviour (doorbell_mask) with the send
+capability the resource manager gave it, which has no RECEIVE right unless the node says source-can-clear: refused,
+so after its first ring each line stayed asserted for good and XNU (INTx as level) re-entered its handler at once,
+forever. Now the VM, the doorbells' receiver, sets them itself: the shim finds each "qcom,gunyah-doorbell" in its
+tree and calls doorbell_mask(cap, all, all) (every ring one assertion that clears itself) and doorbell_receive(cap,
+all); the bell nodes also say source-can-clear, so the host's own call works where the resource manager honours it.
+If the kernel is still silent 45 s on, vCPU 0's most-read device address is answered once with an abort (MMIO
+resume "fault"), so its panic backtrace names the loop. The silence report knows the disks' Apple IDs (106b:1a00).

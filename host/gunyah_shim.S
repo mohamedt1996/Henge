@@ -157,7 +157,8 @@ hv_gunyah_shim_start:
     add  x23, x23, #24
     add  x22, x22, #1
     b    1b
-2:  mov  x0, #3
+2:  bl   dbfind                         /* 0.3.99: every interrupt doorbell clears itself once delivered */
+    mov  x0, #3
     str  x0, [x9, #0x00]
     ic   iallu
     tlbi vmalle1
@@ -415,6 +416,112 @@ rmdone:
 1:  mov  x30, x19
     ret
 
+/* ---- 0.3.99: the interrupt doorbells, made to clear on delivery. A doorbell's flags stay set until its receiver
+   clears them or its ack mask does, and only a receiver may set the masks (doorbell_mask needs RECEIVE rights). The
+   host's irqfd asks for level behaviour (enable 1, ack 1) with the send capability the resource manager gave it, which
+   lacks RECEIVE unless the node says source-can-clear: refused, the masks stay at their defaults (all enabled, none
+   acknowledged), and after its first ring a line stays asserted for good. XNU takes the PCIe INTx lines as level,
+   so each one rung re-entered its handler at once and for ever (0.3.98: CPU 0 read the ISR of the two devices that
+   had rung, slot 2's disk and slot 7's sound, 75,000 times a second each, always 0). This VM is the receiver: for each
+   "qcom,gunyah-doorbell" node in its tree (reg: the capability), doorbell_mask(cap, all, all) makes every ring one
+   assertion that clears itself, and doorbell_receive(cap, all) drops anything already latched. Reports: +0x88 the
+   doorbells done, +0x90 the first error (0: none), +0x98 the first capability. */
+dbfind:
+    mov  x19, x30
+    ldr  w21, [x20, #8]
+    rev  w21, w21
+    ldr  w22, [x20, #12]
+    rev  w22, w22
+    add  x23, x20, x21
+    add  x24, x20, x22
+    mov  x25, #0
+    mov  x14, #0
+    mov  x26, #0
+    mov  x27, #0
+    mov  x28, #0
+dbwalk:
+    ldr  w0, [x23], #4
+    rev  w0, w0
+    cmp  w0, #1
+    b.eq dbnode
+    cmp  w0, #2
+    b.eq dbend
+    cmp  w0, #3
+    b.eq dbprop
+    cmp  w0, #4
+    b.eq dbwalk
+    b    dbdone
+dbnode:
+1:  ldrb w1, [x23], #1
+    cbnz w1, 1b
+    add  x23, x23, #3
+    bic  x23, x23, #3
+    mov  x25, #0
+    mov  x14, #0
+    b    dbwalk
+dbend:
+    cbz  x25, 2f
+    cbz  x14, 2f
+    cbnz x28, 3f
+    mov  x28, x17
+3:  movz x0, #0x8015                    /* doorbell_mask(cap, enable all, ack all) */
+    movk x0, #0xc600, lsl #16
+    mov  x1, x17
+    movn x2, #0
+    movn x3, #0
+    mov  x4, #0
+    hvc  #0
+    cbz  x0, 4f
+    cbnz x27, 4f
+    mov  x27, x0
+4:  movz x0, #0x8013                    /* doorbell_receive(cap, all): whatever is latched now */
+    movk x0, #0xc600, lsl #16
+    mov  x1, x17
+    movn x2, #0
+    mov  x3, #0
+    hvc  #0
+    add  x26, x26, #1
+2:  mov  x25, #0
+    mov  x14, #0
+    b    dbwalk
+dbprop:
+    ldr  w1, [x23], #4
+    rev  w1, w1
+    ldr  w2, [x23], #4
+    rev  w2, w2
+    add  x3, x24, x2
+    mov  x4, x23
+    add  x5, x1, #3
+    bic  x5, x5, #3
+    add  x23, x23, x5
+    adr  x6, s_compatible
+    bl   streq
+    cbz  w0, 5f
+    mov  x3, x4
+    adr  x6, s_dbl
+    bl   streq
+    cbz  w0, dbwalk
+    mov  x25, #1
+    b    dbwalk
+5:  adr  x6, s_reg
+    bl   streq
+    cbz  w0, dbwalk
+    cmp  w1, #8
+    b.ne dbwalk
+    ldr  w17, [x4]
+    rev  w17, w17
+    ldr  w0, [x4, #4]
+    rev  w0, w0
+    orr  x17, x0, x17, lsl #32
+    mov  x14, #1
+    b    dbwalk
+dbdone:
+    str  x28, [x9, #0x98]
+    str  x27, [x9, #0x90]
+    str  x26, [x9, #0x88]
+    mov  x30, x19
+    ret
+
 streq:
     mov  x7, x3
     mov  x8, x6
@@ -446,6 +553,7 @@ s_rm2:        .asciz "qcom,resource-manager"
 s_compatible: .asciz "compatible"
 s_reg:        .asciz "reg"
 s_msgq:       .asciz "qcom,gunyah-message-queue"
+s_dbl:        .asciz "qcom,gunyah-doorbell"
 
     .balign 8
 hv_gunyah_shim_params:
