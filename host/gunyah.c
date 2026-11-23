@@ -560,33 +560,51 @@ static int kpatch(void) {
     fprintf(stderr, "gunyah: boot_args at pa %#llx: kernel at virtual %#llx = physical %#llx, its data to %#llx, device tree "
                     "at %#llx (%u bytes)\n", (unsigned long long)(VMAPPLE_MEM + (uint64_t)ba), (unsigned long long)virt,
             (unsigned long long)phys, (unsigned long long)top, (unsigned long long)dtva, dtlen);
-    /* The kernel collection's header: the first arm64 Mach-O (a fileset, or a plain kernel) from physBase on. */
-    uint64_t hdr = 0;
-    for (uint64_t pa = phys & ~0x3fffull; pa < phys + (256ull << 20) && pa + 32 <= VMAPPLE_MEM + B->ram_size; pa += 0x4000) {
-        const uint8_t *h = hv_phys_ptr(M, pa, 32);
-        if (h && rd32(h) == 0xfeedfacfu && rd32(h + 4) == 0x0100000cu && (rd32(h + 12) == 12 || rd32(h + 12) == 2)) { hdr = pa; break; }
-    }
-    if (!hdr) { fprintf(stderr, "gunyah: the kernel's Mach-O header was not found past %#llx\n", (unsigned long long)phys); return -1; }
-    /* __TEXT (file offset 0) is where the header is: every segment's place follows from it. */
-    uint64_t base_vm = 0;
-    {
-        const uint8_t *h = hv_phys_ptr(M, hdr, 32);
-        uint32_t ncmds = rd32(h + 16), sizeofcmds = rd32(h + 20);
-        const uint8_t *lc = hv_phys_ptr(M, hdr + 32, sizeofcmds);
-        for (uint32_t i = 0, o = 0; lc && i < ncmds && o + 8 <= sizeofcmds; i++) {
-            uint32_t cmd = rd32(lc + o), size = rd32(lc + o + 4);
-            if (size < 8) break;
-            if (cmd == 0x19 && size >= 72 && rd64(lc + o + 40) == 0 && rd64(lc + o + 48)) { base_vm = rd64(lc + o + 24); break; }
-            o += size;
+    /* The kernel collection's header: an arm64 Mach-O (a fileset, or a plain kernel) whose __TEXT sits where
+       boot_args' mapping puts it (virtBase + (pa - physBase)). 0.3.104: the first Mach-O from physBase on was a
+       user program's (__TEXT at 0x100000000; the reserved RAM keeps the last run's pages, and recoveryOS's ramdisk
+       holds binaries), so nothing was patched and the kernel died on its first pointer authentication. Now only a
+       header consistent with the kernel's own mapping is taken, looked for from 64 MB below physBase to its data's end. */
+    uint64_t hdr = 0, base_vm = 0, lo = phys > VMAPPLE_MEM + (64ull << 20) ? (phys - (64ull << 20)) & ~0x3fffull : VMAPPLE_MEM;
+    uint64_t hi = top > phys ? top : phys + (256ull << 20);
+    int seen = 0;
+    for (int pass = 0; pass < 2 && !hdr; pass++)
+        for (uint64_t pa = pass ? lo : phys & ~0x3fffull; pa < (pass ? phys : hi) && pa + 32 <= VMAPPLE_MEM + B->ram_size; pa += 0x4000) {
+            const uint8_t *h = hv_phys_ptr(M, pa, 32);
+            if (!h || rd32(h) != 0xfeedfacfu || rd32(h + 4) != 0x0100000cu || (rd32(h + 12) != 12 && rd32(h + 12) != 2)) continue;
+            uint32_t ncmds = rd32(h + 16), sizeofcmds = rd32(h + 20);
+            const uint8_t *lc = sizeofcmds < (4u << 20) ? hv_phys_ptr(M, pa + 32, sizeofcmds) : NULL;
+            uint64_t bv = 0;
+            for (uint32_t i = 0, o = 0; lc && i < ncmds && o + 8 <= sizeofcmds; i++) {
+                uint32_t cmd = rd32(lc + o), size = rd32(lc + o + 4);
+                if (size < 8) break;
+                if (cmd == 0x19 && size >= 72 && rd64(lc + o + 40) == 0 && rd64(lc + o + 48)) { bv = rd64(lc + o + 24); break; }
+                o += size;
+            }
+            int fits = bv && bv == virt + (pa - phys);
+            if (seen++ < 6)
+                fprintf(stderr, "gunyah: a Mach-O at pa %#llx (%s, __TEXT at %#llx)%s\n", (unsigned long long)pa,
+                        rd32(h + 12) == 12 ? "fileset" : "executable", (unsigned long long)bv,
+                        fits ? ": the kernel's" : ": not where the kernel's mapping puts it, passed over");
+            if (fits) { hdr = pa, base_vm = bv; break; }
         }
+    if (!hdr) {
+        const uint8_t *h = hv_phys_ptr(M, phys & ~0x3fffull, 32);
+        fprintf(stderr, "gunyah: the kernel's Mach-O header was not found around %#llx (%d other Mach-Os); at physBase: "
+                        "%08x %08x %08x %08x: the hand-over is off, Henge's CPUs go on\n", (unsigned long long)phys, seen,
+                h ? rd32(h) : 0, h ? rd32(h + 4) : 0, h ? rd32(h + 8) : 0, h ? rd32(h + 12) : 0);
+        return -1;
     }
-    if (!base_vm) { fprintf(stderr, "gunyah: the kernel's __TEXT was not found\n"); return -1; }
     exec_segments(hdr, base_vm, 0);
     uint64_t code = 0;
     for (int i = 0; i < nxr; i++) code += xr[i].size;
     fprintf(stderr, "gunyah: kernel collection at pa %#llx (%s, __TEXT at %#llx): %d code ranges, %llu MB\n", (unsigned long long)hdr,
             rd32(hv_phys_ptr(M, hdr, 32) + 12) == 12 ? "fileset" : "kernel", (unsigned long long)base_vm, nxr,
             (unsigned long long)(code >> 20));
+    if (code < (1ull << 20)) {
+        fprintf(stderr, "gunyah: under 1 MB of kernel code found: nothing could be patched; the hand-over is off, Henge's CPUs go on\n");
+        return -1;
+    }
 
     uint64_t impl_r = 0, impl_w = 0, midr = 0, midr_left = 0, pac = 0, sctlr = 0;
     uint64_t vec[8], pools[64];

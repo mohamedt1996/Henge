@@ -424,6 +424,14 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
         int fd = reserve_get(ram_size, &huge);
         if (fd >= 0) b->ram = map_on_2mb(fd, ram_size);
         if (b->ram != MAP_FAILED) {
+            /* 0.3.104: henge-reserve's pages hold the last run's RAM (its kernels, its panics): a Mac starts with
+               cleared memory, as the JIT's fresh memfd gives it, so nothing old is mistaken for this boot's. */
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            memset(b->ram, 0, ram_size);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            fprintf(stderr, "hengevm: the reserved memory cleared of the last run's in %lld ms\n",
+                    (long long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
             b->ram_fd = fd;
             b->ram_reserved = 1;
             static char name[64], number[16];

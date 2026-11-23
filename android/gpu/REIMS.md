@@ -1246,3 +1246,12 @@ descriptor from the hand-over message and the app got the byte alone. Root now r
 app's own tmpfs type (appdomain_tmpfs) at the connecting app's exact level (SO_PEERSEC), what a memfd the app made
 would carry; no policy is added. The engine logs the labels before and after; the app reports a dropped descriptor
 (MSG_CTRUNC) as "Permission denied" rather than "Protocol error".
+
+0.3.105 (2026-11-24): 0.3.104's reims fix worked on Gunyah (the RAM relabelled, handed over, mapped; "the app's GPU
+is up"), but the kernel died at once: "kernel collection at pa 0x714d4000 (kernel, __TEXT at 0x100000000): 1 code
+ranges, 0 MB" was a user program's Mach-O, not the kernel's, so 0 PAC hypercalls and 0 SCTLR writes were patched and
+the kernel's first AUTDA failed (ESR 0x72000002, FPAC), panicking in a loop. The header is now taken only where
+boot_args' own mapping puts the kernel's __TEXT (virtBase + (pa - physBase)), looked for from 64 MB below physBase to
+the kernel's data end, each candidate logged; with none, or under 1 MB of code, the hand-over is off and Henge's CPUs
+go on. henge-reserve's pages, which held the last run's RAM (its kernels and the old panic texts this log kept
+finding), are cleared at the engine's start.
