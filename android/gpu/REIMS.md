@@ -1238,3 +1238,11 @@ vCPU; the next run resumes the load with 0): a kick landing between an exit's ha
 device reads into zeros, here a virtio ISR read, so a completion was never seen. Kicks now go only to a vCPU inside
 one GH_VCPU_RUN for 20 ms or more (long runs and WFI waits, what they are for); a vCPU busy with device accesses
 returns to the host on each of them anyway.
+
+0.3.104 (2026-11-23): 0.3.103 booted recoveryOS on Gunyah to the Boot Picker, but the app's GPU never came ("guest
+RAM @henge-ram-N: Protocol error"), so pvg_lite drew it. On Gunyah the Mac's RAM is a memfd made by root
+(henge-reserve, or the engine under su); its SELinux label is none an app may read or map, so the kernel dropped the
+descriptor from the hand-over message and the app got the byte alone. Root now relabels the memfd at hand-over to an
+app's own tmpfs type (appdomain_tmpfs) at the connecting app's exact level (SO_PEERSEC), what a memfd the app made
+would carry; no policy is added. The engine logs the labels before and after; the app reports a dropped descriptor
+(MSG_CTRUNC) as "Permission denied" rather than "Protocol error".

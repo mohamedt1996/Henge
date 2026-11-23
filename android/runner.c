@@ -803,6 +803,7 @@ int main(int argc, char **argv) {
         setenv("HV_RAM_RESERVE", "1", 1);
         setenv("HV_RAM_MEMFD", "1", 1);
         setenv("HV_RAM_THP", "2", 1);
+        setenv("HV_RAM_FD_RELABEL", "1", 1); /* root's memfd, relabelled for the app's GPU at hand-over (gpu/ram_fd.h) */
         if (!getenv("HV_RAM_FILE") || !*getenv("HV_RAM_FILE")) setenv("HV_RAM_FILE", "memfd", 1);
         fprintf(stderr, "hengevm: engine: Gunyah from the jump into the kernel (experimental), %d CPUs; Henge's CPUs until then\n", vc.ncpus);
     }
