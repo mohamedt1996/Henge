@@ -1170,3 +1170,9 @@ before the vCPUs run, then the kernel's image and data every 50 ms for 3 minutes
 reset_vector reports each CPU it starts and what it read with its caches off against what the caches hold. The helper
 threads are joined before the engine returns (detached, they read the RAM after the machine was gone: the segfault
 after a stop).
+
+0.3.97 (2026-11-23): 0.3.96 started CPUs 1-3 (each reached the reset vector and read the right CPU table: no stale
+lines) and the kernel went on past "Creating 7 util devices", then waited for good, CPU 0 polling two virtio devices
+(0x32015000, 0x32019000) 150,000 times a second: "interrupt 71 has no doorbell". Apple's pcie,vmapple1 gives slot s
+the INTx line interrupt-base + s (64 + s) and the doorbells stopped at 67, so devices in slots 4-7 (the util storage
+device among them) could not interrupt. Doorbells now cover 64-95, every slot.

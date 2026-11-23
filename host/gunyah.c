@@ -100,7 +100,7 @@ struct ghsm_share_blob { int32_t vm_fd; uint32_t label, flags, mem_handle; uint6
 #define SMALL_CHUNK (8ull << 20)    /* a piece of 4 KB pages: 8 MB of them shared fine, 64 MB reset the tablet (0.3.75) */
 #define MAX_PIECES 640
 #define SPI_LOW_FIRST 32        /* UART, RTC, GPIO, AES, graphics: INTIDs 33..63 */
-#define SPI_LOW_LAST 67         /* and PCIe INTx 64..67 */
+#define SPI_LOW_LAST 95         /* and PCIe INTx 64..95: slot s rings 64 + s (0.3.97: was 64..67, slots 4 and up had none) */
 #define NIRQ 160
 #define APPLE_MIDR 0x611f0220ull /* what Henge's JIT answers (core/sysreg.c MIDR) */
 
