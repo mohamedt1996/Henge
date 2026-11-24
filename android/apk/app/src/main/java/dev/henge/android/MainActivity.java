@@ -107,6 +107,8 @@ public class MainActivity extends Activity {
         setContentView(root);
         if (VmService.state.equals("installing")) tab = Tab.INSTALL;
         if (!VmService.busy()) new Thread(() -> VmService.gatherImages(this)).start();
+        // 0.3.111: a Mac still running from before (the GPU's crash ended the app's last process): taken back.
+        if (!VmService.busy()) new Thread(() -> VmService.adoptIfRunning(getApplicationContext())).start();
     }
 
     @Override protected void onResume() { super.onResume(); lastSignature = ""; ui.post(refresh); }

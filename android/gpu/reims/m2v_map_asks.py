@@ -63,10 +63,11 @@ EDITS = {
     }
     // Henge's Android port (m2v_map_asks.py): a kernel without the query answers "permitted" for
     // the pages alone, with no line of the maps read; every other answer is the lines'.
-    if henge_populates(start, end, access) {
+    let populated = henge_populates(start, end, access);
+    if let Ok(answer) = populated {
         *asked += 1;
         henge_map_asks(false, 0, began);
-        return Some(true);
+        return Some(answer);
     }
     // The lines are read from a file of their own: reading moves its position, which the kept
     // one's queries share among threads.
@@ -75,30 +76,54 @@ EDITS = {
     let lines = (std::io::BufReader::new(maps).lines().map_while(Result::ok)).inspect(|_| read += 1);
     let answer = permitted(lines, start, end, access, asked);
     henge_map_asks(true, read, began);
+    if let Err(errno) = populated {
+        henge_populate_missed(start, end, access, errno, answer);
+    }
     Some(answer)
+}
+
+/// Henge's Android port (m2v_map_asks.py, 0.3.111): the first questions the kernel's advice left to the lines,
+/// said with its error and the lines' answer, so a log shows which mappings take the slow way (an `errno` of 0:
+/// the advice was not tried).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn henge_populate_missed(start: u64, end: u64, access: Access, errno: i32, answer: bool) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SAID: AtomicU32 = AtomicU32::new(0);
+    if errno != 0 && SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+        eprintln!(
+            "metal2vulkan: (Henge) host mappings: {:#x} bytes at {start:#x} for {access:?}: the kernel's advice \
+             failed ({}), the maps answer {}",
+            end - start,
+            std::io::Error::from_raw_os_error(errno),
+            if answer { "permitted" } else { "not permitted" },
+        );
+    }
 }
 
 /// Henge's Android port (m2v_map_asks.py): whether the kernel populates every page of
 /// `[start, end)` for `access` (`MADV_POPULATE_WRITE` for [`Access::Write`], `MADV_POPULATE_READ`
 /// for [`Access::Read`]; Linux 5.14), which it does only where the process maps every page of the
-/// range, without a gap, in a mapping with the permission: `true` is [`mappings_permitted`]'s
-/// "permitted". `false` says nothing (no permission, a gap, a mapping the kernel cannot pin, a
-/// fault that failed, a kernel without the advice, [`Access::Pin`], `M2V_MAPS_LINES` set): the
-/// caller reads the lines then. The pages are faulted in, as the read or write that follows the
-/// question would fault them.
+/// range, without a gap, in a mapping with the permission: `Ok(true)` is [`mappings_permitted`]'s
+/// "permitted". `Ok(false)` is a gap in the range, which the advice fails with ENOMEM and `msync`
+/// confirms (it fails ENOMEM only where part of the range is not mapped; ENOMEM from the advice
+/// alone may be the kernel out of memory): not permitted, as the lines would answer (0.3.111).
+/// `Err(errno)` says nothing (no permission, a mapping the kernel cannot pin, a fault that failed;
+/// 0: a kernel without the advice, [`Access::Pin`], `M2V_MAPS_LINES` set): the caller reads the
+/// lines then. The pages are faulted in, as the read or write that follows the question would
+/// fault them.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn henge_populates(start: u64, end: u64, access: Access) -> bool {
+fn henge_populates(start: u64, end: u64, access: Access) -> Result<bool, i32> {
     const MADV_POPULATE_READ: libc::c_int = 22;
     const MADV_POPULATE_WRITE: libc::c_int = 23;
     let advice = match access {
         Access::Read => MADV_POPULATE_READ,
         Access::Write => MADV_POPULATE_WRITE,
-        Access::Pin => return false,
+        Access::Pin => return Err(0),
     };
     // SAFETY: `sysconf` reads a constant of the system's.
     let page = match u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }) {
         Ok(page) if page.is_power_of_two() => page,
-        _ => return false,
+        _ => return Err(0),
     };
     // Whether this kernel has the advice and answers it as Linux 5.14 does, tried once on two
     // pages of the runtime's own: a writable one is populated for writing and for reading, one
@@ -134,18 +159,30 @@ fn henge_populates(start: u64, end: u64, access: Access) -> bool {
         }
     });
     if !works || end <= start {
-        return false;
+        return Err(0);
     }
     let first = start - start % page;
     let Some(last) = end.checked_next_multiple_of(page) else {
-        return false;
+        return Err(0);
     };
     let Ok(length) = usize::try_from(last - first) else {
-        return false;
+        return Err(0);
     };
     // SAFETY: the advice changes no byte and no mapping: it faults the range's pages in, and
     // fails where a page of it is not mapped with the permission.
-    unsafe { libc::madvise(first as *mut c_void, length, advice) == 0 }
+    if unsafe { libc::madvise(first as *mut c_void, length, advice) } == 0 {
+        return Ok(true);
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    // SAFETY: `MS_ASYNC` writes nothing back (Linux 2.6.19 on): the call only walks the mappings over the
+    // page-aligned range, failing ENOMEM where part of it is not mapped.
+    if errno == libc::ENOMEM
+        && unsafe { libc::msync(first as *mut c_void, length, libc::MS_ASYNC) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOMEM)
+    {
+        return Ok(false);
+    }
+    Err(errno)
 }
 
 /// Henge's Android port (m2v_map_asks.py): what the questions about the process's mappings cost,

@@ -160,7 +160,36 @@ public class VmService extends Service {
     public static boolean installed(Context c) {
         return new File(macDir(c), "machine.json").exists() && new File(c.getFilesDir(), "installed").exists();
     }
-    public static boolean busy() { Process p = process; return p != null && p.isAlive(); }
+    public static boolean busy() { Process p = process; return (p != null && p.isAlive()) || adoptedPid > 0; }
+
+    /** 0.3.111: an engine still running from before this process of the app started, taken back (adopt): 0 for none.
+     *  The GPU's crash (a lost Vulkan device ends reims-vgpu with abort) takes the app's process down, but the engine
+     *  is root's (su) and goes on with the Mac: 0.3.110's run showed "Start" over a Mac still running, and a second
+     *  start would have put a second Mac on the same reserved memory. */
+    static volatile int adoptedPid;
+    private static volatile String adoptedCmdline = "";
+
+    /** The pid of a Henge engine still running (engine.pid, asked of root: the engine may be root's); 0 if none. */
+    static int liveEngine(Context c) {
+        try {
+            String pid = new String(Files.readAllBytes(new File(c.getFilesDir(), "engine.pid").toPath()), StandardCharsets.UTF_8).trim();
+            if (!pid.matches("[0-9]+")) return 0;
+            String out = DeviceCheck.sh(true, "kill -0 " + pid + " 2>/dev/null && tr '\\0' ' ' < /proc/" + pid + "/cmdline", 5);
+            if (!out.contains("libhengevm")) return 0;
+            adoptedCmdline = out;
+            return Integer.parseInt(pid);
+        } catch (Exception e) { return 0; }
+    }
+
+    /** From the app's first screen: a Mac still running is taken back by the service (in the background: one su call). */
+    static void adoptIfRunning(Context c) {
+        if (busy()) return;
+        if (!new File(c.getFilesDir(), "run.active").exists() && !new File(c.getFilesDir(), "engine.root").exists()) return;
+        int pid = liveEngine(c);
+        if (pid == 0 || busy()) return;
+        Intent i = new Intent(c, VmService.class).putExtra(EXTRA_MODE, "adopt").putExtra("pid", pid);
+        try { c.startForegroundService(i); } catch (Exception ignored) { }
+    }
 
     @Override public IBinder onBind(Intent i) { return null; }
 
@@ -175,11 +204,20 @@ public class VmService extends Service {
         PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
         wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "henge:vm");
         wake.acquire();
+        if ("adopt".equals(mode)) {
+            int pid = intent.getIntExtra("pid", 0);
+            new Thread(() -> adopt(pid), "engine").start();
+            return START_NOT_STICKY;
+        }
         boolean deleteImage = intent.getBooleanExtra("deleteImage", false);
         String gpu = intent.getStringExtra("gpu");
         engineMode = "gunyah".equals(intent.getStringExtra("engine")) ? "gunyah" : "jit";
-        new Thread(() -> run(mode, ram, cpus, release == null ? "15.6.1" : release, deleteImage,
-                gpu == null ? "on" : gpu), "engine").start();
+        new Thread(() -> {
+            // A Mac still running from before (the app's process ended under it): taken back, never a second one.
+            int live = "install".equals(mode) ? 0 : liveEngine(this);
+            if (live > 0) adopt(live);
+            else run(mode, ram, cpus, release == null ? "15.6.1" : release, deleteImage, gpu == null ? "on" : gpu);
+        }, "engine").start();
         return START_NOT_STICKY;
     }
 
@@ -506,6 +544,64 @@ public class VmService extends Service {
         }
         state = install ? (code == 0 ? "installed" : "install failed (" + code + ")")
                         : (code == 0 ? "stopped" : "stopped (" + code + ")");
+        process = null;
+        if (wake != null && wake.isHeld()) wake.release();
+        stopForeground(STOP_FOREGROUND_REMOVE);
+        stopSelf();
+    }
+
+    /** 0.3.111: takes back an engine that outlived the app's last process: the Mac shows as running (Stop works, Start
+     *  makes no second one), the GPU starts again in this process (the engine waits for it: "waiting for the app's GPU"),
+     *  and when the engine ends, what its shell would have done after it (files handed back, settings restored). */
+    private void adopt(int pid) {
+        File files = getFilesDir(), mac = macDir(this), log = logFile(this), active = new File(files, "run.active");
+        android.content.SharedPreferences prefs = getSharedPreferences("henge", MODE_PRIVATE);
+        if (pid <= 0 || liveEngine(this) != pid) { stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(); return; }
+        adoptedPid = pid;
+        state = "running";
+        String cmdline = adoptedCmdline;
+        if (cmdline.contains("--engine gunyah")) engineMode = "gunyah";
+        String last = "";
+        try { last = new String(Files.readAllBytes(active.toPath()), StandardCharsets.UTF_8).trim(); } catch (Exception ignored) { }
+        String lastMode = last.contains("@") ? last.substring(0, last.indexOf('@')) : last;
+        boolean reims = lastMode.startsWith("reims") || cmdline.contains("--gpu reims");
+        long logFrom = log.length();
+        logLastCrash(log);
+        appendLog(log, "henge app: the Mac was still running (engine " + pid + ") after the app's process ended: taken back"
+                + (reims ? "; the GPU starts again in the app (the picture comes back once macOS restarts its GPU)" : ""));
+        if (reims && GpuView.loaded) {
+            String vulkanLib = null;
+            File t = "reims-turnip-henge".equals(lastMode) ? GpuView.turnipHenge(this)
+                    : "reims-turnip".equals(lastMode) ? GpuView.turnip(this) : null;
+            if (t != null) vulkanLib = t.getPath();
+            if (!GpuView.nativeReimsStart(new File(mac, "gpu.reims").getPath(), log.getPath(), reimsHomeDir(this).getPath(), vulkanLib))
+                appendLog(log, "henge app: the GPU could not start again; Stop the Mac and start it");
+        }
+        while (liveEngine(this) == pid) {
+            try { Thread.sleep(2000); } catch (InterruptedException ignored) { }
+        }
+        if (reims && GpuView.loaded) GpuView.nativeReimsStop();
+        int uid = android.os.Process.myUid();
+        DeviceCheck.sh(true, "chown -R " + uid + ":" + uid + " " + sq(files.getPath()) + " " + sq(getCacheDir().getPath())
+                + "; restorecon -RF " + sq(files.getPath()) + " 2>/dev/null; rm -f " + sq(new File(files, "engine.root").getPath())
+                + " " + sq(new File(files, "gunyah-kmsg.txt").getPath()) + "; true", 60);
+        fullSpeed(log, false);
+        hugePages(log, false);
+        coreTuningBack(log, prefs);
+        active.delete();
+        String said = "";
+        try (java.io.RandomAccessFile f = new java.io.RandomAccessFile(log, "r")) {
+            long from = Math.max(logFrom, f.length() - 65536);
+            byte[] b = new byte[(int) (f.length() - from)];
+            f.seek(from);
+            f.readFully(b);
+            said = new String(b, StandardCharsets.UTF_8);
+        } catch (Exception ignored) { }
+        appendLog(log, "henge app: the engine exited" + (said.contains("hengevm: stopped: macOS restarted")
+                ? " (macOS restarted: start the Mac again)" : ""));
+        exportLog(this);
+        adoptedPid = 0;
+        state = "stopped";
         process = null;
         if (wake != null && wake.isHeld()) wake.release();
         stopForeground(STOP_FOREGROUND_REMOVE);

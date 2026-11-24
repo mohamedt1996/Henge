@@ -147,16 +147,35 @@ EDITS = {
     'crates/reims-vgpu-vulkan/src/os/linux/files.rs': [
         ("""#[cfg(test)]
 mod tests {""", """/// Henge's Android port (reims_view_why.py): the host address where a registration of the guest's RAM maps
-/// `length` bytes of `fd` from `offset`, for a view made as a duplicate of that mapping. None where the table
-/// is busy (no wait: a caller may hold it) or no registration holds them.
+/// `length` bytes of `fd` from `offset`, for a view made as a duplicate of that mapping; None where no
+/// registration holds them. The table is waited for: no caller of `vm::file` holds it (each takes what it needs
+/// from the table and lets it go first). 0.3.109 only tried it, and a view made while another thread held it was
+/// left a hole (0.3.110's run: one view at offset 0x1ebd8000, then 90 no-copy buffers over it answered nil, each
+/// with a read of /proc/self/maps, and the guest's GPU restarted on every one). A registration under another
+/// descriptor of the same file (each device dups the RAM's) holds the pages as well: matched by device and inode.
 pub(crate) fn henge_registered_host(fd: &Arc<OwnedFd>, offset: u64, length: u64) -> Option<u64> {
-    let table = TABLE.try_lock()?;
-    table.registered.iter().find_map(|r| {
-        let end = offset.checked_add(length)?;
+    use std::os::fd::AsRawFd as _;
+    fn id(fd: &OwnedFd) -> Option<(u64, u64)> {
+        // SAFETY: fstat writes the stat of an open descriptor into the buffer given.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        (unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } == 0).then(|| (st.st_dev as u64, st.st_ino as u64))
+    }
+    let end = offset.checked_add(length)?;
+    let table = TABLE.lock();
+    let holds = |r: &Registered| {
         let held = r.backing.offset.checked_add(r.end - r.first)?;
-        (Arc::ptr_eq(&r.backing.fd, fd) && offset >= r.backing.offset && end <= held)
-            .then(|| r.first + (offset - r.backing.offset))
-    })
+        (offset >= r.backing.offset && end <= held).then(|| r.first + (offset - r.backing.offset))
+    };
+    if let Some(at) = (table.registered.iter())
+        .filter(|r| Arc::ptr_eq(&r.backing.fd, fd))
+        .find_map(holds)
+    {
+        return Some(at);
+    }
+    let want = id(fd)?;
+    (table.registered.iter())
+        .filter(|r| id(&r.backing.fd) == Some(want))
+        .find_map(holds)
 }
 
 #[cfg(test)]

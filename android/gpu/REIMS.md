@@ -1298,3 +1298,21 @@ faulted and macOS restarted its GPU before drawing ("Trying to restart GPU"): Ze
 Last step to macOS: choosing Macintosh HD restarts the Mac, and on Gunyah the VM ends at a restart. The engine now
 reads the kernel's last word ("MACH Reboot" or "CPU halted") when the VM exits; a restart (and the JIT's PSCI
 SYSTEM_RESET too) exits 3, and the app starts the Mac again, at most 3 times in 10 minutes.
+
+0.3.111 (2026-11-24): 0.3.110 booted macOS to the desktop on Gunyah, drawn by reims at 10 to 29 frames/s (the Boot
+Picker 60). Three faults of that run, fixed:
+- The restart after choosing the startup disk was detected ("MACH Reboot") but the engine's last line turned the
+  restart's reason (negative, as the VM's own reasons are not) into 0, "stopped: other", so the app did not start the
+  Mac again. It now exits 3 for it, and the app relaunches.
+- One view of guest pages (offset 0x1ebd8000) found "no registered RAM mapping": 0.3.109's lookup only tried the
+  backing table's lock, and another FIFO thread held it. The view was left a hole; 90 no-copy buffers over it then
+  answered nil ("pages it cannot read"), each GPU task over it faulted and macOS restarted its GPU on every one (the
+  stutter), and each asked the maps (230 reads, 618,336 lines, 521 ms in 10 s). The lookup now waits for the lock (no
+  caller of a view's map holds it) and also matches another descriptor of the same file (device and inode). The
+  maps' questions answer a gap without the lines (the advice's ENOMEM, confirmed by msync), and the first 8 the
+  kernel's advice leaves to the lines are logged with its error ("metal2vulkan: (Henge) host mappings: ...").
+- A lost Vulkan device ends reims-vgpu with abort, which took the app's process down while the engine (root's) ran
+  on: the app showed Start over a running Mac, and a second start would have put a second Mac on the same reserved
+  memory. The app now takes back a running engine (engine.pid, its cmdline checked) when it opens or is asked to
+  start: the Mac shows as running, the GPU starts again in the app (the engine waits for it), and when the engine
+  ends the app does what the run's shell would have (files handed back, settings restored).

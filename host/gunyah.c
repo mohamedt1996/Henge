@@ -2159,5 +2159,7 @@ int hv_gunyah_run(void) {
                     "(once lost):", (unsigned long long)kicks_back[0], (unsigned long long)kicks_sent[0]);
     for (int i = 0; i < nvcpu; i++) fprintf(stderr, " vcpu%d %llu", i, (unsigned long long)saved_exits[i]);
     fputc('\n', stderr);
-    return vm_reason < 0 ? 0 : vm_reason;
+    /* 0.3.111: HV_GUNYAH_RESTART is negative too; 0.3.110 turned it into 0 here ("stopped: other"), so the app never
+       started the Mac again after a chosen startup disk. */
+    return vm_reason == HV_GUNYAH_RESTART ? HV_GUNYAH_RESTART : vm_reason < 0 ? 0 : vm_reason;
 }
