@@ -1270,3 +1270,12 @@ guest pages (the RAM's file mapped again, shared, at a page's offset) was refuse
 The app now logs the OS layer's debug lines (the first 60) and, once the RAM is mapped, maps a page of the RAM's file
 again itself, anywhere and at a fixed address, with the file's size, access mode and seals: the next log says which
 part refuses.
+
+0.3.108 (2026-11-24): 0.3.107 on Gunyah: the hand-over worked (the fileset at pa 0x73818000; 19 PAC hypercalls and 6
+SCTLR writes patched) and recoveryOS ran on Gunyah's CPUs to loginwindow, but reims still never started: the ring
+(0x79bd8000) and the root page (0x1e813) "could not be mapped", WindowServer aborted every 60 s. The app's own
+probe mapped a page of the RAM's file again at a fixed address fine (3072 MB, read-write, seals 0x6, same bytes), and
+none of the library's OS-layer debug lines named a refusal, so the view is refused before or around the kernel's
+mmap, silently. reims_view_why.py patches the library to say why at warn level: an address in no range of the
+memory map (with the ranges), the allocation, the host's remap, no file behind the source, or the mmap's errno.
+The panic texts the log showed are the earlier run's report on disk, read by recoveryOS, not a panic of this boot.
