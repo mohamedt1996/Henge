@@ -1279,3 +1279,12 @@ none of the library's OS-layer debug lines named a refusal, so the view is refus
 mmap, silently. reims_view_why.py patches the library to say why at warn level: an address in no range of the
 memory map (with the ranges), the allocation, the host's remap, no file behind the source, or the mmap's errno.
 The panic texts the log showed are the earlier run's report on disk, read by recoveryOS, not a panic of this boot.
+
+0.3.109 (2026-11-24): 0.3.108 named it: every view reims-vgpu makes of guest pages (the IOSurface ring, its
+descriptor table, the root page) is "mmap of 0x4000 bytes of fd N at offset ..., prot 0x3, fixed: Permission denied",
+with Zero-copy on and off alike, where the app's own map of the same file at a fixed address had passed at the GPU's
+start (before the Mac ran on Gunyah). So the GPU's root FIFO was never made and WindowServer aborted every 60 s. A
+view refused so is now a duplicate of the registered shared mapping of the RAM (mremap with an old size of 0), which
+maps no file anew; its first use is logged. The app re-probes a new map of the file every 10 s and says when that
+changes, to time the refusal. The panic finder skips reports kept on disk (their JSON escapes): recoveryOS reads the
+old panic report in, and 0.3.107/0.3.108 printed it six times a pass.

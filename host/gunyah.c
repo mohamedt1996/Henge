@@ -1388,19 +1388,22 @@ static void dump_msgbuf(void) {
        follows it. */
     static const char key[] = "panic(cpu ";
     const uint8_t *ram = B->ram, *end = B->ram + B->ram_size, *p = ram;
-    int hits = 0;
-    while (hits < 6 && (p = memmem(p, (size_t)(end - p), key, sizeof key - 1)) != NULL) {
+    int hits = 0, old_reports = 0;
+    while (hits < 6 && old_reports < 64 && (p = memmem(p, (size_t)(end - p), key, sizeof key - 1)) != NULL) {
         if (p[sizeof key - 1] == '%') { p++; continue; } /* the kernel's own format string */
         char out[2049];
         size_t m = 0;
         for (const uint8_t *q = p; q < end && m < 2048 && *q; q++)
             out[m++] = (*q >= 32 && *q < 127) || *q == '\n' || *q == '\t' ? (char)*q : '?';
         out[m] = 0;
-        say("gunyah: panic text in the Mac's RAM at pa %#llx:\n---\n%s\n---\n", (unsigned long long)(VMAPPLE_MEM + (uint64_t)(p - ram)), out);
-        hits++;
         p += m > 0 ? m : 1;
+        /* 0.3.109: a report kept on disk (its JSON escapes, "\n\t" as two characters) is a past panic recoveryOS read
+           in, not this boot's: counted, not printed (0.3.107 and 0.3.108 logged the same old one six times a pass). */
+        if (strstr(out, "\\n\\t") || strstr(out, "\\n")) { old_reports++; continue; }
+        say("gunyah: panic text in the Mac's RAM at pa %#llx:\n---\n%s\n---\n", (unsigned long long)(VMAPPLE_MEM + (uint64_t)(p - m - ram)), out);
+        hits++;
     }
-    if (!hits) say("gunyah: no \"panic(cpu\" text in the Mac's RAM\n");
+    if (!hits) say("gunyah: no panic of this boot in the Mac's RAM%s\n", old_reports ? " (only past panic reports read from disk)" : "");
     const uint8_t *d = ram;
     while ((d = memmem(d, (size_t)(end - d), "Debugger called: <", 18)) != NULL && d[18] == '%') d++;
     if (d) {

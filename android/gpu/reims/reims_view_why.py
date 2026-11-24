@@ -71,6 +71,56 @@ EDITS = {
         // Henge's Android port (reims_view_why.py): the kernel's reason, said.
         let why = std::io::Error::last_os_error();
         let kr = refused("a view of guest pages", false);
+        // 0.3.109: the tablet refuses a new map of the Mac's RAM file once Gunyah runs (0.3.108's run: EACCES on
+        // every view, where the app's own map of the same page had passed at its start). The pages are already
+        // mapped, shared, where the guest's RAM is registered: a view is then a second mapping of those, made by
+        // mremap with an old size of 0 (the kernel's duplicate of a shared mapping), which maps no file anew.
+        if let Some(target) = at {
+            if matches!(why.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM)) {
+                if let Some(src) = files::henge_registered_host(&backing.fd, backing.offset, length) {
+                    unsafe extern "C" {
+                        #[link_name = "mremap"]
+                        fn henge_mremap(
+                            addr: *mut libc::c_void,
+                            old: libc::size_t,
+                            new: libc::size_t,
+                            flags: libc::c_int,
+                            ...
+                        ) -> *mut libc::c_void;
+                    }
+                    // SAFETY: a duplicate of the registered shared mapping over the caller's range, which a
+                    // view replaces (MREMAP_MAYMOVE 1 | MREMAP_FIXED 2).
+                    let dup = unsafe { henge_mremap(ptr(src), 0, length.to_usize(), 3, ptr(target)) };
+                    let rw = libc::PROT_READ | libc::PROT_WRITE;
+                    // SAFETY: the duplicate just made, its protection lowered where the view asks.
+                    if dup != libc::MAP_FAILED
+                        && (prot == rw || unsafe { libc::mprotect(ptr(target), length.to_usize(), prot) } == 0)
+                    {
+                        static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            log::warn!(
+                                target: "reims_vgpu_vulkan::os",
+                                "views of guest pages are duplicates of the RAM's mapping: the kernel refuses new maps \
+                                 of its file ({why})"
+                            );
+                        }
+                        return Ok(target);
+                    }
+                    let again = std::io::Error::last_os_error();
+                    log::warn!(
+                        target: "reims_vgpu_vulkan::os",
+                        "a view of guest pages: the duplicate of the RAM's mapping at {src:#x} was refused too: {again}"
+                    );
+                } else {
+                    log::warn!(
+                        target: "reims_vgpu_vulkan::os",
+                        "a view of guest pages: no registered RAM mapping holds offset {:#x} (+{length:#x}) of fd {}",
+                        backing.offset,
+                        backing.fd.as_raw_fd()
+                    );
+                }
+            }
+        }
         log::warn!(
             target: "reims_vgpu_vulkan::os",
             "a view of guest pages: mmap of {length:#x} bytes of fd {} at offset {offset:#x}, prot {prot:#x}, \\
@@ -93,6 +143,24 @@ EDITS = {
          """                    log::warn!(
                         target: "reims_vgpu_vulkan::os",
                         "remap of {len:#x} bytes at {source:#x}: no file behind them\""""),
+    ],
+    'crates/reims-vgpu-vulkan/src/os/linux/files.rs': [
+        ("""#[cfg(test)]
+mod tests {""", """/// Henge's Android port (reims_view_why.py): the host address where a registration of the guest's RAM maps
+/// `length` bytes of `fd` from `offset`, for a view made as a duplicate of that mapping. None where the table
+/// is busy (no wait: a caller may hold it) or no registration holds them.
+pub(crate) fn henge_registered_host(fd: &Arc<OwnedFd>, offset: u64, length: u64) -> Option<u64> {
+    let table = TABLE.try_lock()?;
+    table.registered.iter().find_map(|r| {
+        let end = offset.checked_add(length)?;
+        let held = r.backing.offset.checked_add(r.end - r.first)?;
+        (Arc::ptr_eq(&r.backing.fd, fd) && offset >= r.backing.offset && end <= held)
+            .then(|| r.first + (offset - r.backing.offset))
+    })
+}
+
+#[cfg(test)]
+mod tests {"""),
     ],
 }
 

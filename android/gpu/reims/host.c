@@ -301,6 +301,18 @@ static void sample_threads(void) {
     hlog("reims: sample: %d of %d threads sampled (the busy ones and the GPU library's)", sent, n);
 }
 
+/* 0.3.109: whether the RAM's file may still be mapped again, shared, at a fixed address (what reims-vgpu does for
+   each view of guest pages): 0, or the errno. 0.3.108: allowed at the GPU's start, refused (EACCES) once the Mac
+   ran on Gunyah. */
+static int ram_remap_probe(int fd, uint64_t off) {
+    void *res = mmap(NULL, 0x4000, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (res == MAP_FAILED) return errno;
+    void *fix = mmap(res, 0x4000, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, (off_t)off);
+    int e = fix == MAP_FAILED ? errno : 0;
+    munmap(res, 0x4000);
+    return e;
+}
+
 static void on_log(void *ctx, RvgLogLevel level, const char *target, size_t tl, const char *msg, size_t ml) {
     (void)ctx;
     /* 0.3.106: debug lines only from the library's OS layer (views of guest pages: why a remap is refused), the
@@ -677,6 +689,13 @@ static void *beat_loop(void *arg) {
                  n / secs, n ? te / 1e6 / n : 0.0, n ? tr / 1e6 / n : 0.0, s ? ts / 1e6 / s : 0.0, screen,
                  (unsigned long long)put, put ? put_ns / 1e6 / put : 0.0);
             last = now_ns();
+            {   /* the RAM's file mapped again: said when it changes */
+                static int was = -1;
+                int e = h->ram_fd >= 0 ? ram_remap_probe(h->ram_fd, h->ram_size > 0x0ae9c000ull ? 0x0ae98000ull : 0x4000) : -1;
+                if (e != was && e >= 0)
+                    hlog("reims: the RAM's file mapped again now: %s%s", e ? "REFUSED: " : "ok", e ? strerror(e) : "");
+                was = e;
+            }
             reg_report(h);
             static int beats;
             if (beats++ % 2 == 1) memory_report();
