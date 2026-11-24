@@ -1488,3 +1488,20 @@ read here from its disassembly:
   is, whichever clock is chosen.
 - /.henge/reports sends henge-clock-info.txt (the timebase by sysctl, the commpage's first 512 bytes, two clocks a
   second apart) in place of the driver.
+
+0.3.120 (2026-11-24): 0.3.119's first 24 MHz start (the Exact start before it in the same log booted as ever): 805
+counter and compare reads and 4 count-down writes rewritten, none left, the device tree at 24 MHz; then vCPU 0 made
+188 exits (the last the serial port's set-up) and nothing more for 60 s. The kernel's log ends "failed to find the
+timer", the line before pe_init_fiq, whose GICR store needs the exception vectors' fix-up (0.3.92); no panic, no
+banner, so no commpage either ("NO COMMPAGE FOUND" was that, not the search). What that start does not tell: whether
+the kernel faulted over and over inside a stub or fix-up that sat somewhere new, or span on a time. 0.3.119 placed
+the timer's stubs in the same pass as the others, 9.6 KB of them, so the MIDR, SCTLR and reset stubs and the four
+fix-ups all sat elsewhere than in a boot that works, possibly in another code range's padding. Now:
+- the timer is a pass of its own after the fix-ups: every stub and fix-up an Exact boot has is where it is there;
+- a timer stub goes into its own code range's padding, into another's only when that is full, and each range's
+  share is logged ("timer stubs: code range ..."), as is each fix-up's place;
+- all or nothing: a dry pass first; if any timer instruction has no room, none is rewritten and the Mac gets the
+  counter's own rate, with every range's padding logged;
+- on a stall, every value in the kernel's data that is the address of a timer stub or fix-up is counted and logged
+  with the code there ("stall: ..."): a fault loop or an interrupt inside one leaves its return address behind.
+Exact, the default, runs none of this but the counting.

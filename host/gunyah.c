@@ -398,6 +398,8 @@ static void *pac_thread(void *arg) {
 static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static int g_tb24;        /* the counter is scaled for the Mac */
 static uint64_t g_ct_seen[6], g_ct_done, g_ct_left;
+static struct { uint64_t pa, end; int fix; } g_ts[72]; /* the timer's stubs and the fix-ups, for the stall report */
+static int g_nts;
 
 static int commpage_like(const uint8_t *c, int ncpu) {
     if (c[0x24] != 14 || c[0x25] != 14 || c[0x37] != 14) return 0; /* user and kernel page shifts: 16 KB */
@@ -683,7 +685,7 @@ static int kpatch(void) {
     }
 
     uint64_t impl_r = 0, impl_w = 0, midr = 0, midr_left = 0, pac = 0, sctlr = 0;
-    uint64_t vec[8], pools[64];
+    uint64_t vec[8], pools[64], zs[64];
     int nvec = 0;
     const char *kp = getenv("HV_GUNYAH_KEEP_PAC");
     int keep_pac = kp && *kp == '1';
@@ -698,13 +700,14 @@ static int kpatch(void) {
     }
     for (int r = 0; r < nxr; r++) {
         uint32_t *w = hv_phys_ptr(M, xr[r].pa, xr[r].size);
-        pools[r] = xr[r].size / 4;
+        pools[r] = xr[r].size / 4, zs[r] = 0;
         if (!w) continue;
         uint64_t n = xr[r].size / 4;
         /* The stub pool: the zeros at the code's end (page padding), less a margin. */
         uint64_t z = n;
         while (z > 0 && w[z - 1] == 0) z--;
         uint64_t pool = z + 16 < n ? z + 16 : n;
+        zs[r] = z;
         for (uint64_t i = 0; i < z; i++) {
             uint32_t x = w[i];
             if ((x & ~31u) == 0xd518c000u && nvec < 8) { /* MSR VBAR_EL1, Xt: where its ADRP (+ADD) points */
@@ -795,59 +798,6 @@ static int kpatch(void) {
                 pool += 5, sctlr++;
                 continue;
             }
-            {
-                /* 0.3.119: the generic timer. 1: a read of a counter or a compare value (CNTVCT, CNTPCT, their
-                   self-synchronized forms, CNTV_CVAL, CNTP_CVAL); 2: a read of a count-down (TVAL); 3: a write of a
-                   compare value; 4: a write of a count-down; 5: a read of CNTFRQ. Counted always; rewritten for the
-                   24 MHz clock. */
-                uint32_t op = x & ~31u;
-                int kind = op == 0xd53be040u || op == 0xd53be020u || op == 0xd53be0c0u || op == 0xd53be0a0u || op == 0xd53be340u ||
-                           op == 0xd53be240u ? 1
-                         : op == 0xd53be300u || op == 0xd53be200u ? 2
-                         : op == 0xd51be340u || op == 0xd51be240u ? 3
-                         : op == 0xd51be300u || op == 0xd51be200u ? 4
-                         : op == 0xd53be000u ? 5 : 0;
-                if (kind) {
-                    g_ct_seen[kind]++;
-                    if (g_tb24 && rt != 31) {
-                        static const uint8_t need[6] = {0, 3, 4, 7, 8, 3};
-                        if (pool + need[kind] > n || (int64_t)((pool - i) * 4) >= (120ll << 20)) { g_ct_left++; continue; }
-                        uint64_t site = xr[r].pa + i * 4, stub = xr[r].pa + pool * 4;
-                        uint32_t *c = &w[pool], a = rt == 16 ? 17 : 16, b = rt == 16 ? 16 : 17;
-                        int k = 0;
-                        if (kind == 1) {
-                            c[k++] = x;                                        /* mrs xt, <counter> */
-                            c[k++] = 0x8b400800u | rt << 16 | rt << 5 | rt;    /* add xt, xt, xt, lsr #2 */
-                        } else if (kind == 2) {
-                            c[k++] = x;                                        /* mrs xt, <tval> */
-                            c[k++] = 0x93407c00u | rt << 5 | rt;               /* sxtw xt, wt */
-                            c[k++] = 0x8b800800u | rt << 16 | rt << 5 | rt;    /* add xt, xt, xt, asr #2 */
-                        } else if (kind == 3) {
-                            c[k++] = 0xa9bf47f0u;                              /* stp x16, x17, [sp, #-16]! */
-                            c[k++] = 0xd28000a0u | a;                          /* mov xa, #5 */
-                            c[k++] = 0x9ac00800u | a << 16 | rt << 5 | a;      /* udiv xa, xt, xa */
-                            c[k++] = 0xcb000000u | a << 16 | rt << 5 | a;      /* sub xa, xt, xa: four fifths, rounded up */
-                            c[k++] = op | a;                                   /* msr <cval>, xa */
-                            c[k++] = 0xa8c147f0u;                              /* ldp x16, x17, [sp], #16 */
-                        } else if (kind == 4) {
-                            c[k++] = 0xa9bf47f0u;                              /* stp x16, x17, [sp, #-16]! */
-                            c[k++] = 0x93407c00u | rt << 5 | a;                /* sxtw xa, wt */
-                            c[k++] = 0xd28000a0u | b;                          /* mov xb, #5 */
-                            c[k++] = 0x9ac00c00u | b << 16 | a << 5 | b;       /* sdiv xb, xa, xb */
-                            c[k++] = 0xcb000000u | b << 16 | a << 5 | a;       /* sub xa, xa, xb */
-                            c[k++] = op | a;                                   /* msr <tval>, xa */
-                            c[k++] = 0xa8c147f0u;                              /* ldp x16, x17, [sp], #16 */
-                        } else {
-                            c[k++] = 0xd286c000u | rt;                         /* mov xt, #0x3600 */
-                            c[k++] = 0xf2a02dc0u | rt;                         /* movk xt, #0x16e, lsl #16: 24,000,000 */
-                        }
-                        c[k] = branch(stub + (uint64_t)k * 4, site + 4);
-                        w[i] = branch(site, stub);
-                        pool += (uint64_t)k + 1, g_ct_done++;
-                    }
-                    continue;
-                }
-            }
             if ((top13 == 0xd5380000u || top13 == 0xd5180000u) && (crn == 15 || crn == 11)) { /* implementation defined */
                 if (top13 == 0xd5380000u) w[i] = rt == 31 ? NOP : MOVZ_X(rt), impl_r++;
                 else w[i] = NOP, impl_w++;
@@ -902,11 +852,118 @@ static int kpatch(void) {
                     *ew = branch(ent, at);
                     pools[r] += fw + 1;
                     vfixed++, done = 1;
+                    fprintf(stderr, "gunyah: fix-up of exception vector %#llx: %zu bytes at pa %#llx (code range %d)\n",
+                            (unsigned long long)ent, flen, (unsigned long long)at, r);
+                    if (g_nts < 72) g_ts[g_nts].pa = at, g_ts[g_nts].end = at + flen, g_ts[g_nts].fix = 1, g_nts++;
                 }
                 if (!done) fprintf(stderr, "gunyah: no room near exception vector %#llx for its fix-up\n", (unsigned long long)ent);
             }
         }
         fprintf(stderr, "gunyah: %d exception tables found, %d synchronous entries now carry out device accesses Gunyah cannot\n", nvec, vfixed);
+    }
+    /* 0.3.120: the generic timer, in a pass of its own after everything above, so that every stub and fix-up a boot
+       on the counter's own rate has sits where it sits there; the timer's stubs only follow them. (0.3.119 placed
+       them in one pass: its 24 MHz boot stopped after the kernel's log line that precedes pe_init_fiq, where the
+       fix-ups are first needed.) */
+    uint64_t cur[64], own[64] = {0}, far[64] = {0};
+    /* First without writing (dry): a kernel with some of its timer instructions scaled and some not would run on two
+       clocks, so unless every one has room none is rewritten and the Mac gets the counter's own rate. */
+    for (int dry = g_tb24 ? 1 : 0; dry >= 0; dry--) {
+    uint64_t dleft = 0;
+    for (int r = 0; r < nxr; r++) cur[r] = pools[r];
+    for (int r = 0; r < nxr; r++) {
+        uint32_t *w = hv_phys_ptr(M, xr[r].pa, xr[r].size);
+        if (!w || !zs[r]) continue;
+        uint64_t z = zs[r];
+        for (uint64_t i = 0; i < z; i++) {
+            {
+                /* 0.3.119: the generic timer. 1: a read of a counter or a compare value (CNTVCT, CNTPCT, their
+                   self-synchronized forms, CNTV_CVAL, CNTP_CVAL); 2: a read of a count-down (TVAL); 3: a write of a
+                   compare value; 4: a write of a count-down; 5: a read of CNTFRQ. Counted always; rewritten for the
+                   24 MHz clock. */
+                uint32_t x = w[i], op = x & ~31u, rt = x & 31;
+                int kind = op == 0xd53be040u || op == 0xd53be020u || op == 0xd53be0c0u || op == 0xd53be0a0u || op == 0xd53be340u ||
+                           op == 0xd53be240u ? 1
+                         : op == 0xd53be300u || op == 0xd53be200u ? 2
+                         : op == 0xd51be340u || op == 0xd51be240u ? 3
+                         : op == 0xd51be300u || op == 0xd51be200u ? 4
+                         : op == 0xd53be000u ? 5 : 0;
+                if (kind) {
+                    if (!dry) g_ct_seen[kind]++;
+                    if (g_tb24 && rt != 31) {
+                        static const uint8_t need[6] = {0, 3, 4, 7, 8, 3};
+                        /* Its stub: in this code range's own padding; in another's within a branch's reach if not. */
+                        uint64_t site = xr[r].pa + i * 4;
+                        int q = -1;
+                        for (int t = -1; t < nxr && q < 0; t++) {
+                            int u = t < 0 ? r : t;
+                            if (!zs[u] || cur[u] + need[kind] > xr[u].size / 4) continue;
+                            uint64_t at = xr[u].pa + cur[u] * 4;
+                            if ((at > site ? at - site : site - at) < (120ull << 20)) q = u;
+                        }
+                        uint32_t *wq = q < 0 ? NULL : hv_phys_ptr(M, xr[q].pa, xr[q].size);
+                        if (!wq) { dleft++; continue; }
+                        uint64_t stub = xr[q].pa + cur[q] * 4;
+                        uint32_t scratch[10], *c = dry ? scratch : &wq[cur[q]], a = rt == 16 ? 17 : 16, b = rt == 16 ? 16 : 17;
+                        int k = 0;
+                        if (kind == 1) {
+                            c[k++] = x;                                        /* mrs xt, <counter> */
+                            c[k++] = 0x8b400800u | rt << 16 | rt << 5 | rt;    /* add xt, xt, xt, lsr #2 */
+                        } else if (kind == 2) {
+                            c[k++] = x;                                        /* mrs xt, <tval> */
+                            c[k++] = 0x93407c00u | rt << 5 | rt;               /* sxtw xt, wt */
+                            c[k++] = 0x8b800800u | rt << 16 | rt << 5 | rt;    /* add xt, xt, xt, asr #2 */
+                        } else if (kind == 3) {
+                            c[k++] = 0xa9bf47f0u;                              /* stp x16, x17, [sp, #-16]! */
+                            c[k++] = 0xd28000a0u | a;                          /* mov xa, #5 */
+                            c[k++] = 0x9ac00800u | a << 16 | rt << 5 | a;      /* udiv xa, xt, xa */
+                            c[k++] = 0xcb000000u | a << 16 | rt << 5 | a;      /* sub xa, xt, xa: four fifths, rounded up */
+                            c[k++] = op | a;                                   /* msr <cval>, xa */
+                            c[k++] = 0xa8c147f0u;                              /* ldp x16, x17, [sp], #16 */
+                        } else if (kind == 4) {
+                            c[k++] = 0xa9bf47f0u;                              /* stp x16, x17, [sp, #-16]! */
+                            c[k++] = 0x93407c00u | rt << 5 | a;                /* sxtw xa, wt */
+                            c[k++] = 0xd28000a0u | b;                          /* mov xb, #5 */
+                            c[k++] = 0x9ac00c00u | b << 16 | a << 5 | b;       /* sdiv xb, xa, xb */
+                            c[k++] = 0xcb000000u | b << 16 | a << 5 | a;       /* sub xa, xa, xb */
+                            c[k++] = op | a;                                   /* msr <tval>, xa */
+                            c[k++] = 0xa8c147f0u;                              /* ldp x16, x17, [sp], #16 */
+                        } else {
+                            c[k++] = 0xd286c000u | rt;                         /* mov xt, #0x3600 */
+                            c[k++] = 0xf2a02dc0u | rt;                         /* movk xt, #0x16e, lsl #16: 24,000,000 */
+                        }
+                        c[k] = branch(stub + (uint64_t)k * 4, site + 4);
+                        cur[q] += (uint64_t)k + 1;
+                        if (dry) continue;
+                        w[i] = branch(site, stub);
+                        g_ct_done++, own[q] += q == r, far[q] += q != r;
+                    }
+                    continue;
+                }
+            }
+        }
+    }
+    if (dry && dleft) {
+        fprintf(stderr, "gunyah: the Mac's clock at 24 MHz: %llu of the kernel's timer instructions have no room for a stub: "
+                        "none is rewritten, the Mac gets the counter's own rate (as Settings > Mac's clock: Exact)\n",
+                (unsigned long long)dleft);
+        for (int r = 0; r < nxr; r++)
+            if (zs[r]) fprintf(stderr, "gunyah:   code range %d: pa %#llx, %llu KB, %llu bytes of zeros at its end, %llu taken\n", r,
+                               (unsigned long long)xr[r].pa, (unsigned long long)(xr[r].size >> 10),
+                               (unsigned long long)(xr[r].size - zs[r] * 4), (unsigned long long)((pools[r] - zs[r]) * 4));
+        g_tb24 = 0;
+    }
+    g_ct_left += dry ? 0 : dleft;
+    }
+    for (int r = 0; r < nxr; r++) {
+        if (cur[r] == pools[r]) continue;
+        if (g_nts < 72) g_ts[g_nts].pa = xr[r].pa + pools[r] * 4, g_ts[g_nts].end = xr[r].pa + cur[r] * 4, g_ts[g_nts].fix = 0, g_nts++;
+        fprintf(stderr, "gunyah: timer stubs: code range %d (pa %#llx, %llu KB, %llu bytes of zeros at its end, %llu taken by the "
+                        "other stubs and fix-ups): %llu stubs of its own and %llu of other ranges at pa %#llx-%#llx\n", r,
+                (unsigned long long)xr[r].pa, (unsigned long long)(xr[r].size >> 10), (unsigned long long)(xr[r].size - zs[r] * 4),
+                (unsigned long long)((pools[r] - zs[r]) * 4), (unsigned long long)own[r], (unsigned long long)far[r],
+                (unsigned long long)(xr[r].pa + pools[r] * 4), (unsigned long long)(xr[r].pa + cur[r] * 4));
+        pools[r] = cur[r];
     }
     fprintf(stderr, "gunyah: kernel patched for this CPU: %llu reads and %llu writes of Apple's own registers (now 0 and "
                     "ignored), %llu MIDR reads (now Apple's %#llx)%s, %llu PAC hypercalls (now success), %llu SCTLR writes (pointer "
@@ -1510,6 +1567,43 @@ static void dump_screen(void) {
     say("gunyah: could not write the Mac's screen to a picture\n");
 }
 
+/* 0.3.120: where a stalled kernel is, as far as its memory tells. Gunyah shows no vCPU register; but a kernel that
+   faults over and over, or was interrupted, leaves return addresses in its data (saved ELR and LR, the stacks). Every
+   8-byte value in the kernel's data that is the kernel address of a timer stub or of a fix-up is counted. */
+static void stall_stubs(void) {
+    if (!g_nts || !k_phys || k_top <= k_phys) return;
+    const uint8_t *k = hv_phys_ptr(M, k_phys, k_top - k_phys);
+    if (!k) return;
+    struct { uint64_t va; unsigned n; } hit[24];
+    int nh = 0;
+    uint64_t all = 0;
+    for (uint64_t o = 0; o + 8 <= k_top - k_phys; o += 8) {
+        uint64_t v = rd64(k + o);
+        if (v < k_virt || (v & 3)) continue;
+        uint64_t pa = v - k_virt + k_phys;
+        int in = 0;
+        for (int i = 0; i < g_nts && !in; i++) in = pa >= g_ts[i].pa && pa < g_ts[i].end;
+        if (!in) continue;
+        all++;
+        int j = 0;
+        while (j < nh && hit[j].va != v) j++;
+        if (j < nh) hit[j].n++;
+        else if (nh < 24) hit[nh].va = v, hit[nh].n = 1, nh++;
+    }
+    say("gunyah: stall: %llu values in the kernel's data point into the timer's stubs or the fix-ups%s\n", (unsigned long long)all,
+        all ? ":" : " (no fault or interrupt was taken inside one)");
+    for (int j = 0; j < nh; j++) {
+        uint64_t pa = hit[j].va - k_virt + k_phys;
+        int fix = 0;
+        for (int i = 0; i < g_nts; i++) if (pa >= g_ts[i].pa && pa < g_ts[i].end) fix = g_ts[i].fix;
+        const uint32_t *c = hv_phys_ptr(M, pa & ~3ull, 32);
+        if (!c) continue;
+        say("gunyah: stall:   %#llx (pa %#llx, %s) %u times; the code there: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+            (unsigned long long)hit[j].va, (unsigned long long)pa, fix ? "a fix-up" : "a timer stub", hit[j].n, c[0], c[1], c[2], c[3],
+            c[4], c[5], c[6], c[7]);
+    }
+}
+
 static void dump_msgbuf(void) {
     if (!k_phys || k_top <= k_phys) return;
     const uint8_t *k = hv_phys_ptr(M, k_phys, k_top - k_phys);
@@ -1547,6 +1641,7 @@ static void dump_msgbuf(void) {
         }
     }
     if (!found) say("gunyah: no kernel log (msgbuf) found in the kernel's data yet\n");
+    stall_stubs();
     /* 0.3.87: 0.3.86's log ended "failed to find the timer" (harmless: the JIT's boots print it too), then "MACH Reboot"
        a quarter millisecond later: that is the panic path's restart (kdp_machine_reboot_type), and a panic's text goes
        to the panic buffer and the console, not to msgbuf. Every "panic(cpu" in the Mac's RAM is logged with what
