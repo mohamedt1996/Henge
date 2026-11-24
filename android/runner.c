@@ -20,7 +20,7 @@
 /* Graphics: reims (pvg_reims.c): what crossed to the app's GPU device. */
 void hv_pvg_reims_activity(uint64_t *requests, uint64_t *irqs);
 uint64_t hv_pvg_reims_wait_ns(void);
-void hv_pvg_reims_wait_split(uint64_t v[7]);
+void hv_pvg_reims_wait_split(uint64_t v[9]);
 int hv_pvg_reims_spin_us(void);
 
 static void curl_global_init_all(void) { curl_global_init(CURL_GLOBAL_ALL); }
@@ -509,15 +509,16 @@ static void *install_heartbeat(void *arg) {
                     (wait - last_wait) / 1e9, hv_pvg_reims_spin_us());
             last_wait = wait;
             {
-                static uint64_t was[7];
-                uint64_t v[7], d[7];
+                static uint64_t was[9];
+                uint64_t v[9], d[9];
                 hv_pvg_reims_wait_split(v);
-                for (int i = 0; i < 7; i++) d[i] = v[i] - was[i], was[i] = v[i];
+                for (int i = 0; i < 9; i++) d[i] = v[i] - was[i], was[i] = v[i];
                 fprintf(stderr, " [waits: %llu answered awake (%.0f us each), %llu slept for (%.0f us each); of them %llu for the "
                                 "CPU's own write before (%.0f us each, %llu slept for)]",
                         (unsigned long long)d[0], d[0] ? d[1] / 1e3 / (double)d[0] : 0.0, (unsigned long long)d[2],
                         d[2] ? d[3] / 1e3 / (double)d[2] : 0.0, (unsigned long long)d[4], d[4] ? d[5] / 1e3 / (double)d[4] : 0.0,
                         (unsigned long long)d[6]);
+                fprintf(stderr, " [posting an access took %.0f us each, %.1f s in all]", d[7] ? d[8] / 1e3 / (double)d[7] : 0.0, d[8] / 1e9);
             }
         }
         if (disk != last_disk || cmds != last_gpu) moved = 1;

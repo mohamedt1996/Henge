@@ -688,6 +688,18 @@ static const char reports_script[] =
     "date; } > \"$I\" 2>&1 </dev/null\n"
     "curl -fsS -o /dev/null -T \"$I\" \"$U/\" </dev/null && n=$((n+1)) && echo '  henge-clock-info.txt'\n"
     "rm -f \"$I\"\n"
+    /* 0.3.127: "the sound stops when the mouse stops moving". Does an idle Mac wake late? A thousand 10 ms sleeps with
+       nobody touching anything: how many overran, and the longest. */
+    "T=/tmp/henge-timer-test.txt\n"
+    "echo 'A 12 second timing test now: please do not touch the screen or the mouse until it says Sent.'\n"
+    "sleep 2\n"
+    "perl -MTime::HiRes=usleep,time -e '$a=$b=$c=$m=0; for (1..1000) { $t=time; usleep(10000); $d=(time-$t)*1000; "
+    "$a++ if $d>20; $b++ if $d>50; $c++ if $d>200; $m=$d if $d>$m } "
+    "printf \"1000 sleeps of 10 ms, hands off: %d took over 20 ms, %d over 50 ms, %d over 200 ms; the longest %.1f ms\\n\", $a, $b, $c, $m' "
+    "> \"$T\" 2>&1 </dev/null\n"
+    "cat \"$T\"\n"
+    "curl -fsS -o /dev/null -T \"$T\" \"$U/\" </dev/null && n=$((n+1)) && echo '  henge-timer-test.txt'\n"
+    "rm -f \"$T\"\n"
     "echo \"Sent $n files to Henge. On the tablet: Henge, the log, Save the full log to Downloads.\"\n";
 
 /* And back. The wallpaper stays as it is: pick one in System Settings. */

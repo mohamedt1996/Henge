@@ -37,6 +37,7 @@ typedef struct {
     /* 0.3.126: the waits apart: answers seen while still awake and those slept for, and of both the ones that were
        for this thread's own posted write (a doorbell the next access has to wait out). Counts and ns. */
     uint64_t awake_n, awake_ns, slept_n, slept_ns, pend_n, pend_ns, pend_slept_n;
+    uint64_t post_n, post_ns; /* 0.3.127: the posting itself (the futex wake of the app's thread, and what follows it on this core) */
 } Reims;
 
 static Reims R;
@@ -204,9 +205,10 @@ static int wait_answer(HvReimsSlot *s, uint64_t began, int pending) {
     return rc;
 }
 
-/* For the heartbeat: seven counts, as in Reims. */
-void hv_pvg_reims_wait_split(uint64_t v[7]) {
+/* For the heartbeat: nine counts, as in Reims. */
+void hv_pvg_reims_wait_split(uint64_t v[9]) {
     v[0] = R.awake_n, v[1] = R.awake_ns, v[2] = R.slept_n, v[3] = R.slept_ns, v[4] = R.pend_n, v[5] = R.pend_ns, v[6] = R.pend_slept_n;
+    v[7] = R.post_n, v[8] = R.post_ns;
 }
 
 static uint64_t forward(int device, int write, uint64_t off, uint64_t value, unsigned size) {
@@ -236,6 +238,9 @@ static uint64_t forward(int device, int write, uint64_t off, uint64_t value, uns
     s->sent_ns = began;
     __atomic_store_n(&s->state, HV_REIMS_REQUEST, __ATOMIC_RELEASE);
     futex(&s->state, FUTEX_WAKE, 1, NULL);
+    /* 0.3.126's split: the waits themselves were 2 s of the 8 s counted per 30 s; the rest lies between `began` and the
+       wait, which is this call (the woken thread may be put on this core, before this one goes on). Timed. */
+    __atomic_fetch_add(&R.post_n, 1, __ATOMIC_RELAXED), __atomic_fetch_add(&R.post_ns, now_ns() - began, __ATOMIC_RELAXED);
     if (write && posted_writes()) {
         my_pending = 1, my_pending_since = began;
         __atomic_fetch_add(&R.h->requests, 1, __ATOMIC_RELAXED);

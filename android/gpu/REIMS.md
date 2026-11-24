@@ -1592,3 +1592,19 @@ slept, and paid two wake-ups. Now that wait is awake from when it begins (HV_REI
 and the heartbeat line splits the waits: answered awake and slept for, their mean times, and the share that was for
 the CPU's own write before. Sound in that run: 150 to 1220 ms of silence per 30 s with the Mac's buffers up to 2.9 s
 apart (the Mac standing still: disk time 24 to 27 s of 30, the fast cores held to 1.7 GHz).
+
+0.3.127 (2026-11-24): 0.3.126's start, 24 MHz, 15 minutes, with the reports. The user: "the sound stops if the mouse
+stops moving".
+- Sound: 12 of 20 half minutes with no silence at all and buffers 85.4 ms apart (41 to 136); the others 5 to 740 ms
+  of silence with buffers up to 3.5 s apart, the stream running throughout (five starts and stops in the run). In
+  the Mac's own log three "skipping cycle due to overload" in 15 minutes (hundreds before 24 MHz). hw.tbfrequency
+  24000000, commpage +0x90 0.
+- Safari's GPU process: one crash (pid 609, SIGSEGV in malloc_type_calloc under libdispatch, not the audio thread's
+  recursion), its successor 788 played on.
+- The GPU's waits, split: 93% of answers seen awake in 7 to 9 us, 7% slept for at 600 to 1100 us; together 2 s of
+  the 7 to 11 s counted per 30 s. The rest lies before the wait: the posting (FUTEX_WAKE). Timed now.
+- "fastest core held to 1.7 of 2.8 GHz" for ten minutes at 63 to 73 C: a cap, not heat.
+What the log cannot say is why an idle Mac's sound stops: the Mac's buffers stop coming, the pump was not late.
+Measured now, each 30 s: the longest a vCPU stayed inside one GH_VCPU_RUN, the kicks, the kicker's and the device
+thread's longest pauses (both on the slow cores since 0.3.125). And /.henge/reports ends with a hands-off test in
+the Mac (a thousand 10 ms sleeps: how many overran, the longest) as henge-timer-test.txt.

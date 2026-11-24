@@ -133,6 +133,8 @@ static int irq_fd[NIRQ];
 static volatile uint8_t irq_level[NIRQ];
 static volatile uint64_t rings[NIRQ];  /* doorbell rings per interrupt (0.3.98: the silence report shows them) */
 static volatile uint64_t dev_ticks;    /* device-thread passes (each runs the devices' completions) */
+static uint64_t now_ns(void);
+static volatile uint64_t dev_gap_max; /* the device thread's longest pause since the last 30 s line */
 static volatile uint64_t uart_last_ns; /* when the kernel last wrote the serial port */
 static volatile uint64_t fault_pa;     /* 0.3.99: the next read here by vCPU 0 is answered with an abort (see watch_thread) */
 static uint64_t handoff[2048];  /* the hand-over pages, as the shim reads them (16 KB) */
@@ -457,9 +459,14 @@ static void *device_thread(void *arg) {
     thread_altstack();
     HvCpu *cpu0 = hv_vm_cpu(0);
     struct pollfd p = {.fd = dev_kick, .events = POLLIN};
-    uint64_t n = 0;
+    uint64_t n = 0, pass_at = now_ns();
     while (!stop_req) {
         if (poll(&p, 1, 1) > 0) { uint64_t v; if (read(dev_kick, &v, sizeof v) < 0) { } }
+        {
+            uint64_t t = now_ns();
+            if (t - pass_at > dev_gap_max) dev_gap_max = t - pass_at;
+            pass_at = t;
+        }
         if (M->tick) M->tick(M, cpu0);
         dev_ticks++;
         /* Lines a device still holds high: ring again, in case the guest finished with the last ring. */
@@ -2047,12 +2054,33 @@ static uint64_t saved_exits[HV_MAX_CPUS]; /* exits that came back with a signal 
    them anyway. */
 static volatile uint64_t run_since[HV_MAX_CPUS]; /* when this vCPU's current GH_VCPU_RUN began (0: not in one) */
 static uint64_t kicks_sent[HV_MAX_CPUS];
+/* 0.3.127: "the sound stops when the mouse stops moving". What the engine can see of an idle Mac, every 30 s: how
+   long a vCPU stayed inside one GH_VCPU_RUN at most (a WFI wait that nothing ended), how late this 2 ms kicker and the
+   1 ms device thread ran at most (both keep to the slow cores since 0.3.125), and the kicks sent. */
+static volatile uint64_t stay_max[HV_MAX_CPUS], stay_long[HV_MAX_CPUS], kick_late_max;
 static void *kick_thread(void *arg) {
     (void)arg;
     thread_altstack();
+    uint64_t said_at = now_ns(), kicks_was = 0;
     while (!stop_req) {
+        uint64_t before = now_ns();
         usleep((useconds_t)kick_ms * 1000);
         uint64_t now = now_ns();
+        if (now - before > kick_late_max) kick_late_max = now - before;
+        if (mac_runs && now - said_at >= 30000000000ull) {
+            char line[400];
+            int n = 0;
+            uint64_t kicks = 0;
+            for (int i = 0; i < nvcpu && n < (int)sizeof line - 48; i++) {
+                n += snprintf(line + n, sizeof line - (size_t)n, " vcpu%d %.0f ms (%llu of 100 ms or more)", i, stay_max[i] / 1e6,
+                              (unsigned long long)stay_long[i]);
+                stay_max[i] = 0, stay_long[i] = 0, kicks += kicks_sent[i];
+            }
+            say("gunyah: last 30 s: the longest a CPU stayed in the Mac without coming back:%s; %llu kicks; the kicker's longest "
+                "sleep %.1f ms (2 asked), the device thread's longest pause %.1f ms (1 asked)\n", line,
+                (unsigned long long)(kicks - kicks_was), kick_late_max / 1e6, dev_gap_max / 1e6);
+            kicks_was = kicks, kick_late_max = 0, dev_gap_max = 0, said_at = now;
+        }
         for (int i = 0; i < nvcpu; i++) {
             uint64_t t = run_since[i];
             if (t && now > t && now - t >= 20000000ull) kick_vcpu(i), kicks_sent[i]++;
@@ -2087,9 +2115,15 @@ static void *vcpu_thread(void *arg) {
            first exit seen was the second store), so its RAM was not cleaned and it hung: "cpu 1 failed to boot" again.
            exit_reason is cleared before each run, and an interrupted run that left an exit behind is handled as one. */
         r->exit_reason = GH_VCPU_EXIT_UNKNOWN;
-        run_since[id] = now_ns();
+        uint64_t in_at = now_ns();
+        run_since[id] = in_at;
         int rc = ioctl(vcpu_fd[id], GH_VCPU_RUN, 0);
         run_since[id] = 0;
+        {
+            uint64_t stayed = now_ns() - in_at;
+            if (stayed > stay_max[id]) stay_max[id] = stayed;
+            if (stayed >= 100000000ull) stay_long[id]++;
+        }
         if (rc < 0) {
             if (errno == EINTR || errno == EAGAIN) {
                 if (kicks_back[id]++ == 0) say("gunyah: vCPU %d came back on a signal: the kicks work\n", id);
