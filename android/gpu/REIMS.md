@@ -1555,3 +1555,9 @@ may FAR):
 - Programs: mach_absolute_time goes to the kernel (trap -3) when the commpage's +0x90 is 0, as set; +0x91 (a hardware
   clock for mach_continuous_time) is 0 in this Mac's commpage, so that one asks the kernel as well. A program that
   reads CNTVCT_EL0 itself, not through these, would still see 19.2 MHz; none is known.
+
+0.3.124 (2026-11-24): 0.3.123's start: "the kernel's call of recount_leave_user was found 6 times (once is needed)",
+so nothing was rewritten and the Mac booted on the counter's own rate, as it is meant to when unsure (the panic text
+in that log is the old report still in RAM and on disk). The surroundings alone were too loose. Now a candidate must
+also end in fleh_dispatch64's jump to the handler within four instructions of mov x0, x21: br x22 (d61f02c0) or
+braa x22, sp (d71f0adf). Every loose candidate is logged with its 16 words, so a miss can be read from the log.

@@ -893,7 +893,7 @@ static int kpatch(void) {
         for (int r = 0; r < nxr; r++) {
             uint32_t *w = hv_phys_ptr(M, xr[r].pa, xr[r].size);
             if (!w || zs[r] < 16) continue;
-            for (uint64_t i = 0; i + 16 < zs[r]; i++) {
+            for (uint64_t i = 0; i + 20 < zs[r]; i++) {
                 if (w[i] != 0xaa0003f5u || w[i + 1] != 0xaa0103f6u) continue; /* mov x21, x0; mov x22, x1 */
                 int bl = -1, nbl = 0, back = 0;
                 for (int k = 2; k < 14 && !back; k++) {
@@ -901,6 +901,17 @@ static int kpatch(void) {
                     else if (w[i + k] == 0xaa1503e0u) back = k; /* mov x0, x21 */
                 }
                 if (nbl != 1 || !back || bl > back) continue;
+                /* 0.3.123 found six such places. fleh_dispatch64's ends in the jump to the handler: br x22, or
+                   braa x22, sp where the kernel is built with pointer authentication. Each candidate is logged. */
+                int disp = 0;
+                for (int k = back + 1; k < back + 5 && !disp; k++)
+                    disp = w[i + k] == 0xd61f02c0u || w[i + k] == 0xd71f0adfu;
+                fprintf(stderr, "gunyah: a call between mov x21, x0; mov x22, x1 and mov x0, x21 at pa %#llx%s: %08x %08x %08x "
+                                "%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                        (unsigned long long)(xr[r].pa + i * 4), disp ? " (then the jump through x22: fleh_dispatch64)" : "",
+                        w[i], w[i + 1], w[i + 2], w[i + 3], w[i + 4], w[i + 5], w[i + 6], w[i + 7], w[i + 8], w[i + 9], w[i + 10],
+                        w[i + 11], w[i + 12], w[i + 13], w[i + 14], w[i + 15]);
+                if (!disp) continue;
                 found++, fr = r, fi = i + (uint64_t)bl;
             }
         }
