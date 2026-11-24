@@ -120,8 +120,15 @@
 
     .text
     .balign 4
-    .global hv_gunyah_fix_start, hv_gunyah_fix_end
-hv_gunyah_fix_start:
+#ifdef HV_FIX_TB                        /* host/gunyah_fixup_tb.S: the same, and the timer's traps (0.3.121) */
+#define FIX_START hv_gunyah_fixtb_start
+#define FIX_END hv_gunyah_fixtb_end
+#else
+#define FIX_START hv_gunyah_fix_start
+#define FIX_END hv_gunyah_fix_end
+#endif
+    .global FIX_START, FIX_END
+FIX_START:
     sub  sp, sp, #128
     stp  x0, x1, [sp, #0]
     stp  x2, x3, [sp, #16]
@@ -130,7 +137,11 @@ hv_gunyah_fix_start:
     mrs  x0, esr_el1
     lsr  x1, x0, #26
     cmp  x1, #0x25                      /* data abort at EL1 */
+#ifdef HV_FIX_TB
+    b.ne tbcheck
+#else
     b.ne decline
+#endif
     tbnz x0, #24, decline               /* with a syndrome: Gunyah could have done it, so not ours */
     and  x1, x0, #0x3f
     cmp  x1, #0x10                      /* synchronous external abort */
@@ -439,6 +450,78 @@ svtab:
     br   x17
     .endr
 
+#ifdef HV_FIX_TB
+/* 0.3.121: the Mac's clock at 24 MHz on a 19.2 MHz counter. gunyah.c makes each generic-timer instruction of the
+   kernel the permanently undefined word 0x00007a00 | op << 5 | Rt (exception class 0), carried out here:
+   op 0-5 read CNTVCT, CNTPCT, CNTVCTSS, CNTPCTSS, CNTV_CVAL, CNTP_CVAL: the value and a quarter of it;
+   op 6-7 read CNTV_TVAL, CNTP_TVAL: the signed 32-bit value and a quarter of it; op 8 reads CNTFRQ: 24,000,000;
+   op 9-12 write CNTV_CVAL, CNTP_CVAL, CNTV_TVAL, CNTP_TVAL: the value less a fifth of it (TVAL: of its signed 32 bits). */
+tbcheck:
+    cbnz x1, decline                    /* class 0: an undefined instruction */
+    mrs  x0, elr_el1
+    str  x0, [sp, #64]
+    ldr  w3, [x0]
+    lsr  w1, w3, #9
+    cmp  w1, #0x3d                      /* 0x00007a00 >> 9 */
+    b.ne decline
+    ubfx x4, x3, #5, #4                 /* op */
+    cmp  x4, #12
+    b.hi decline
+    cmp  x4, #9
+    b.lo 1f
+    and  x1, x3, #31
+    CALL getreg                         /* a write: x2 = Rt (x3, x4 kept) */
+    cmp  x4, #11
+    b.lo 0f
+    sxtw x2, w2
+0:  mov  x1, #5
+    sdiv x1, x2, x1
+    sub  x2, x2, x1
+1:  adr  x16, ttab
+    add  x16, x16, x4, lsl #3
+    br   x16
+ttab:
+    mrs  x2, cntvct_el0
+    b    tbrs
+    mrs  x2, cntpct_el0
+    b    tbrs
+    mrs  x2, S3_3_C14_C0_6              /* CNTVCTSS_EL0 */
+    b    tbrs
+    mrs  x2, S3_3_C14_C0_5              /* CNTPCTSS_EL0 */
+    b    tbrs
+    mrs  x2, cntv_cval_el0
+    b    tbrs
+    mrs  x2, cntp_cval_el0
+    b    tbrs
+    mrs  x2, cntv_tval_el0
+    b    tbrt
+    mrs  x2, cntp_tval_el0
+    b    tbrt
+    movz x2, #0x3600
+    b    tbrf
+    msr  cntv_cval_el0, x2
+    b    done
+    msr  cntp_cval_el0, x2
+    b    done
+    msr  cntv_tval_el0, x2
+    b    done
+    msr  cntp_tval_el0, x2
+    b    done
+tbrf:
+    movk x2, #0x16e, lsl #16            /* 24,000,000 */
+    b    tbset
+tbrt:
+    sxtw x2, w2
+    add  x2, x2, x2, asr #2
+    b    tbset
+tbrs:
+    add  x2, x2, x2, lsr #2
+tbset:
+    and  x1, x3, #31
+    CALL setreg
+    b    done
+#endif
+
 decline:
     ldp  x0, x1, [sp, #0]
     ldp  x2, x3, [sp, #16]
@@ -447,4 +530,4 @@ decline:
     add  sp, sp, #128
     .word 0                             /* the vector's own first instruction (gunyah.c) */
     .word 0                             /* b vector + 4 (gunyah.c) */
-hv_gunyah_fix_end:
+FIX_END:

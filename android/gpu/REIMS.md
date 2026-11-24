@@ -1505,3 +1505,25 @@ fix-ups all sat elsewhere than in a boot that works, possibly in another code ra
 - on a stall, every value in the kernel's data that is the address of a timer stub or fix-up is counted and logged
   with the code there ("stall: ..."): a fault loop or an interrupt inside one leaves its return address behind.
 Exact, the default, runs none of this but the counting.
+
+0.3.121 (2026-11-24): 0.3.120's log, two starts. Exact booted and shut down as ever. 24 MHz stopped after 182 exits,
+before any kernel text, and the new lines say why:
+- "timer stubs: code range 0 (..., 11532 bytes of zeros at its end, 10604 taken by the other stubs and fix-ups): 77
+  stubs" and "code range 7 (pa 0x78575410, 1554 KB, 399460 bytes of zeros at its end ...): 725 of other ranges": the
+  kernel's text has 11.5 KB of padding, three fix-ups of 3436 bytes fill it, and 725 timer stubs went into range 7.
+- "stall: 10570 values ... 0xfffffe002269ae24 (a timer stub) 10218 times; the code there: fffffe00 2269ae60 ...": no
+  code is left where the stubs were, but frame records, and one stub's address saved 10218 times: a fault at that
+  stub, taken again and again down the stack. Range 7's zeros are the kernel's own zeroed data, not padding (it does
+  not start on a page; the Exact start's report shows a table of names where the fourth fix-up had been written).
+  So 0.3.119 failed the same way, and its "all go through stubs" was true only of the writing.
+- Known and left alone, since Exact boots with it: the fourth fix-up (the second table's SPx entry) lies in that data.
+Now no stubs: each of the kernel's 809 timer instructions becomes the undefined word 0x00007a00 | op << 5 | Rt, and a
+second copy of the fix-up (host/gunyah_fixup_tb.S: gunyah_fixup.S with HV_FIX_TB, 240 bytes more; the first assembles
+to the same 3436 bytes as before, compared) takes exception class 0 with that word at ELR and carries it out: counter
+and compare reads plus a quarter, count-down reads sign-extended plus a quarter, CNTFRQ 24,000,000, writes less a
+fifth. tests/test_gunyah_fixup_tb.py runs the assembled handler in Unicorn: 178 cases (every register for a read,
+x16/x17 and the saved ones, the values written, five kinds of exception it must pass on) all right; Unicorn keeps no
+compare value, so those are checked at the MSR. 24 MHz is taken only if every table's SP0 fix-up lies in page padding
+(under 16 KB of zeros at a range's end); else nothing is rewritten and the Mac gets the counter's own rate.
+What has not run: any of it on the tablet. Each kernel read of the time is now an exception at EL1 (no hypervisor
+exit); and programs ask the kernel for the time (commpage +0x90 = 0), so the 24 MHz clock costs CPU time by design.
