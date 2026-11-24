@@ -1463,3 +1463,28 @@ log does not say why (its crash report will).
 - For the driver: the device logs each of its requests (a refused one too) and, every 30 s, how its buffers arrive
   and go back (gaps, bursts, how many out at once) and the first 36 events after a start; /.henge/reports also
   sends the files under /System/Library that hold "AVIODevice" (under 40 MB) and what is loaded.
+
+0.3.119 (2026-11-24): Safari's videos played with Sound: Off (0.3.118: no sound device, no sound thread). The Mac sent
+its sound driver (/System/Library/Audio/Plug-Ins/HAL/AppleVirtIOSound.driver, a HAL plug-in of 4,700 instructions),
+read here from its disassembly:
+- It never takes its time from the device. Its zero timestamps are a chain of dispatch_after blocks, each adding one
+  period (0.26 s of frames: rate x 260 / 1000) and that period's ticks by mach_timebase_info to the last; its sound
+  goes out on a 24 Hz timer, each period (a twelfth of a second rounded up to a page: 4096 frames) as soon as the
+  mix has filled it, twelve periods of ring; a returned buffer only frees ring space. So 0.3.115's latency_bytes,
+  0.3.116's clock and 0.3.117's pacing could not change what coreaudiod saw, and did not.
+- kern.timer.coalescing_enabled=0 in the Mac (the two latenesses, 6 to 8 and 74 to 80 ms, looked like XNU's 5 and
+  75 ms coalescing tiers): no change to the ear.
+- What is wrong is in coreaudiod's own lines: in all 307 overload reports of four runs (two told 19 MHz, two 19.2)
+  it takes one IO cycle, 1024 frames at 48 kHz, for 511,999 ticks. That is 24 MHz, every Apple Silicon Mac's
+  timebase, whatever this kernel was told; the two latenesses are 5 and 60 ms of 24 MHz ticks counted at 19.2.
+  The driver's timestamps follow the real timebase, coreaudiod's cycles a fixed 24 MHz: a quarter apart, a re-anchor
+  about each fourth timestamp. On the JIT the Mac's counter is 24 MHz, and there sound is right and Safari plays.
+- Settings > Mac's clock: 24 MHz (HV_GUNYAH_TIMEBASE=24; Exact stays the default): where the counter is 19.2 MHz the
+  kernel's reads of the counters and compare values answer c + c/4, its writes of compare and count-down values take
+  a fifth off, CNTFRQ answers 24 MHz, the device tree keeps its 24 MHz, and the commpage's byte at +0x90 is set to 0
+  so that programs ask the kernel for the time instead of reading the counter (offsets as in XNU's
+  cpu_capabilities.h; mach_absolute_time's fallback is in libsyscall). The stubs' encodings were assembled and read
+  back here; none of it has run. Every start now counts the kernel's timer instructions and says where the commpage
+  is, whichever clock is chosen.
+- /.henge/reports sends henge-clock-info.txt (the timebase by sysctl, the commpage's first 512 bytes, two clocks a
+  second apart) in place of the driver.

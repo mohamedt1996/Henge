@@ -382,6 +382,71 @@ static void *pac_thread(void *arg) {
     return NULL;
 }
 
+/* ---- the Mac's clock at 24 MHz (0.3.119) ----
+   Every Apple Silicon Mac's timebase is 24 MHz, and macOS's sound server counts on it: in each of the 307 overload
+   reports of four runs coreaudiod takes one IO cycle of 1024 frames at 48 kHz for 511,999 ticks (24 MHz; 409,600 at
+   the tablet's 19.2), whatever the kernel was told. Its cycles and the sound driver's timestamps (which follow
+   mach_timebase_info) then disagree by a quarter: a re-anchor and an overload about once a second, the cuts in
+   Chrome, and what Safari's GPU process dies logging. On the JIT the Mac's counter is 24 MHz and sound is right.
+
+   HV_GUNYAH_TIMEBASE=24 (Settings > Mac's clock: 24 MHz), where the counter is 19.2 MHz (24 = 19.2 x 5/4, as the JIT
+   scales it): the kernel's reads of the counter go through stubs that answer c + c/4, its writes of the timers'
+   compare and count-down values through stubs that take a fifth off, CNTFRQ reads answer 24 MHz, and the device
+   tree keeps its 24 MHz. Programs read the counter themselves where the kernel's commpage says they may (a byte at
+   +0x90: 0 none, 1 to 3 how), unscaled; that byte is set to 0 once the kernel has made the page, and
+   mach_absolute_time asks the kernel instead. */
+static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static int g_tb24;        /* the counter is scaled for the Mac */
+static uint64_t g_ct_seen[6], g_ct_done, g_ct_left;
+
+static int commpage_like(const uint8_t *c, int ncpu) {
+    if (c[0x24] != 14 || c[0x25] != 14 || c[0x37] != 14) return 0; /* user and kernel page shifts: 16 KB */
+    if (c[0x22] != ncpu || c[0x35] != ncpu) return 0;              /* CPUs configured, physical */
+    uint64_t mem;
+    memcpy(&mem, c + 0x38, 8);
+    return mem >= (1ull << 30) && mem <= (64ull << 30) && c[0x90] <= 3;
+}
+
+static void *commpage_thread(void *arg) {
+    (void)arg;
+    thread_altstack();
+    while (!stop_req && !mac_runs) usleep(10000);
+    uint8_t *at[4];
+    int nat = 0, said = 0, set = 0;
+    for (int pass = 0; pass < 1200 && !stop_req; pass++) { /* two minutes */
+        if (!nat || pass % 50 == 0) {
+            nat = 0;
+            for (int r = 0; r < M->nram && nat < 4; r++) {
+                uint8_t *p = (uint8_t *)M->ram[r].host;
+                for (uint64_t o = 0; o + 0x4000 <= M->ram[r].size && nat < 4; o += 0x4000)
+                    if (commpage_like(p + o, nvcpu)) {
+                        at[nat++] = p + o;
+                        if (said < 4) {
+                            char hex[2 * 0xa0 + 1];
+                            for (int i = 0; i < 0xa0; i++) snprintf(hex + 2 * i, 3, "%02x", p[o + (uint64_t)i]);
+                            say("gunyah: a commpage at pa %#llx (programs' own counter reads: %u; its first 160 bytes %s)\n",
+                                (unsigned long long)(M->ram[r].pa + o), p[o + 0x90], hex);
+                            said++;
+                        }
+                    }
+            }
+        }
+        if (g_tb24)
+            for (int i = 0; i < nat; i++)
+                if (at[i][0x90]) {
+                    __atomic_store_n(&at[i][0x90], 0, __ATOMIC_RELEASE);
+                    if (set++ < 4) say("gunyah: that commpage now sends programs to the kernel for the time (the scaled counter)\n");
+                }
+        if (!g_tb24 && nat) break; /* only said, where the counter is not scaled */
+        if (pass == 300 && !nat)
+            say(g_tb24 ? "gunyah: NO COMMPAGE FOUND after 30 s: programs in the Mac read the unscaled counter, their time runs a fifth "
+                         "slow against the kernel's. Settings > Mac's clock: Exact\n"
+                       : "gunyah: no commpage found after 30 s (its layout is not the one looked for)\n");
+        usleep(100000);
+    }
+    return NULL;
+}
+
 /* ---- devices ---- */
 
 static void *device_thread(void *arg) {
@@ -622,6 +687,15 @@ static int kpatch(void) {
     int nvec = 0;
     const char *kp = getenv("HV_GUNYAH_KEEP_PAC");
     int keep_pac = kp && *kp == '1';
+    {
+        uint64_t hz;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(hz));
+        const char *t = getenv("HV_GUNYAH_TIMEBASE");
+        g_tb24 = t && !strcmp(t, "24") && hz == 19200000;
+        if (t && !strcmp(t, "24") && !g_tb24)
+            fprintf(stderr, "gunyah: the Mac's clock at 24 MHz is for a 19.2 MHz counter; this one is %llu Hz: its own rate is told\n",
+                    (unsigned long long)hz);
+    }
     for (int r = 0; r < nxr; r++) {
         uint32_t *w = hv_phys_ptr(M, xr[r].pa, xr[r].size);
         pools[r] = xr[r].size / 4;
@@ -721,6 +795,59 @@ static int kpatch(void) {
                 pool += 5, sctlr++;
                 continue;
             }
+            {
+                /* 0.3.119: the generic timer. 1: a read of a counter or a compare value (CNTVCT, CNTPCT, their
+                   self-synchronized forms, CNTV_CVAL, CNTP_CVAL); 2: a read of a count-down (TVAL); 3: a write of a
+                   compare value; 4: a write of a count-down; 5: a read of CNTFRQ. Counted always; rewritten for the
+                   24 MHz clock. */
+                uint32_t op = x & ~31u;
+                int kind = op == 0xd53be040u || op == 0xd53be020u || op == 0xd53be0c0u || op == 0xd53be0a0u || op == 0xd53be340u ||
+                           op == 0xd53be240u ? 1
+                         : op == 0xd53be300u || op == 0xd53be200u ? 2
+                         : op == 0xd51be340u || op == 0xd51be240u ? 3
+                         : op == 0xd51be300u || op == 0xd51be200u ? 4
+                         : op == 0xd53be000u ? 5 : 0;
+                if (kind) {
+                    g_ct_seen[kind]++;
+                    if (g_tb24 && rt != 31) {
+                        static const uint8_t need[6] = {0, 3, 4, 7, 8, 3};
+                        if (pool + need[kind] > n || (int64_t)((pool - i) * 4) >= (120ll << 20)) { g_ct_left++; continue; }
+                        uint64_t site = xr[r].pa + i * 4, stub = xr[r].pa + pool * 4;
+                        uint32_t *c = &w[pool], a = rt == 16 ? 17 : 16, b = rt == 16 ? 16 : 17;
+                        int k = 0;
+                        if (kind == 1) {
+                            c[k++] = x;                                        /* mrs xt, <counter> */
+                            c[k++] = 0x8b400800u | rt << 16 | rt << 5 | rt;    /* add xt, xt, xt, lsr #2 */
+                        } else if (kind == 2) {
+                            c[k++] = x;                                        /* mrs xt, <tval> */
+                            c[k++] = 0x93407c00u | rt << 5 | rt;               /* sxtw xt, wt */
+                            c[k++] = 0x8b800800u | rt << 16 | rt << 5 | rt;    /* add xt, xt, xt, asr #2 */
+                        } else if (kind == 3) {
+                            c[k++] = 0xa9bf47f0u;                              /* stp x16, x17, [sp, #-16]! */
+                            c[k++] = 0xd28000a0u | a;                          /* mov xa, #5 */
+                            c[k++] = 0x9ac00800u | a << 16 | rt << 5 | a;      /* udiv xa, xt, xa */
+                            c[k++] = 0xcb000000u | a << 16 | rt << 5 | a;      /* sub xa, xt, xa: four fifths, rounded up */
+                            c[k++] = op | a;                                   /* msr <cval>, xa */
+                            c[k++] = 0xa8c147f0u;                              /* ldp x16, x17, [sp], #16 */
+                        } else if (kind == 4) {
+                            c[k++] = 0xa9bf47f0u;                              /* stp x16, x17, [sp, #-16]! */
+                            c[k++] = 0x93407c00u | rt << 5 | a;                /* sxtw xa, wt */
+                            c[k++] = 0xd28000a0u | b;                          /* mov xb, #5 */
+                            c[k++] = 0x9ac00c00u | b << 16 | a << 5 | b;       /* sdiv xb, xa, xb */
+                            c[k++] = 0xcb000000u | b << 16 | a << 5 | a;       /* sub xa, xa, xb */
+                            c[k++] = op | a;                                   /* msr <tval>, xa */
+                            c[k++] = 0xa8c147f0u;                              /* ldp x16, x17, [sp], #16 */
+                        } else {
+                            c[k++] = 0xd286c000u | rt;                         /* mov xt, #0x3600 */
+                            c[k++] = 0xf2a02dc0u | rt;                         /* movk xt, #0x16e, lsl #16: 24,000,000 */
+                        }
+                        c[k] = branch(stub + (uint64_t)k * 4, site + 4);
+                        w[i] = branch(site, stub);
+                        pool += (uint64_t)k + 1, g_ct_done++;
+                    }
+                    continue;
+                }
+            }
             if ((top13 == 0xd5380000u || top13 == 0xd5180000u) && (crn == 15 || crn == 11)) { /* implementation defined */
                 if (top13 == 0xd5380000u) w[i] = rt == 31 ? NOP : MOVZ_X(rt), impl_r++;
                 else w[i] = NOP, impl_w++;
@@ -787,6 +914,12 @@ static int kpatch(void) {
             (unsigned long long)impl_r, (unsigned long long)impl_w, (unsigned long long)midr, (unsigned long long)APPLE_MIDR,
             midr_left ? " (some left: no room for their stubs)" : "", (unsigned long long)pac, (unsigned long long)sctlr);
 
+    fprintf(stderr, "gunyah: the kernel's generic timer: %llu reads of a counter or compare value, %llu of a count-down, %llu "
+                    "writes of a compare value, %llu of a count-down, %llu reads of CNTFRQ; %s%s\n",
+            (unsigned long long)g_ct_seen[1], (unsigned long long)g_ct_seen[2], (unsigned long long)g_ct_seen[3],
+            (unsigned long long)g_ct_seen[4], (unsigned long long)g_ct_seen[5],
+            g_tb24 ? "all go through stubs: the Mac's clock is 24 MHz (the counter's 19.2 MHz times 5/4)" : "as they are",
+            g_ct_left ? " (SOME LEFT: no room for their stubs; Settings > Mac's clock: Exact)" : "");
     /* The timebase: the kernel's tree says the 24 MHz Henge's JIT counts; Gunyah gives the CPU's own counter. */
     uint64_t f;
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
@@ -801,7 +934,8 @@ static int kpatch(void) {
        19 MHz every 0.26 s buffer came back 2.7 ms "late" by the Mac's: coreaudiod re-anchored its clock each fourth one
        (10.7 ms, "host time is not consecutive") and reported an overload, once a second, for the whole of 0.3.115's run. */
     int tb_exact = !(tbm && !strcmp(tbm, "whole"));
-    if (!tb_exact && f % 1000000 && (f + 500000) / 1000000 > 0) f = (f + 500000) / 1000000 * 1000000;
+    if (g_tb24) f = 24000000; /* 0.3.119: the kernel's counter reads are scaled to it */
+    else if (!tb_exact && f % 1000000 && (f + 500000) / 1000000 > 0) f = (f + 500000) / 1000000 * 1000000;
     int changed = 0;
     if (dtva >= virt && dtlen > 8) {
         uint64_t dtpa = dtva - virt + phys;
@@ -863,7 +997,10 @@ static int kpatch(void) {
             }
         }
     }
-    if (f == counter_hz)
+    if (g_tb24)
+        fprintf(stderr, "gunyah: the kernel's timebase-frequency: %d changed, 24000000 Hz (the CPU's counter, %llu Hz, reaches the "
+                        "kernel scaled by 5/4)\n", changed, (unsigned long long)counter_hz);
+    else if (f == counter_hz)
         fprintf(stderr, "gunyah: the kernel's timebase-frequency: %d set to the CPU's %llu Hz%s\n", changed, (unsigned long long)f,
                 f % 1000000 ? " (not a whole MHz: the Mac's microsecond clock steps back each second; Settings > Mac's clock)" : "");
     else
@@ -2162,9 +2299,9 @@ int hv_gunyah_run(void) {
     clean_all_ram();
     /* 0.3.96: the helpers are joined before this returns: detached, they went on reading the Mac's RAM (the PAC scan,
        the stall dump) and Henge's devices after the machine was taken down, the "Segmentation fault" after a stop. */
-    pthread_t helper[6];
+    pthread_t helper[8];
     int nhelper = 0;
-    void *(*helpers[])(void *) = {device_thread, pac_thread, watch_thread, clean_thread};
+    void *(*helpers[])(void *) = {device_thread, pac_thread, watch_thread, clean_thread, commpage_thread};
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 8u << 20);

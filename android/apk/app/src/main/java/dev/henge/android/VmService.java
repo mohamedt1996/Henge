@@ -1363,8 +1363,9 @@ public class VmService extends Service {
         else if (ram != null && ram.contains("plain")) b.append(" HV_GUNYAH_RAM=plain");
         // 0.3.113: Settings > Mac's clock. Exact: the kernel is told the counter's own rate (19.2 MHz), as up to 0.3.112.
         // 0.3.116: Exact is the default again (Whole MHz made the Mac's sound clock reset once a second).
-        b.append("whole".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("gunyahClock116", "exact"))
-                ? " HV_GUNYAH_TIMEBASE=whole" : " HV_GUNYAH_TIMEBASE=exact");
+        // 0.3.119: 24 MHz: the counter scaled for the Mac, as every Apple Silicon Mac's is (host/gunyah.c).
+        String clock = getSharedPreferences("henge", MODE_PRIVATE).getString("gunyahClock116", "exact");
+        b.append("whole".equals(clock) ? " HV_GUNYAH_TIMEBASE=whole" : "24".equals(clock) ? " HV_GUNYAH_TIMEBASE=24" : " HV_GUNYAH_TIMEBASE=exact");
         return b.toString();
     }
     static String sq(String s) { return "'" + s.replace("'", "'\\''") + "'"; }

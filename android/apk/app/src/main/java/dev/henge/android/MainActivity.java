@@ -871,15 +871,22 @@ public class MainActivity extends Activity {
         enote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(enote);
         c.addView(hairline());
-        if ("gunyah".equals(engineMode())) { // 0.3.113; 0.3.116: Exact by default (host/gunyah.c: the kernel's timebase-frequency)
-            final boolean whole = "whole".equals(prefs.getString("gunyahClock116", "exact"));
-            c.addView(choiceRow("Mac's clock", new String[]{"Exact", "Whole MHz"}, whole ? 1 : 0,
-                    i -> { prefs.edit().putString("gunyahClock116", i == 1 ? "whole" : "exact").apply(); render(true); }));
-            TextView cnote = text(whole
+        if ("gunyah".equals(engineMode())) { // 0.3.113; 0.3.116: Exact by default; 0.3.119: 24 MHz (host/gunyah.c)
+            final String clock = prefs.getString("gunyahClock116", "exact");
+            final int ci = "24".equals(clock) ? 1 : "whole".equals(clock) ? 2 : 0;
+            c.addView(choiceRow("Mac's clock", new String[]{"Exact", "24 MHz", "Whole MHz"}, ci,
+                    i -> { prefs.edit().putString("gunyahClock116", i == 1 ? "24" : i == 2 ? "whole" : "exact").apply(); render(true); }));
+            TextView cnote = text(ci == 1
+                    ? "Experimental (0.3.119), for sound. Every Apple Silicon Mac's timer ticks at 24 MHz and macOS's sound system "
+                        + "counts on it; the Mi Pad 7's ticks at 19.2 MHz. Here macOS's kernel is given the tablet's timer times "
+                        + "5/4, and programs ask the kernel for the time. It changes how the Mac starts on Gunyah: if the Mac does "
+                        + "not start, or its clock or its pace is wrong, choose Exact."
+                    : ci == 2
                     ? "macOS is told the nearest whole MHz (19 on the Mi Pad 7). Its microseconds count right, but its clock "
-                        + "runs 1% fast against the tablet's, and its sound cuts out about once a second (0.3.115's run)."
-                    : "macOS is told the tablet's timer rate as it is (19.2 MHz on the Mi Pad 7), so its clock and its sound "
-                        + "keep the tablet's pace. Its microsecond clock steps back up to 10 ms every second.", 13, DIM, false);
+                        + "runs 1% fast against the tablet's."
+                    : "macOS is told the tablet's timer rate as it is (19.2 MHz on the Mi Pad 7): how the Mac has started on "
+                        + "Gunyah so far. Its sound cuts out about once a second and Safari's videos stop (macOS's sound system "
+                        + "counts on 24 MHz): try 24 MHz.", 13, DIM, false);
             cnote.setPadding(dp(17), 0, dp(17), dp(12));
             c.addView(cnote);
             c.addView(hairline());
