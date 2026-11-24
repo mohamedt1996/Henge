@@ -88,6 +88,25 @@ static void *pump_thread(void *unused) {
                 else A.sent++;
             }
         }
+        /* 0.3.115: every 30 s of playing, what the Mac's side of the sound did, if anything: silence a pull had to add
+           (the Mac was late with its sound: a cut) and buffers that found the ring full (the Mac ahead of the player). */
+        {
+            static uint64_t passes, cuts0, short0, full0, late0;
+            static uint64_t late; /* pulls that started 30 ms or more behind their time */
+            if (A.d && ++passes % 3000 == 0) {
+                uint64_t cuts = A.d->underruns - cuts0, sh = A.d->short_bytes - short0, full = A.d->ring_full - full0;
+                unsigned fb = A.channels * bytes_per ? A.channels * bytes_per : 1;
+                if (cuts || full || late != late0)
+                    fprintf(stderr, "hengevm: sound: last 30 s: the Mac was late with its sound %llu time(s), %llu ms of silence "
+                                    "played for it; the ring was full %llu time(s); the engine's pump ran 30 ms or more late %llu time(s)\n",
+                            (unsigned long long)cuts, (unsigned long long)(sh / fb * 1000 / (A.rate ? A.rate : 48000)),
+                            (unsigned long long)full, (unsigned long long)(late - late0));
+                cuts0 = A.d->underruns, short0 = A.d->short_bytes, full0 = A.d->ring_full, late0 = late;
+            }
+            struct timespec t;
+            clock_gettime(CLOCK_MONOTONIC, &t);
+            if (was_running && (int64_t)(t.tv_sec - next.tv_sec) * 1000000000 + (t.tv_nsec - next.tv_nsec) > 30000000) late++;
+        }
         pthread_mutex_unlock(&A.mu);
         /* The next 10 ms, by the clock; after a pause or a stall, from now. */
         struct timespec now;

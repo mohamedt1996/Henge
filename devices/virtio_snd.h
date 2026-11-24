@@ -48,6 +48,9 @@ typedef struct HvVirtioSnd {
     uint64_t pending_end[HV_VSND_PENDING]; /* `written` after this buffer's data */
     uint32_t phead, pcopy, ptail; /* pcopy: next one whose audio is not yet in the ring */
     uint64_t underruns, xfers;
+    /* 0.3.115, for the backend's 30 s line: bytes of silence a pull had to add while the stream ran (the guest was
+       late: a cut), and how often a waiting buffer found the ring full (the guest ahead of the player). */
+    uint64_t short_bytes, ring_full;
 } HvVirtioSnd;
 
 HvVirtioSnd *hv_virtio_snd_create(HvMachine *m, HvPcie *bus);

@@ -185,7 +185,7 @@ static void fill_ring(HvVirtioSnd *d) {
         len = len > 4 ? len - 4 : 0;
         uint64_t w = atomic_load(&d->written);
         if (len > HV_VSND_RING) len = HV_VSND_RING;
-        if (w + len - atomic_load(&d->consumed) > HV_VSND_RING) return; /* full: later */
+        if (w + len - atomic_load(&d->consumed) > HV_VSND_RING) { d->ring_full++; return; } /* full: later */
         uint32_t off = 0;
         while (off < len) {
             uint32_t at = (uint32_t)((w + off) % HV_VSND_RING), n = len - off;
@@ -233,8 +233,15 @@ void hv_virtio_snd_poll(HvVirtioSnd *d) {
         HvVirtqElem *e = &d->pending[d->phead % HV_VSND_PENDING];
         uint8_t st[8] = {0};
         put32(st, S_OK);
-        uint64_t queued = atomic_load(&d->written) - c;
-        put32(st + 4, (uint32_t)queued); /* latency_bytes */
+        /* latency_bytes. 0.3.115: 0, as QEMU's device answers. Up to 0.3.114 this was what the ring still held, about
+           one of the guest's buffers (a quarter second); in 0.3.114's run coreaudiod refused every timestamp of the
+           sound device as about that far in the future ("Out of bounds host time detected", each 0.26 s), re-anchored
+           its clock and reported IO overloads: the cuts in Chrome's sound, and what Safari's GPU process dies logging.
+           HV_SND_LATENCY=1 answers the ring's fill again. */
+        static int report_latency = -1;
+        if (report_latency < 0) { const char *e = getenv("HV_SND_LATENCY"); report_latency = e && *e == '1'; }
+        uint64_t queued = report_latency ? atomic_load(&d->written) - c : 0;
+        put32(st + 4, (uint32_t)queued);
         hv_virtq_write(v, e, 0, st, 8);
         hv_virtq_push(v, TXQ, e, 8);
         d->phead++;
@@ -259,7 +266,7 @@ uint32_t hv_virtio_snd_pull(HvVirtioSnd *d, void *buf, uint32_t len) {
     }
     if (n < len) {
         memset((uint8_t *)buf + n, 0, len - n);
-        if (d->running) d->underruns++;
+        if (d->running) d->underruns++, d->short_bytes += len - n;
     }
     /* compare-exchange: a release on the CPU thread may have moved it on */
     atomic_compare_exchange_strong(&d->consumed, &c, c + n);

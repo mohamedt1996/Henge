@@ -1381,3 +1381,24 @@ log does not say why (its crash report will).
   before the first desktop on Gunyah (2026-11-23).
 - The ten panic-full reports are one panic (2026-11-21, incident 4A8369BC), written again at every start: the
   "shut down because of a problem" notice at each boot is that one.
+
+0.3.115 (2026-11-24): 0.3.114's run on Gunyah, its log, the reports and the Mac's sound log.
+- reims_protect_kept.py was the cause: "(Henge) protect_max: the kernel refuses protection 0x1 for 0x4000 bytes ...
+  (Permission denied)", then no nil no-copy buffer, no faulted task and no "Trying to restart GPU" in the whole run
+  (0.3.113: 229 of each). Of the Mac's programs only Safari's GPU process and BiomeAgent crashed (0.3.113's and the
+  runs before: ten more, of damaged memory). Frames at up to 58 a second.
+- Slower all the same: the tablet was hot before it began. Fastest core held to 1.7 to 1.9 of 2.8 GHz for the whole
+  run (0.3.113: 2.2 to 2.5), 84 C a minute in; the Mac's CPU threads ran 57 to 70% of the time (0.3.113: 34 to 46%).
+- Sound, from coreaudiod's own log: every timestamp of the sound device is refused, "Out of bounds host time
+  detected", each exactly 0.26 s of the Mac's clock after the last and 180 to 250 ms ahead of the bound; then
+  "Re-anchoring IO timeline" (TimeStampOutOfLine) and "HALS_OverloadMessage: Overload possibly due to safety
+  violation" (100 in the 8000 lines kept). Those are the cuts in Chrome. Safari's GPU process logs "Throwing
+  Exception: not (the_error == 0)" 1437 times (Thread_Utilities.cpp) and dies: the recursion of 0.3.114's notes,
+  entered after an overload. The app's player lost nothing meanwhile (0 gaps, 70 ms dropped in the run).
+- A test, not a proven fix: the device's transmit status answered latency_bytes = what its ring still held, about
+  one of the guest's 0.26 s buffers, the same quarter second the timestamps are ahead by. It answers 0 now, as QEMU's
+  virtio-snd does (HV_SND_LATENCY=1: as before). The next sound log says whether "Out of bounds host time" is gone.
+- The engine's pump says every 30 s, when there is something: how often and for how many ms the Mac was late with
+  its sound (silence played), how often the ring was full, how often the pump itself ran 30 ms late.
+- At 19 MHz the Mac makes 1.05% more sound than the tablet plays; the 0.68 s ring absorbs about a minute of it. The
+  "ring was full" count will show whether that matters; Mac's clock: Exact takes it away.
