@@ -302,7 +302,14 @@ static void sample_threads(void) {
 }
 
 static void on_log(void *ctx, RvgLogLevel level, const char *target, size_t tl, const char *msg, size_t ml) {
-    (void)ctx, (void)level;
+    (void)ctx;
+    /* 0.3.106: debug lines only from the library's OS layer (views of guest pages: why a remap is refused), the
+       first 60: the 0.3.105 run's ring and root page "could not be mapped" with nothing saying why. */
+    if (level >= RVG_LOG_DEBUG) {
+        static int shown;
+        if (tl < 20 || memcmp(target, "reims_vgpu_vulkan::os", tl < 21 ? tl : 21) || shown >= 60) return;
+        shown++;
+    }
     hlog("reims %.*s: %.*s", (int)tl, target, (int)ml, msg);
     if (ml >= 17 && !memcmp(msg, "stamp wait report", 17)) sample_wanted = 1;
 }
@@ -817,6 +824,26 @@ static int bring_up(Host *h) {
     if (h->ram == MAP_FAILED) { h->ram = NULL; hlog("reims: mapping guest RAM: %s", strerror(errno)); return -1; }
     hlog("reims: guest RAM mapped at %p (%s the guest's 16 KiB pages)", (void *)h->ram,
          (uintptr_t)h->ram & 0x3fff ? "NOT on" : "on");
+    {   /* 0.3.106: what reims-vgpu does for each view of guest pages (a ring, a root page): the RAM's file mapped
+           again, shared, at a page's offset over a reserved range. The 0.3.105 run's views were all refused. */
+        struct stat st;
+        int fl = fcntl(h->ram_fd, F_GETFL), seals = fcntl(h->ram_fd, 1034 /* F_GET_SEALS */);
+        uint64_t off = h->ram_size > (0x0ae98000ull + 0x4000) ? 0x0ae98000ull : 0x4000;
+        void *any = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE, MAP_SHARED, h->ram_fd, (off_t)off);
+        int e1 = any == MAP_FAILED ? errno : 0;
+        void *res = mmap(NULL, 0x4000, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        void *fix = res == MAP_FAILED ? MAP_FAILED : mmap(res, 0x4000, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, h->ram_fd, (off_t)off);
+        int e2 = fix == MAP_FAILED ? errno : 0;
+        int same = any != MAP_FAILED && memcmp(any, h->ram + off, 64) == 0;
+        hlog("reims: the RAM's file: %lld MB, %s, seals %#x; a page of it mapped again at +%#llx: %s%s, at a fixed address: %s%s%s",
+             fstat(h->ram_fd, &st) == 0 ? (long long)(st.st_size >> 20) : -1LL,
+             (fl & O_ACCMODE) == O_RDWR ? "read-write" : (fl & O_ACCMODE) == O_RDONLY ? "READ-ONLY" : "write-only", seals,
+             (unsigned long long)off, any == MAP_FAILED ? "REFUSED: " : "ok", any == MAP_FAILED ? strerror(e1) : "",
+             fix == MAP_FAILED ? "REFUSED: " : "ok", fix == MAP_FAILED ? strerror(e2) : "",
+             any != MAP_FAILED ? (same ? " (the same bytes)" : " (DIFFERENT bytes)") : "");
+        if (any != MAP_FAILED) munmap(any, 0x4000);
+        if (res != MAP_FAILED) munmap(res, 0x4000);
+    }
 
     RvgMemoryRange range = {h->ram_pa, h->ram_size, h->ram};
     RvgMemoryMap map = {&range, 1};
@@ -1001,7 +1028,7 @@ int reims_host_start(const char *path, const char *log_path, const char *home, c
     pthread_mutex_init(&h->show_lock, NULL);
     pthread_mutex_init(&h->reg_lock, NULL);
     pthread_cond_init(&h->wake, NULL);
-    rvg_log_set_handler(on_log, NULL, RVG_LOG_INFO);
+    rvg_log_set_handler(on_log, NULL, RVG_LOG_DEBUG);
     install_crash_log();
     stage = "waiting for the engine's file";
     H = h;

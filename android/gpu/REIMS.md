@@ -1261,3 +1261,12 @@ kernel: the fileset at pa 0x7497c000 has __TEXT at 0xfffffe0007004000, the unsli
 not virtBase + (pa - physBase) (physBase's page held zeros). So the hand-over was off and the JIT booted recoveryOS.
 The kernel's header is now the first fileset (or plain kernel) linked in the kernel's half of the address space;
 with the RAM cleared, the user program 0.3.104 patched can no longer come first.
+
+0.3.107 (2026-11-24): read in full, 0.3.105's run (the JIT booting recoveryOS after the hand-over was declined) shows
+reims never working on the reserved RAM: the GPU saw 34 register accesses in 3 minutes, "ring of 0x4000 bytes at
+0x7ae98000 could not be mapped", "root page 0x1ed0c not mapped: no root node", "root FIFO not created", and
+WindowServer died of SIGABRT after 63 s, twice (waiting on a GPU that never started). Every view reims-vgpu makes of
+guest pages (the RAM's file mapped again, shared, at a page's offset) was refused, with the reason at debug level.
+The app now logs the OS layer's debug lines (the first 60) and, once the RAM is mapped, maps a page of the RAM's file
+again itself, anywhere and at a fixed address, with the file's size, access mode and seals: the next log says which
+part refuses.
