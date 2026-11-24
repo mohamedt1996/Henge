@@ -466,6 +466,11 @@ public class VmService extends Service {
             // Settings > Cores for the Mac: Off leaves them where Android puts them, as before.
             if (!install && gunyah() && !"off".equals(prefs.getString("coreTuning", "on")))
                 pb.environment().put("HV_CPU_HELPERS_SLOW", "1");
+            // 0.3.128, Gunyah: the app's threads that answer the Mac's GPU registers keep off the Mac's CPUs' cores
+            // (android/pvg_reims.c, android/gpu/reims/host.c), and the engine's own memory stays out of swap (host/gunyah.c).
+            if (!install && gunyah() && !"off".equals(prefs.getString("coreTuning", "on")))
+                pb.environment().put("HV_REIMS_OFF_MAC_CORES", "1");
+            if (!install && gunyah()) pb.environment().put("HV_GUNYAH_MLOCK", "1");
             // Settings > Big core: Leave out (the default) keeps the Mac's CPUs off a core faster than all the others.
             pb.environment().put("HV_CPU_PRIME", "use".equals(prefs.getString("bigCore", "avoid")) ? "1" : "0");
             String coreKept = "";

@@ -392,6 +392,16 @@ static void fast_find(void) {
     pthread_t th;
     if (pthread_create(&th, NULL, fast_again, NULL) == 0) pthread_detach(th);
 }
+/* The cores the Mac's CPUs may run on, a bit each (0: no fast and slow cores to tell apart). */
+uint64_t hv_runner_mac_cores(void) {
+    if (getenv("HV_CPU_ANY")) return 0;
+    pthread_once(&fast_once, fast_find);
+    uint64_t m = 0;
+    for (int i = 0; i < 64 && i < fast_total; i++)
+        if (CPU_ISSET(i, &fast_set)) m |= 1ull << i;
+    return m;
+}
+
 void hv_host_cpu_thread(void) {
     if (getenv("HV_CPU_ANY")) return;
     pthread_once(&fast_once, fast_find);

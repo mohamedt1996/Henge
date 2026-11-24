@@ -62,7 +62,10 @@ typedef struct {
     /* 0.3.125: the mode macOS set (0s before it has), written by the app: places on the Mac's screen are reckoned by
        it, not by the mode offered first (macOS keeps the resolution chosen in its Displays settings). */
     uint32_t mode_w, mode_h;
-    uint64_t pad[5];
+    /* 0.3.128: the tablet's cores the Mac's CPUs run on, one bit each (0: not told), written by the engine: the app
+       keeps the threads that answer the Mac's GPU registers off them. */
+    uint64_t mac_cores;
+    uint64_t pad[4];
     HvReimsSlot slot[HV_REIMS_SLOTS];
 } HvReimsHeader;
 

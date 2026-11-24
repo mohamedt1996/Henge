@@ -1608,3 +1608,23 @@ What the log cannot say is why an idle Mac's sound stops: the Mac's buffers stop
 Measured now, each 30 s: the longest a vCPU stayed inside one GH_VCPU_RUN, the kicks, the kicker's and the device
 thread's longest pauses (both on the slow cores since 0.3.125). And /.henge/reports ends with a hands-off test in
 the Mac (a thousand 10 ms sleeps: how many overran, the longest) as henge-timer-test.txt.
+
+0.3.128 (2026-11-25): 0.3.127's start (24 MHz, 20 minutes, Cores for the Mac: Off, reports with the timer test).
+- The end: the tablet ran short of memory. Its last two minutes: 450 to 590 MB available, 2.2 GB swapped in and 2.3
+  out per 30 s, "waiting for memory 18 to 19% of the time (everything stalled 12%)", the Mac's CPUs waiting 26% for a
+  core, 0.7 to 12 frames a second at 4 to 26 ms a frame, 2512 ms of silence, the engine with 4400 to 5200 faults
+  waiting for swap per 30 s; System Settings' panes were being opened; then a clean shut down.
+- Before that: nine half minutes in a row without any silence.
+- The posting of a GPU access, timed: 60 to 310 us each, 2 to 5 s per 30 s, three quarters and more of the CPUs'
+  waiting on the GPU; the waits themselves: 93% seen awake after 5 to 8 us, 7% slept for (300 to 1000 us).
+- The idle measures: no vCPU stayed in the Mac over 70 ms but in the last half minute (113 and 175 ms); the kicker
+  slept up to 10 to 49 ms where 2 are asked, the device thread paused up to 12 to 52 ms where 1 is. A stay ends at
+  any exit or kick, so it says nothing of a late timer inside the Mac; the Mac's own test does: of 1000 sleeps of
+  10 ms, hands off, 35 took over 20 ms, 11 over 50, 2 over 200, the longest 270 ms (run in the short-of-memory end).
+Changes, Gunyah:
+- The app's register threads keep off the Mac's CPUs' cores (HvReimsHeader.mac_cores, HV_REIMS_OFF_MAC_CORES=1 with
+  Settings > Cores for the Mac: On). Reading of the 60 to 310 us: FUTEX_WAKE puts the woken thread (nice -10) on the
+  waker's core, ahead of the CPU's thread; it answers and stays awake 150 us for a next access that cannot come.
+  Not seen directly: the next log's "posting an access took" says.
+- The engine's own memory is locked as it is touched (HV_GUNYAH_MLOCK=1; mlockall with MCL_ONFAULT; no file of the
+  disks is mapped, the Mac's RAM is pinned already).

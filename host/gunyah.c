@@ -2432,6 +2432,20 @@ int hv_gunyah_run(void) {
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 8u << 20);
     hv_machine_wake_hook = kick_devices; /* a finished disk request reaches the device thread at once, not at its next 1 ms */
+    /* 0.3.128 (HV_GUNYAH_MLOCK=1): 0.3.127's last two minutes, the tablet short of memory (450 to 590 MB available,
+       2.2 GB swapped in and 2.3 out per 30 s): "the engine took 908 page faults, 4399 of them waiting for swap or
+       storage", each with a CPU of the Mac's or a device behind it. The engine's own pages (some 80 MB beside the
+       Mac's RAM, which is pinned already) stay in memory from here: locked as they are touched, not all at once. */
+    {
+        const char *ml = getenv("HV_GUNYAH_MLOCK");
+        if (ml && *ml == '1') {
+#ifndef MCL_ONFAULT
+#define MCL_ONFAULT 4
+#endif
+            int rc = mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT);
+            fprintf(stderr, "gunyah: the engine's own memory is kept out of swap: %s\n", rc == 0 ? "locked as it is touched" : strerror(errno));
+        }
+    }
     for (unsigned h = 0; h < sizeof helpers / sizeof *helpers; h++)
         if (pthread_create(&helper[nhelper], &attr, helpers[h], NULL) == 0) nhelper++;
     pthread_mutex_lock(&kill_mu); /* the ids are written before any kick reads them */

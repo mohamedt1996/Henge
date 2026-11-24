@@ -21,6 +21,7 @@
 #include <ftw.h>
 #include <linux/futex.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -607,9 +608,30 @@ static void reg_report(Host *h) {
              (unsigned long long)count, reach / 1e6, reach / 1e3 / count, device / 1e6, device / 1e3 / count, top[0] ? top : "none");
 }
 
+/* 0.3.128: this thread off the cores the Mac's CPUs run on (HvReimsHeader.mac_cores), where the engine told them:
+   woken by a CPU's thread it was put on that thread's core, ahead of it, and held it through its 150 us awake.
+   Android gives a thread its group's cores again when the process changes groups, so this is done again now and then. */
+static void off_mac_cores(Host *h) {
+    static int said;
+    uint64_t mask = h->h ? __atomic_load_n(&h->h->mac_cores, __ATOMIC_ACQUIRE) : 0;
+    if (!mask) return;
+    long n = sysconf(_SC_NPROCESSORS_CONF);
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    int left = 0;
+    for (long i = 0; i < n && i < 64; i++)
+        if (!(mask >> i & 1)) CPU_SET((int)i, &set), left++;
+    if (!left) return;
+    int rc = sched_setaffinity(0, sizeof set, &set);
+    if (!__atomic_exchange_n(&said, 1, __ATOMIC_ACQ_REL))
+        hlog("reims: the register threads keep to the %d cores that are not the Mac's CPUs' (mask %#llx)%s%s", left,
+             (unsigned long long)mask, rc ? ": REFUSED: " : "", rc ? strerror(errno) : "");
+}
+
 static void *slot_loop(void *arg) {
     HvReimsSlot *s = arg;
     Host *h = H;
+    unsigned naps = 0;
     /* Ahead of the app's ordinary threads: a CPU of the Mac's stands still until this one answers. */
     setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), -10);
     uint64_t idle_since = now_ns();
@@ -621,6 +643,7 @@ static void *slot_loop(void *arg) {
                 cpu_relax();
                 continue;
             }
+            if ((naps++ & 255) == 0) off_mac_cores(h);
             struct timespec t = {0, 200 * 1000000};
             futex(&s->state, FUTEX_WAIT, HV_REIMS_IDLE, &t);
             idle_since = now_ns() - 150000; /* woken: look once, then sleep again unless there is work */

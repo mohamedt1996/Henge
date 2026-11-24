@@ -211,7 +211,24 @@ void hv_pvg_reims_wait_split(uint64_t v[9]) {
     v[7] = R.post_n, v[8] = R.post_ns;
 }
 
+uint64_t hv_runner_mac_cores(void);
+
 static uint64_t forward(int device, int write, uint64_t off, uint64_t value, unsigned size) {
+    /* 0.3.128 (HV_REIMS_OFF_MAC_CORES=1, Gunyah): 0.3.127 timed the posting of an access at 60 to 300 us, three quarters
+       of all the CPUs' waiting on the GPU, where the answer itself is seen 6 us after. The app's thread for this CPU,
+       woken, is put on this CPU's core ahead of this thread (it is the more urgent one), answers, and then stays awake
+       150 us for the next access, which cannot come while it holds the core. Told which cores are the Mac's CPUs', the
+       app keeps those threads off them (android/gpu/reims/host.c). From a CPU's thread, so the cores are known. */
+    static int told;
+    if (!told && !__atomic_exchange_n(&told, 1, __ATOMIC_ACQ_REL)) {
+        const char *v = getenv("HV_REIMS_OFF_MAC_CORES");
+        if (v && *v == '1') {
+            uint64_t m = hv_runner_mac_cores();
+            __atomic_store_n(&R.h->mac_cores, m, __ATOMIC_RELEASE);
+            fprintf(stderr, "hengevm: reims: the app is told the Mac's CPUs' cores (mask %#llx): its register threads keep off them\n",
+                    (unsigned long long)m);
+        }
+    }
     if (my_slot < 0) {
         my_slot = __atomic_fetch_add(&R.nslots, 1, __ATOMIC_ACQ_REL);
         if (my_slot >= HV_REIMS_SLOTS) { fprintf(stderr, "hengevm: reims: more GPU threads than slots\n"); abort(); }
