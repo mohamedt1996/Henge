@@ -560,11 +560,11 @@ static int kpatch(void) {
     fprintf(stderr, "gunyah: boot_args at pa %#llx: kernel at virtual %#llx = physical %#llx, its data to %#llx, device tree "
                     "at %#llx (%u bytes)\n", (unsigned long long)(VMAPPLE_MEM + (uint64_t)ba), (unsigned long long)virt,
             (unsigned long long)phys, (unsigned long long)top, (unsigned long long)dtva, dtlen);
-    /* The kernel collection's header: an arm64 Mach-O (a fileset, or a plain kernel) whose __TEXT sits where
-       boot_args' mapping puts it (virtBase + (pa - physBase)). 0.3.104: the first Mach-O from physBase on was a
+    /* The kernel collection's header: an arm64 Mach-O (a fileset, or a plain kernel) linked in the kernel's half of
+       the address space. 0.3.104: the first Mach-O from physBase on was a
        user program's (__TEXT at 0x100000000; the reserved RAM keeps the last run's pages, and recoveryOS's ramdisk
        holds binaries), so nothing was patched and the kernel died on its first pointer authentication. Now only a
-       header consistent with the kernel's own mapping is taken, looked for from 64 MB below physBase to its data's end. */
+       kernel's header is taken, looked for from 64 MB below physBase to its data's end. */
     uint64_t hdr = 0, base_vm = 0, lo = phys > VMAPPLE_MEM + (64ull << 20) ? (phys - (64ull << 20)) & ~0x3fffull : VMAPPLE_MEM;
     uint64_t hi = top > phys ? top : phys + (256ull << 20);
     int seen = 0;
@@ -581,11 +581,14 @@ static int kpatch(void) {
                 if (cmd == 0x19 && size >= 72 && rd64(lc + o + 40) == 0 && rd64(lc + o + 48)) { bv = rd64(lc + o + 24); break; }
                 o += size;
             }
-            int fits = bv && bv == virt + (pa - phys);
+            /* The load commands hold the kernel's unslid addresses (0.3.105's run: the fileset at pa 0x7497c000, __TEXT
+               at 0xfffffe0007004000, 64 MB past physBase, whose page is zeros), so the test is the kind: a fileset, or
+               a plain kernel, linked in the kernel's half of the address space; a user program never is. */
+            int fits = bv >= 0xfffffe0000000000ull && (rd32(h + 12) == 12 || rd32(h + 12) == 2);
             if (seen++ < 6)
                 fprintf(stderr, "gunyah: a Mach-O at pa %#llx (%s, __TEXT at %#llx)%s\n", (unsigned long long)pa,
                         rd32(h + 12) == 12 ? "fileset" : "executable", (unsigned long long)bv,
-                        fits ? ": the kernel's" : ": not where the kernel's mapping puts it, passed over");
+                        fits ? ": the kernel's" : ": not the kernel's (a user program's, or a fileset entry's), passed over");
             if (fits) { hdr = pa, base_vm = bv; break; }
         }
     if (!hdr) {

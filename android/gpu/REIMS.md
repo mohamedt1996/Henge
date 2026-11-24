@@ -1255,3 +1255,9 @@ boot_args' own mapping puts the kernel's __TEXT (virtBase + (pa - physBase)), lo
 the kernel's data end, each candidate logged; with none, or under 1 MB of code, the hand-over is off and Henge's CPUs
 go on. henge-reserve's pages, which held the last run's RAM (its kernels and the old panic texts this log kept
 finding), are cleared at the engine's start.
+
+0.3.106 (2026-11-24): 0.3.105 cleared the reserved RAM (119 ms) and its stricter search then passed over the real
+kernel: the fileset at pa 0x7497c000 has __TEXT at 0xfffffe0007004000, the unslid address its load commands carry,
+not virtBase + (pa - physBase) (physBase's page held zeros). So the hand-over was off and the JIT booted recoveryOS.
+The kernel's header is now the first fileset (or plain kernel) linked in the kernel's half of the address space;
+with the RAM cleared, the user program 0.3.104 patched can no longer come first.
