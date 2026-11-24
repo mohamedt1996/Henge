@@ -620,7 +620,10 @@ static void off_mac_cores(Host *h) {
     CPU_ZERO(&set);
     int left = 0;
     for (long i = 0; i < n && i < 64; i++)
-        if (!(mask >> i & 1)) CPU_SET((int)i, &set), left++;
+        if (!(mask >> i & 1)) {
+            CPU_SET((int)i, &set);
+            left++;
+        }
     if (!left) return;
     int rc = sched_setaffinity(0, sizeof set, &set);
     if (!__atomic_exchange_n(&said, 1, __ATOMIC_ACQ_REL))
