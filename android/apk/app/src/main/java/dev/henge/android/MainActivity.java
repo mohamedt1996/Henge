@@ -157,7 +157,7 @@ public class MainActivity extends Activity {
 
     /** Rebuilds the page when what it shows changes; the install progress page redraws every second. */
     private void render(boolean force) {
-        String sig = tab + "|" + VmService.state + "|" + VmService.busy() + "|" + VmService.installed(this) + "|" + details;
+        String sig = tab + "|" + VmService.state + "|" + VmService.busy() + "|" + VmService.shuttingDown() + "|" + VmService.installed(this) + "|" + details;
         boolean live = (tab == Tab.INSTALL && installing()) || (tab == Tab.SETTINGS) || (tab == Tab.INSTALL && failed());
         if (!force && sig.equals(lastSignature) && !live) return;
         int scrollY = 0;
@@ -252,7 +252,10 @@ public class MainActivity extends Activity {
         if (running) {
             hero.addView(primary("▶  Open Screen", true, v -> startActivity(new Intent(this, ScreenActivity.class))));
             hero.addView(gap(10));
-            hero.addView(secondary(VmService.instantResume(this) && !VmService.gunyah() ? "Save & Stop" : "Shut Down", BAD, v -> VmService.stop(this)));
+            // 0.3.112: Shut Down asks macOS to shut down; while it does, the same button ends the Mac at once.
+            String stopLabel = VmService.shuttingDown() ? "Force Stop"
+                    : VmService.instantResume(this) && !VmService.gunyah() ? "Save & Stop" : "Shut Down";
+            hero.addView(secondary(stopLabel, BAD, v -> VmService.stop(this)));
         } else {
             boolean saved = VmService.instantResume(this) && !VmService.gunyah() && VmService.resumeFile(this).exists();
             hero.addView(primary(saved ? "▶  Resume" : "▶  Start", !busy, v -> launch("run")));

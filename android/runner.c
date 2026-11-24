@@ -597,6 +597,40 @@ static void on_signal(int sig) {
     hv_vm_stop();
 }
 
+/* 0.3.112: Stop asks macOS to shut down (SIGUSR2) instead of ending it. A Mac ended by a kill shows "your computer
+   was shut down because of a problem" at its next start (0.3.111's black box after a Stop). vmapple's power button
+   (PL061 pin 3, where QEMU wires it) is pressed for 0.3 s: macOS asks "Are you sure you want to shut down your computer
+   now?", whose default button is Shut Down, and Return is pressed 5 s later for a screen nobody sees (a Mac taken back
+   without its GPU). macOS then shuts down as from its menu: apps quit, disks unmounted, "CPU halted". The app ends the
+   engine itself if macOS has not shut down within 90 s (an app asking to save, the question cancelled), or at a second
+   Stop. The pin is driven from this thread while the CPUs may read the GPIO block: a level the device's next update
+   picks up, as a host input pin is. */
+static sem_t power_asked;
+static void on_power_signal(int sig) {
+    (void)sig;
+    sem_post(&power_asked); /* async-signal-safe: the presser does the work */
+}
+
+static void *power_thread(void *unused) {
+    (void)unused;
+    for (;;) {
+        while (sem_wait(&power_asked) != 0) {}
+        HvVmapple *b = hv_vm_board();
+        if (stopping || !b || !b->gpio) continue;
+        fprintf(stderr, "hengevm: the power button pressed: macOS asks to shut down (Shut Down is its default)\n");
+        hv_pl061_set_input(b->gpio, 3, 1);
+        usleep(300000);
+        hv_pl061_set_input(b->gpio, 3, 0);
+        sleep(5);
+        if (stopping) continue;
+        fprintf(stderr, "hengevm: Return pressed for macOS's shut down question\n");
+        hv_vm_key_hid(0x28, 1); /* HID usage 0x28: Return */
+        usleep(80000);
+        hv_vm_key_hid(0x28, 0);
+    }
+    return NULL;
+}
+
 /* Settings > Instant resume (upstream's, host/snapshot.c). The app stops the Mac with SIGUSR1 instead of SIGTERM:
    it is paused at a block boundary, its disks flushed and idle, and the whole machine (CPUs, RAM, devices) written
    to HV_RESUME_FILE; the next start with the same Mac, settings and build of the engine picks it up from there
@@ -927,6 +961,14 @@ int main(int argc, char **argv) {
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGUSR1, resume_file ? on_save_signal : on_signal); /* without Instant resume, a stop like SIGTERM's */
+    if (!install_dir) {
+        sem_init(&power_asked, 0, 0);
+        pthread_t pt;
+        if (pthread_create(&pt, NULL, power_thread, NULL) == 0) {
+            pthread_detach(pt);
+            signal(SIGUSR2, on_power_signal);
+        }
+    }
     fprintf(stderr, "hengevm: %d CPUs, %llu MB, network %s, sound %s\n", hv_vm_ncpus(),
             (unsigned long long)vc.ram_mb, vc.no_net ? "off" : "on (NAT)", vc.no_sound ? "off" : "on");
     /* CPUs 1 and up need their own threads (parked until PSCI CPU_ON) and the 1 ms kicker. Without them
@@ -959,7 +1001,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "hengevm: stopped: macOS restarted; the app starts it again\n");
         return 3;
     }
-    fprintf(stderr, "hengevm: stopped: %s\n", reason == HV_GUNYAH_RESTART ? "restart" : hv_vm_reason_name(reason));
+    /* 0.3.112: named. On Gunyah a VM that ended by itself (status "exited", the kernel's last word not "MACH Reboot")
+       is macOS shut down; 0.3.111 said "other" for that and for a Stop alike. */
+    fprintf(stderr, "hengevm: stopped: %s\n", reason == HV_GUNYAH_RESTART ? "restart"
+                                               : stopping                 ? "the app ended the Mac (Stop)"
+                                               : gunyah && reason == 0    ? "macOS shut down"
+                                                                          : hv_vm_reason_name(reason));
     if (install_dir) {
         if (install_done != 0) return 1;
         fprintf(stderr, "henge: macOS is installed. Start it with: hengevm-android --mac %s\n", install_dir);

@@ -1316,3 +1316,26 @@ Picker 60). Three faults of that run, fixed:
   memory. The app now takes back a running engine (engine.pid, its cmdline checked) when it opens or is asked to
   start: the Mac shows as running, the GPU starts again in the app (the engine waits for it), and when the engine
   ends the app does what the run's shell would have (files handed back, settings restored).
+
+0.3.112 (2026-11-24): 0.3.111's run: no GPU crash, macOS's desktop at 7 to 40 frames/s in Chrome playing YouTube (23
+on average; each frame 2.5 to 4 ms of the tablet's GPU, so macOS's software video decoding sets the pace) and 50 to 59
+in Safari, the hottest sensor at 93 C during boot and 86 to 89 C during the video. No read of /proc/self/maps any
+more, but 145 no-copy buffers over task pages 0xf5 and 0xf9 still answered nil right after login, with no view of
+guest pages refused: the gap check answered for them, so part of each range is not mapped in the app at all. macOS
+restarted its GPU 224 times and the window it was drawing (the "shut down because of a problem" notice) stayed a
+black box. Safari's GPU process (com.apple.WebKit.GPU) crashed six times, so Safari would not play the video; the
+log does not say why (its crash report will).
+- reims_hole_why.py: for the first 4 such buffers, which pages do not read, whether the kernel maps the first of
+  them at all, what the backing table holds there and the kernel's mappings around it; and the first 8 task ranges
+  whose GPU page table maps fewer pages than asked.
+- Shut Down asks macOS to shut down: the engine presses vmapple's power button (PL061 pin 3, never driven before)
+  on SIGUSR2 and presses Return 5 s later for the question's default, Shut Down. The button reads Force Stop
+  meanwhile, and the app ends the engine itself if macOS is still up 90 s later. A Mac ended by a kill is what
+  showed that notice at the next start.
+- A Mac taken back after the app's crash: its screen cannot come back (its GPU's objects lived in the app's last
+  process; the new reims device answered "resumed FIFO 1 is not below the FIFO count 0" to every restart macOS
+  tried), so macOS is asked to shut down cleanly, where the engine is of this build. Its sound plays again.
+- Sound: a quarter of a second of buffer (a tenth before), the track starting once a tenth is in it and again after
+  a silence, and every 30 s with a gap or a drop a line says how many ("henge app: sound: last 30 s: ...").
+- The engine's last line says "macOS shut down" for a VM that ended by itself and "the app ended the Mac (Stop)"
+  for a stop, where 0.3.111 said "other" for both.

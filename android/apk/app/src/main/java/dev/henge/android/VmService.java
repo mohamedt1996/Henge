@@ -545,6 +545,7 @@ public class VmService extends Service {
         state = install ? (code == 0 ? "installed" : "install failed (" + code + ")")
                         : (code == 0 ? "stopped" : "stopped (" + code + ")");
         process = null;
+        shutdownAsked = 0;
         if (wake != null && wake.isHeld()) wake.release();
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
@@ -567,8 +568,7 @@ public class VmService extends Service {
         boolean reims = lastMode.startsWith("reims") || cmdline.contains("--gpu reims");
         long logFrom = log.length();
         logLastCrash(log);
-        appendLog(log, "henge app: the Mac was still running (engine " + pid + ") after the app's process ended: taken back"
-                + (reims ? "; the GPU starts again in the app (the picture comes back once macOS restarts its GPU)" : ""));
+        appendLog(log, "henge app: the Mac was still running (engine " + pid + ") after the app's process ended: taken back");
         if (reims && GpuView.loaded) {
             String vulkanLib = null;
             File t = "reims-turnip-henge".equals(lastMode) ? GpuView.turnipHenge(this)
@@ -576,6 +576,25 @@ public class VmService extends Service {
             if (t != null) vulkanLib = t.getPath();
             if (!GpuView.nativeReimsStart(new File(mac, "gpu.reims").getPath(), log.getPath(), reimsHomeDir(this).getPath(), vulkanLib))
                 appendLog(log, "henge app: the GPU could not start again; Stop the Mac and start it");
+        }
+        // 0.3.112: the sound too (0.3.111 took the Mac back silent).
+        if (!"off".equals(prefs.getString("sound", "on"))) new Thread(() -> playSound(log), "sound").start();
+        // 0.3.112: the Mac's screen cannot come back: its GPU's objects (FIFOs, root page) lived in the app's last
+        // process, and a new reims device has none of them (0.3.111's run: "resumed FIFO 1 is not below the FIFO count
+        // 0" at every restart macOS tried, no frame after). So macOS is asked to shut down cleanly (the engine presses
+        // its power button and confirms), not left running blind until a Stop ends it uncleanly.
+        if (reims) {
+            if (knowsShutDown(this)) {
+                try {
+                    Thread.sleep(3000); // the GPU up first: macOS's shut down draws through it
+                    signal(this, pid, 12);
+                    askedShutDown(this, pid, "the Mac's screen cannot come back after the GPU's crash (its GPU's state "
+                            + "was in the app's last process): macOS asked to shut down cleanly; start it again after");
+                } catch (Exception ignored) { }
+            } else {
+                appendLog(log, "henge app: the Mac's screen cannot come back after the GPU's crash, and its engine is of an "
+                        + "earlier build: Shut Down ends it");
+            }
         }
         while (liveEngine(this) == pid) {
             try { Thread.sleep(2000); } catch (InterruptedException ignored) { }
@@ -602,6 +621,7 @@ public class VmService extends Service {
         exportLog(this);
         adoptedPid = 0;
         state = "stopped";
+        shutdownAsked = 0;
         process = null;
         if (wake != null && wake.isHeld()) wake.release();
         stopForeground(STOP_FOREGROUND_REMOVE);
@@ -1204,6 +1224,11 @@ public class VmService extends Service {
         boolean said = false;
         while (busy()) {
             android.media.AudioTrack track = null;
+            // 0.3.112: the track starts once a tenth of a second is in it (not at its first bytes), and every 30 s
+            // the gaps (the Mac's sound came late: the track ran dry) and the drops (the track was full) are said.
+            int frame = 4, rate = 48000, prefill = 0, lastUnder = 0;
+            long written = 0, dropped = 0, gotBytes = 0, nextReport = System.currentTimeMillis() + 30000, lastData = 0;
+            boolean started = false;
             try (java.net.Socket s = new java.net.Socket()) {
                 s.connect(new java.net.InetSocketAddress("127.0.0.1", 5901), 1000);
                 s.setTcpNoDelay(true);
@@ -1215,12 +1240,17 @@ public class VmService extends Service {
                     if (head[0] != 'H' || head[1] != 'S' || len < 0 || len > body.length) throw new java.io.IOException("not the engine's sound");
                     in.readFully(body, 0, len);
                     if (head[2] == 1 && len >= 12) {
-                        int channels = le32(body, 0), rate = le32(body, 8);
+                        int channels = le32(body, 0);
+                        rate = le32(body, 8);
                         format = le32(body, 4);
+                        frame = channels * (format == 5 ? 2 : 4);
+                        prefill = rate / 10 * frame;
+                        written = 0;
+                        started = false;
+                        lastUnder = 0;
                         if (track != null) { track.release(); track = null; }
                         try {
                             track = soundTrack(channels, format, rate);
-                            track.play();
                             if (!said) appendLog(log, "henge app: sound: playing " + channels + " channels at " + rate + " Hz");
                         } catch (Exception e) {
                             if (!said) appendLog(log, "henge app: sound: Android refused " + channels + " channels, format " + format + ", " + rate + " Hz: " + e);
@@ -1228,6 +1258,16 @@ public class VmService extends Service {
                         }
                         said = true;
                     } else if (head[2] == 2 && track != null) {
+                        // After a silence (macOS sends nothing while nothing plays) the track is filled again before
+                        // it plays, and the dry spell is no gap.
+                        long arrived = System.currentTimeMillis();
+                        if (started && arrived - lastData > 500) {
+                            track.pause();
+                            track.flush();
+                            started = false;
+                            written = 0;
+                        }
+                        lastData = arrived;
                         out.clear();
                         if (format == 17) { // 32-bit integers: as floats, which every Android plays
                             for (int i = 0; i + 4 <= len; i += 4) out.putFloat(le32(body, i) / 2147483648f);
@@ -1237,7 +1277,29 @@ public class VmService extends Service {
                         out.flip();
                         // Never waits: what the track has no room for is dropped, so the sound stays on time
                         // (the Mac's clock and the tablet's drift apart by a little, for ever).
-                        track.write(out, out.remaining(), android.media.AudioTrack.WRITE_NON_BLOCKING);
+                        int want = out.remaining();
+                        int put = track.write(out, want, android.media.AudioTrack.WRITE_NON_BLOCKING);
+                        gotBytes += want;
+                        if (put > 0) written += put;
+                        if (put >= 0 && put < want) dropped += want - put;
+                        if (!started && written >= prefill) {
+                            lastUnder = track.getUnderrunCount();
+                            track.play();
+                            started = true;
+                        }
+                        long now = System.currentTimeMillis();
+                        if (now >= nextReport) {
+                            int under = started ? track.getUnderrunCount() : 0;
+                            int gaps = under - lastUnder;
+                            lastUnder = under;
+                            if (gaps > 0 || dropped > 0)
+                                appendLog(log, "henge app: sound: last 30 s: " + gaps + " gap(s) (the Mac's sound came late), "
+                                        + (dropped * 1000L / Math.max(1, (long) rate * frame)) + " ms dropped (the track was full) of "
+                                        + (gotBytes * 1000L / Math.max(1, (long) rate * frame)) + " ms received");
+                            dropped = 0;
+                            gotBytes = 0;
+                            nextReport = now + 30000;
+                        }
                     }
                 }
             } catch (Exception e) {
@@ -1259,7 +1321,9 @@ public class VmService extends Service {
         int frame = channels * (format == 5 ? 2 : 4);
         int least = android.media.AudioTrack.getMinBufferSize(rate,
                 channels == 1 ? android.media.AudioFormat.CHANNEL_OUT_MONO : android.media.AudioFormat.CHANNEL_OUT_STEREO, encoding);
-        int size = Math.max(least > 0 ? least : 0, rate / 10 * frame); // a tenth of a second, or what the device needs
+        // 0.3.112: a quarter of a second (0.3.111: a tenth, so the Mac's sound arriving 0.1 s late was a gap; the
+        // track starts once a tenth is in it, so the sound runs about that far behind), or what the device needs.
+        int size = Math.max(least > 0 ? least : 0, rate / 4 * frame);
         return new android.media.AudioTrack.Builder()
                 .setAudioAttributes(new android.media.AudioAttributes.Builder()
                         .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
@@ -1302,20 +1366,54 @@ public class VmService extends Service {
     static File resumeFile(Context c) { return new File(macDir(c), "instant-resume.henge"); }
 
     /** SIGTERM: the engine stops the Mac at the next block and flushes its disks. With Instant resume, SIGUSR1:
-     *  it is paused and saved first (a few seconds for the RAM), then stops. */
+     *  it is paused and saved first (a few seconds for the RAM), then stops.
+     *  0.3.112: Shut Down first asks macOS (SIGUSR2: the engine presses the Mac's power button and confirms its
+     *  question), so the next start shows no "your computer was shut down because of a problem" (0.3.111's black box
+     *  after a Stop). A second tap (Force Stop), or 90 s without the Mac going down, ends it as before. */
     public static void stop(Context c) {
         try {
-            String pid = new String(Files.readAllBytes(new File(c.getFilesDir(), "engine.pid").toPath())).trim();
-            int sig = !gunyah() && instantResume(c) && "running".equals(state) ? 10 : 15;
-            if (gunyah() || new File(c.getFilesDir(), "engine.root").exists()) { // a root process: only root may signal it
-                new ProcessBuilder("su", "-c", "kill -" + sig + " " + Integer.parseInt(pid)).start();
-                return;
-            }
-            android.os.Process.sendSignal(Integer.parseInt(pid), sig);
+            int pid = Integer.parseInt(new String(Files.readAllBytes(new File(c.getFilesDir(), "engine.pid").toPath())).trim());
+            boolean save = !gunyah() && instantResume(c) && "running".equals(state);
+            boolean ask = !save && "running".equals(state) && shutdownAsked == 0 && knowsShutDown(c);
+            signal(c, pid, save ? 10 : ask ? 12 : 15);
+            if (ask) askedShutDown(c, pid, "Shut Down: macOS asked to shut down (its power button); Force Stop ends it at once");
         } catch (Exception e) {
             Process p = process;
             if (p != null) p.destroy();
         }
+    }
+
+    /** 0.3.112: when macOS was asked to shut down (0 if not): Shut Down then reads Force Stop. */
+    static volatile long shutdownAsked;
+    static boolean shuttingDown() { return shutdownAsked > 0 && busy(); }
+
+    /** Whether the running engine takes SIGUSR2 as "ask macOS to shut down": one of this build (an engine of an
+     *  earlier build, taken back after an update, would die of it at once, its disks unflushed). */
+    private static boolean knowsShutDown(Context c) {
+        return adoptedPid == 0 || adoptedCmdline.contains(c.getApplicationInfo().nativeLibraryDir + "/");
+    }
+
+    /** The engine signalled (root's through su, the app's own directly). */
+    private static void signal(Context c, int pid, int sig) throws Exception {
+        if (gunyah() || adoptedPid > 0 || new File(c.getFilesDir(), "engine.root").exists()) // a root process: only root may signal it
+            new ProcessBuilder("su", "-c", "kill -" + sig + " " + pid).start();
+        else android.os.Process.sendSignal(pid, sig);
+    }
+
+    /** macOS was asked to shut down: said, and the engine ended if the Mac is still up 90 s later. */
+    private static void askedShutDown(Context c, int pid, String why) {
+        long at = System.currentTimeMillis();
+        shutdownAsked = at;
+        appendLog(logFile(c), "henge app: " + why);
+        new Thread(() -> {
+            for (int i = 0; i < 90 && busy() && shutdownAsked == at; i++) {
+                try { Thread.sleep(1000); } catch (InterruptedException e) { return; }
+            }
+            if (!busy() || shutdownAsked != at) return;
+            appendLog(logFile(c), "henge app: macOS did not shut down within 90 s (an app asking to save? the question "
+                    + "cancelled?): the Mac is ended");
+            try { signal(c, pid, 15); } catch (Exception ignored) { }
+        }, "shutdown-wait").start();
     }
 
     static String signalName(int sig) {
