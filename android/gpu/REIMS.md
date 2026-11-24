@@ -1540,3 +1540,18 @@ within the next 12 instructions; mov x0, x21 after it) and must be found exactly
 else nothing is rewritten and the Mac gets the counter's own rate. The words around it are logged. Other places a
 trap could spoil: ELR_EL1 and SPSR_EL1 are saved by SPILL_REGISTERS before any call and restored after
 recount_enter_user on the way out; no other call lies between an exception's entry and its reads of ESR/FAR there.
+
+0.3.123 (2026-11-24): before 0.3.122 ran, the trap's side effects read through in Apple's source for this kernel
+(xnu-11417.140.69: osfmk/arm64/locore.s, exception_asm.h, start.s, cswitch.s, machine_routines_asm.s, sleh.c,
+libsyscall/wrappers/mach_absolute_time.s, osfmk/arm/cpu_capabilities.h), since a trap rewrites ESR, ELR, SPSR (and
+may FAR):
+- fleh_synchronous reads ELR_EL1 too (into lr, and with CONFIG_SPTM into the saved PC) and SPSR_EL1 after
+  recount_leave_user: the wrapper now keeps all four (16 instructions, 64 of the 196 bytes left).
+- No other call lies between an entry and those reads: the vectors and SPILL_REGISTERS call nothing; IRQ and FIQ
+  handlers read none of them; exceptions from the kernel skip recount_leave_user; the way out restores ELR and SPSR
+  from the saved state after recount_enter_user and arm_debug_set; the C handlers read none of the four directly.
+- SP_EL1 is each CPU's exception stack whenever kernel code runs on SP0 (the PCB pointer is put in SP_EL0), so the
+  fix-up's 128-byte frame is on a stack.
+- Programs: mach_absolute_time goes to the kernel (trap -3) when the commpage's +0x90 is 0, as set; +0x91 (a hardware
+  clock for mach_continuous_time) is 0 in this Mac's commpage, so that one asks the kernel as well. A program that
+  reads CNTVCT_EL0 itself, not through these, would still see 19.2 MHz; none is known.

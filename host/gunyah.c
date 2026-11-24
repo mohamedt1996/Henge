@@ -905,7 +905,7 @@ static int kpatch(void) {
             }
         }
         uint32_t *w = found == 1 ? hv_phys_ptr(M, xr[fr].pa, xr[fr].size) : NULL;
-        if (!w || xr[fr].size - zs[fr] * 4 > 16384 || pools[fr] + 10 > xr[fr].size / 4) {
+        if (!w || xr[fr].size - zs[fr] * 4 > 16384 || pools[fr] + 16 > xr[fr].size / 4) {
             fprintf(stderr, "gunyah: the Mac's clock at 24 MHz: the kernel's call of recount_leave_user was found %d times%s: the "
                             "Mac gets the counter's own rate (as Settings > Mac's clock: Exact)\n", found,
                     found == 1 ? ", and its code range has no page padding left for the wrapper" : " (once is needed)");
@@ -916,19 +916,16 @@ static int kpatch(void) {
             if (off & (1ll << 25)) off -= 1ll << 26;
             uint64_t target = site + (uint64_t)(off * 4);
             uint32_t *c = &w[pools[fr]];
-            c[0] = 0xa9be7bfdu; /* stp x29, x30, [sp, #-32]! */
-            c[1] = 0xd5385210u; /* mrs x16, esr_el1 */
-            c[2] = 0xd5386011u; /* mrs x17, far_el1 */
-            c[3] = 0xa90147f0u; /* stp x16, x17, [sp, #16] */
-            c[4] = 0x94000000u | (uint32_t)(((int64_t)(target - (stub + 16)) >> 2) & 0x3ffffff); /* bl recount_leave_user */
-            c[5] = 0xa94147f0u; /* ldp x16, x17, [sp, #16] */
-            c[6] = 0xd5185210u; /* msr esr_el1, x16 */
-            c[7] = 0xd5186011u; /* msr far_el1, x17 */
-            c[8] = 0xa8c27bfdu; /* ldp x29, x30, [sp], #32 */
-            c[9] = 0xd65f03c0u; /* ret */
+            /* stp x29, x30, [sp, #-48]!; ESR and FAR to [sp, #16], ELR and SPSR to [sp, #32] (fleh_synchronous reads
+               all four after the call; assembled with clang and copied); bl; the four back; ldp x29, x30; ret */
+            static const uint32_t wr[16] = {0xa9bd7bfdu, 0xd5385210u, 0xd5386011u, 0xa90147f0u, 0xd5384030u, 0xd5384011u,
+                                            0xa90247f0u, 0 /* bl */,   0xa94247f0u, 0xd5184030u, 0xd5184011u, 0xa94147f0u,
+                                            0xd5185210u, 0xd5186011u, 0xa8c37bfdu, 0xd65f03c0u};
+            memcpy(c, wr, sizeof wr);
+            c[7] = 0x94000000u | (uint32_t)(((int64_t)(target - (stub + 28)) >> 2) & 0x3ffffff); /* bl recount_leave_user */
             w[fi] = 0x94000000u | (uint32_t)(((int64_t)(stub - site) >> 2) & 0x3ffffff);
-            pools[fr] += 10;
-            fprintf(stderr, "gunyah: the kernel's call of recount_leave_user (pa %#llx, to %#llx) keeps ESR_EL1 and FAR_EL1 now "
+            pools[fr] += 16;
+            fprintf(stderr, "gunyah: the kernel's call of recount_leave_user (pa %#llx, to %#llx) keeps ESR, FAR, ELR and SPSR now "
                             "(wrapper at pa %#llx; around the call: %08x %08x %08x %08x | %08x %08x %08x %08x)\n",
                     (unsigned long long)site, (unsigned long long)target, (unsigned long long)stub, w[fi - 4], w[fi - 3],
                     w[fi - 2], w[fi - 1], w[fi + 1], w[fi + 2], w[fi + 3], w[fi + 4]);
