@@ -36,6 +36,8 @@ public class VmService extends Service {
     /** The folder the Mac shares with the tablet (host/share.c), and in it what Settings > Mac apps brings in. */
     public static File shareDir(Context c) { return new File(c.getFilesDir(), "share"); }
     public static File macAppsDir(Context c) { return new File(shareDir(c), "Mac Apps"); }
+    /** The Mac's crash reports, sent by the script at /.henge/reports (host/share.c); saved to Downloads with the log. */
+    public static File macReportsDir(Context c) { return new File(shareDir(c), "Mac Reports"); }
     /** Shader captures go where a computer can copy them over USB: Android/data/dev.henge.android/files/shaders. */
     public static File shaderDir(Context c) {
         File ext = c.getExternalFilesDir(null);
@@ -475,6 +477,7 @@ public class VmService extends Service {
                 pb.environment().put("HV_BALLOON", "0");
             if (!install) { // the shared folder, at http://10.0.2.4 in macOS (android/runner.c)
                 macAppsDir(this).mkdirs();
+                macReportsDir(this).mkdirs(); // 0.3.113: where "curl -s http://10.0.2.4/.henge/reports | sh" puts crash reports
                 pb.environment().put("HV_SHARE_DIR", shareDir(this).getPath());
                 pb.environment().put("HV_SHARE_SOCKET", new File(files, "share.sock").getPath());
             }
@@ -1353,6 +1356,9 @@ public class VmService extends Service {
         if (layout != null && layout.contains("--lend")) b.append(" HV_GUNYAH_LEND_BOOT=1");
         if (ram != null && ram.contains("resmem")) b.append(" HV_GUNYAH_RAM=resmem");
         else if (ram != null && ram.contains("plain")) b.append(" HV_GUNYAH_RAM=plain");
+        // 0.3.113: Settings > Mac's clock. Exact: the kernel is told the counter's own rate (19.2 MHz), as up to 0.3.112.
+        if ("exact".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("gunyahClock", "whole")))
+            b.append(" HV_GUNYAH_TIMEBASE=exact");
         return b.toString();
     }
     static String sq(String s) { return "'" + s.replace("'", "'\\''") + "'"; }

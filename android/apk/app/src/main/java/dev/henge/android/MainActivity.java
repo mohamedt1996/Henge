@@ -867,6 +867,20 @@ public class MainActivity extends Activity {
         enote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(enote);
         c.addView(hairline());
+        if ("gunyah".equals(engineMode())) { // 0.3.113 (host/gunyah.c: the kernel's timebase-frequency)
+            final boolean exact = "exact".equals(prefs.getString("gunyahClock", "whole"));
+            c.addView(choiceRow("Mac's clock", new String[]{"Whole MHz", "Exact"}, exact ? 1 : 0,
+                    i -> { prefs.edit().putString("gunyahClock", i == 1 ? "exact" : "whole").apply(); render(true); }));
+            TextView cnote = text(exact
+                    ? "macOS is told the tablet's timer rate as it is (19.2 MHz on the Mi Pad 7), as up to 0.3.112. Its clock keeps "
+                        + "the tablet's pace, but its microseconds step back up to 10 ms every second, which programs can trip over."
+                    : "macOS is told the nearest whole MHz (19 on the Mi Pad 7), the only kind of rate its microsecond clock counts "
+                        + "right. Its clock then runs about 1% fast. If the Mac no longer starts or its sound breaks up with this, "
+                        + "choose Exact: that is how 0.3.112 started it.", 13, DIM, false);
+            cnote.setPadding(dp(17), 0, dp(17), dp(12));
+            c.addView(cnote);
+            c.addView(hairline());
+        }
         c.addView(infoRow("Display", "VNC on 127.0.0.1:5900"));
         c.addView(hairline());
         c.addView(infoRow("Engine", VmService.busy() ? "Running" : VmService.state));
@@ -1585,6 +1599,9 @@ public class MainActivity extends Activity {
         body.addView(gap(10));
         body.addView(link("Save the full log to Downloads", v -> saveToDownloads(false)));
         body.addView(gap(10));
+        body.addView(text("A program crashed in macOS? In the Mac's Terminal: curl -s http://10.0.2.4/.henge/reports | sh "
+                + "sends its crash reports here, and Save the full log then saves them too (henge-mac-reports).", 12, DIM, false));
+        body.addView(gap(10));
         body.addView(link("Export captured shaders to Downloads", v -> saveToDownloads(true)));
         if (clear) {
             body.addView(gap(10));
@@ -1617,6 +1634,13 @@ public class MainActivity extends Activity {
                 if (n != null) saved.add(n);
                 n = VmService.toDownloads(c, new File(VmService.macDir(c), "restore/install.log"), "henge-install-" + stamp + ".log", "text/plain");
                 if (n != null) saved.add(n);
+                // 0.3.113: the Mac's crash reports, if "curl -s http://10.0.2.4/.henge/reports | sh" sent any.
+                File reports = VmService.macReportsDir(c);
+                String[] sent = reports.list();
+                if (sent != null && sent.length > 0) {
+                    n = VmService.toDownloads(c, reports, "henge-mac-reports-" + stamp + ".zip", "application/zip");
+                    if (n != null) saved.add(n);
+                }
             }
             String msg = saved.isEmpty() ? (shaders ? "No shaders captured yet." : "No log to save yet.")
                     : "Saved to Download/Henge: " + TextUtils.join(", ", saved);

@@ -72,6 +72,7 @@ Settings that matter:
 | Mac screen | 1024, 1280, 1600, 1920 | Fewer pixels is faster: every pixel is copied. Default 1280x800. |
 | Vulkan driver | Turnip, System | System is the one seen working. |
 | CPU engine | JIT, Gunyah | JIT. Gunyah resets the Xiaomi Pad 7. |
+| Mac's clock (Gunyah) | Whole MHz, Exact | Whole MHz (0.3.113). Exact is how 0.3.112 started the Mac: choose it if the Mac no longer starts. |
 | Mac's memory | In RAM, On storage | In RAM. On storage is the fallback where the hand-over fails. |
 | GPU memory checks | Used, Everything | Used. Everything is for a window that shows stale pixels. |
 | Touch | Direct, Trackpad | |

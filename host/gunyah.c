@@ -782,6 +782,15 @@ static int kpatch(void) {
     /* The timebase: the kernel's tree says the 24 MHz Henge's JIT counts; Gunyah gives the CPU's own counter. */
     uint64_t f;
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+    /* 0.3.113: XNU takes its microseconds as ticks / (rate / 1000000), a whole number: at the Mi Pad 7's 19.2 MHz that
+       is 19, so a second counted 1,010,526 microseconds and the microsecond clock stepped back up to 10.5 ms at each
+       second (0.3.111's log: "[53225.1001268]", "took -8650 us", "Spent too much time (18446744073709)s"). The kernel
+       is told the nearest whole MHz instead (19): its clocks agree with each other and run 1% fast against the
+       tablet's. HV_GUNYAH_TIMEBASE=exact (Settings > Mac's clock: Exact) tells it the counter's own rate, as before. */
+    uint64_t counter_hz = f;
+    const char *tbm = getenv("HV_GUNYAH_TIMEBASE");
+    int tb_exact = tbm && !strcmp(tbm, "exact");
+    if (!tb_exact && f % 1000000 && (f + 500000) / 1000000 > 0) f = (f + 500000) / 1000000 * 1000000;
     int changed = 0;
     if (dtva >= virt && dtlen > 8) {
         uint64_t dtpa = dtva - virt + phys;
@@ -843,7 +852,15 @@ static int kpatch(void) {
             }
         }
     }
-    fprintf(stderr, "gunyah: the kernel's timebase-frequency: %d set to the CPU's %llu Hz\n", changed, (unsigned long long)f);
+    if (f == counter_hz)
+        fprintf(stderr, "gunyah: the kernel's timebase-frequency: %d set to the CPU's %llu Hz%s\n", changed, (unsigned long long)f,
+                f % 1000000 ? " (not a whole MHz: the Mac's microsecond clock steps back each second; Settings > Mac's clock)" : "");
+    else
+        fprintf(stderr, "gunyah: the kernel's timebase-frequency: %d set to %llu Hz, the whole MHz nearest the CPU's %llu Hz "
+                        "(the Mac's clock runs %.2f%% %s; Settings > Mac's clock: Exact for the counter's own rate)\n", changed,
+                (unsigned long long)f, (unsigned long long)counter_hz,
+                100.0 * (counter_hz > f ? (double)(counter_hz - f) / (double)f : (double)(f - counter_hz) / (double)f),
+                counter_hz > f ? "fast" : "slow");
     if (pcie_moved && B->pcie) {
         int e = hv_pcie_alias(B->pcie, PCIE_ECAM_NEW, PCIE_ECAM_NEW_SIZE, PCIE_MMIO_NEW, PCIE_MMIO_NEW_SIZE);
         fprintf(stderr, "gunyah: PCIe moved below Gunyah's 1 GB VMMIO limit: ECAM %#llx, MMIO %#llx (%d values in the tree)%s\n",

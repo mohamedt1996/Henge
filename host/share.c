@@ -648,6 +648,27 @@ static const char lighten_script[] =
     "echo 'Also turn on Reduce Motion and Reduce Transparency: System Settings, Accessibility.'\n"
     "echo 'Log out and back in for all of it to take effect. To undo: curl -s http://" HV_SHARE_ADDR "/.henge/unlighten | sh'\n";
 
+/* What "curl -s http://10.0.2.4/.henge/reports | sh" runs in macOS (0.3.113): the newest crash reports, the user's and
+   the system's, sent to the shared folder's "Mac Reports", so they can be read outside the Mac without Console
+   (Safari's GPU process crashed six times in 0.3.111's run and the kernel's log does not say why). */
+static const char reports_script[] =
+    "#!/bin/sh\n"
+    "U='http://" HV_SHARE_ADDR "/Mac%20Reports'\n"
+    "curl -s -o /dev/null -X MKCOL \"$U\" </dev/null\n"
+    "n=0\n"
+    "for d in \"$HOME/Library/Logs/DiagnosticReports\" /Library/Logs/DiagnosticReports; do\n"
+    "  [ -d \"$d\" ] || continue\n"
+    "  ls -t \"$d\" 2>/dev/null | grep -E '\\.(ips|crash|diag|panic|hang|spin)$' | head -40 > /tmp/henge-reports.$$\n"
+    "  while IFS= read -r b; do\n"
+    "    f=\"$d/$b\"\n"
+    "    [ -f \"$f\" ] && [ -r \"$f\" ] || continue\n"
+    "    [ \"$(wc -c < \"$f\")\" -le 8388608 ] || continue\n"
+    "    if curl -fsS -o /dev/null -T \"$f\" \"$U/\" </dev/null; then n=$((n+1)); echo \"  $b\"; fi\n"
+    "  done < /tmp/henge-reports.$$\n"
+    "  rm -f /tmp/henge-reports.$$\n"
+    "done\n"
+    "echo \"Sent $n reports to Henge. On the tablet: Henge, the log, Save the full log to Downloads.\"\n";
+
 /* And back. The wallpaper stays as it is: pick one in System Settings. */
 static const char unlighten_script[] =
     "#!/bin/sh\n"
@@ -727,6 +748,10 @@ static int serve_henge(Conn *c, Request *r) {
         if (body_discard(c, r) != 0) return -1;
         const char *s = what[0] == 'l' ? lighten_script : unlighten_script;
         return respond(c, r, 200, "OK", "Content-Type: text/plain\r\n", s, strlen(s));
+    }
+    if (!strcmp(what, "reports") && !strcmp(r->method, "GET")) {
+        if (body_discard(c, r) != 0) return -1;
+        return respond(c, r, 200, "OK", "Content-Type: text/plain\r\n", reports_script, strlen(reports_script));
     }
     if (!strcmp(what, "agent") && !strcmp(r->method, "GET")) return serve_agent(c, r);
     if (!strcmp(what, "clipboard") && !strcmp(r->method, "GET")) return clipboard_get(c, r);

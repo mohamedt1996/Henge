@@ -1339,3 +1339,17 @@ log does not say why (its crash report will).
   a silence, and every 30 s with a gap or a drop a line says how many ("henge app: sound: last 30 s: ...").
 - The engine's last line says "macOS shut down" for a VM that ended by itself and "the app ended the Mac (Stop)"
   for a stop, where 0.3.111 said "other" for both.
+
+0.3.113 (2026-11-24): 0.3.111's log read again (0.3.112's run was not kept, and the freeze reported in it is in no log).
+- The Mac's microsecond clock was wrong on Gunyah. XNU takes microseconds as ticks / (timebase / 1,000,000), a whole
+  number: at the tablet's 19.2 MHz that is 19, so a second held 1,010,526 of them and the microsecond clock stepped
+  back up to 10.5 ms at each second: kernel stamps like "[53225.1001268]", APFS's "took -8650 us" and "Spent too much
+  time (18446744073709)s". The kernel is now told the nearest whole MHz (19): its clocks agree, and run 1.05% fast
+  against the tablet's. Settings > Mac's clock: Exact (HV_GUNYAH_TIMEBASE=exact) is 0.3.112's value, for a Mac that
+  does not start or whose sound breaks up with it. Not tested on the tablet.
+- Safari's GPU process: its six crashes come after WindowServer's 145 nil buffers ended (those are task 2's, in the
+  first minutes), five of them in the same kernel line as "Sandbox: com.apple.WebKit.GPU deny(1) syscall-mig 261";
+  coresymbolicationd, syspolicyd (twice), UIKitSystem and BiomeAgent crashed in the same run. The kernel's log has no
+  reason for any of them. In the Mac's Terminal, `curl -s http://10.0.2.4/.henge/reports | sh` now sends the newest
+  crash reports (40 of the user's, 40 of the system's) to the shared folder's "Mac Reports", and Save the full log to
+  Downloads saves them as henge-mac-reports-*.zip: no Console, no copying inside the Mac.
