@@ -1580,3 +1580,15 @@ Changes:
 - Gunyah: the engine's threads that are not the Mac's CPUs keep to the slow cores (HV_CPU_HELPERS_SLOW=1, as the
   JIT's "one core each" does); Settings > Cores for the Mac: Off leaves them as before. Not measured yet: the next
   log's "waited for a core" says.
+
+0.3.126 (2026-11-24): 0.3.125's start (24 MHz, five minutes, Magic Trackpad in use, mode 1280x800 as offered, so the
+pointer change had nothing to show): the other threads went to the 3 slow cores; "waited for a core" 7.6 to 16.2%
+(0.3.124: 11 to 20%), too short a run to call. The GPU's registers as before: 20 to 30 thousand accesses and 3.7 to
+5.4 s of the CPUs' time per 30 s, 175 to 200 us an access, where the app counts 35 to 41 us to reach it and 17 to 29
+in the device. The pattern in the app's counts: a doorbell write (gfx +0x1020, posted, 45 us on average in the
+device, up to 23 ms) and the status reads right behind it (+0x1018, +0x1014). A posted write's wait is taken at the
+CPU's next access and its awake part was counted from the post, so it was usually over before the wait began: the CPU
+slept, and paid two wake-ups. Now that wait is awake from when it begins (HV_REIMS_PENDING_FROM_POST=1: as before),
+and the heartbeat line splits the waits: answered awake and slept for, their mean times, and the share that was for
+the CPU's own write before. Sound in that run: 150 to 1220 ms of silence per 30 s with the Mac's buffers up to 2.9 s
+apart (the Mac standing still: disk time 24 to 27 s of 30, the fast cores held to 1.7 GHz).

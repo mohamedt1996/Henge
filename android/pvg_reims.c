@@ -34,6 +34,9 @@ typedef struct {
     int nslots;
     uint64_t waits, lost;
     uint64_t wait_ns; /* all CPUs' time inside forward(), for the heartbeat */
+    /* 0.3.126: the waits apart: answers seen while still awake and those slept for, and of both the ones that were
+       for this thread's own posted write (a doorbell the next access has to wait out). Counts and ns. */
+    uint64_t awake_n, awake_ns, slept_n, slept_ns, pend_n, pend_ns, pend_slept_n;
 } Reims;
 
 static Reims R;
@@ -141,7 +144,8 @@ static void answer_took(int64_t ns) {
 
 /* Waits until the slot's request is no longer REQUEST (answered: REPLY, or IDLE for a write); 0, or -1
    when the app died with it (the slot is then IDLE and the access counts as lost). */
-static int wait_answer(HvReimsSlot *s, uint64_t began) {
+static int wait_answer_1(HvReimsSlot *s, uint64_t began, int *slept) {
+    *slept = 0;
     int64_t spin_ns = spin_now_ns();
     uint64_t from = now_ns();
 #if defined(__aarch64__) && !defined(HV_REIMS_NO_WFE)
@@ -173,6 +177,7 @@ static int wait_answer(HvReimsSlot *s, uint64_t began) {
 #endif
     if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != HV_REIMS_REQUEST) return 0;
     answer_took(spin_limit_ns()); /* not answered awake: the next waits stay awake longer */
+    *slept = 1;
     for (;;) {
         struct timespec t = {0, 100 * 1000000};
         futex(&s->state, FUTEX_WAIT, HV_REIMS_REQUEST, &t);
@@ -186,6 +191,24 @@ static int wait_answer(HvReimsSlot *s, uint64_t began) {
     }
 }
 
+static int wait_answer(HvReimsSlot *s, uint64_t began, int pending) {
+    uint64_t t0 = now_ns();
+    int slept = 0, rc = wait_answer_1(s, began, &slept);
+    uint64_t d = now_ns() - t0;
+    if (slept) __atomic_fetch_add(&R.slept_n, 1, __ATOMIC_RELAXED), __atomic_fetch_add(&R.slept_ns, d, __ATOMIC_RELAXED);
+    else __atomic_fetch_add(&R.awake_n, 1, __ATOMIC_RELAXED), __atomic_fetch_add(&R.awake_ns, d, __ATOMIC_RELAXED);
+    if (pending) {
+        __atomic_fetch_add(&R.pend_n, 1, __ATOMIC_RELAXED), __atomic_fetch_add(&R.pend_ns, d, __ATOMIC_RELAXED);
+        if (slept) __atomic_fetch_add(&R.pend_slept_n, 1, __ATOMIC_RELAXED);
+    }
+    return rc;
+}
+
+/* For the heartbeat: seven counts, as in Reims. */
+void hv_pvg_reims_wait_split(uint64_t v[7]) {
+    v[0] = R.awake_n, v[1] = R.awake_ns, v[2] = R.slept_n, v[3] = R.slept_ns, v[4] = R.pend_n, v[5] = R.pend_ns, v[6] = R.pend_slept_n;
+}
+
 static uint64_t forward(int device, int write, uint64_t off, uint64_t value, unsigned size) {
     if (my_slot < 0) {
         my_slot = __atomic_fetch_add(&R.nslots, 1, __ATOMIC_ACQ_REL);
@@ -194,7 +217,13 @@ static uint64_t forward(int device, int write, uint64_t off, uint64_t value, uns
     HvReimsSlot *s = &R.h->slot[my_slot];
     if (my_pending) { /* this thread's posted write: done before anything else of its goes */
         uint64_t w0 = now_ns();
-        wait_answer(s, my_pending_since);
+        /* 0.3.126: awake from now, not from when the write was posted. A doorbell (gfx +0x1020) takes the app 45 us on
+           average and the Mac reads the status right behind it; counted from the post, the awake part was over
+           before this wait began, so it slept, and a sleep costs both sides' wake-ups: the logs' 175 to 200 us an
+           access where the app's own share is 50. HV_REIMS_PENDING_FROM_POST=1: as before. */
+        static int from_post = -1;
+        if (from_post < 0) { const char *v = getenv("HV_REIMS_PENDING_FROM_POST"); from_post = v && *v == '1'; }
+        wait_answer(s, from_post ? my_pending_since : w0, 1);
         __atomic_fetch_add(&R.wait_ns, now_ns() - w0, __ATOMIC_RELAXED);
         my_pending = 0;
     }
@@ -212,7 +241,7 @@ static uint64_t forward(int device, int write, uint64_t off, uint64_t value, uns
         __atomic_fetch_add(&R.h->requests, 1, __ATOMIC_RELAXED);
         return 0;
     }
-    if (wait_answer(s, began) != 0) return 0;
+    if (wait_answer(s, began, 0) != 0) return 0;
     __atomic_fetch_add(&R.wait_ns, now_ns() - began, __ATOMIC_RELAXED);
     uint64_t v = s->value;
     __atomic_store_n(&s->state, HV_REIMS_IDLE, __ATOMIC_RELEASE);
