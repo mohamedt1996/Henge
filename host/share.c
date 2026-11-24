@@ -676,6 +676,26 @@ static const char reports_script[] =
     "2>&1 </dev/null | tail -8000 > \"$L\"\n"
     "if [ -s \"$L\" ] && curl -fsS -o /dev/null -T \"$L\" \"$U/\" </dev/null; then n=$((n+1)); echo '  henge-sound-log.txt'; fi\n"
     "rm -f \"$L\"\n"
+    /* 0.3.118: the Mac's driver for the sound device itself (the one that names its device AVIODevice), to read how it
+       times its buffers and timestamps: four builds of the device's timing have not satisfied it. Files under 40 MB
+       that hold the name, and a note of what is loaded. */
+    "echo 'Looking for the sound driver (a minute or two)...'\n"
+    "I=/tmp/henge-driver-info.txt\n"
+    "{ echo '== files that hold AVIODevice'; for d in /System/Library/DriverExtensions /System/Library/Extensions "
+    "/System/Library/Audio/Plug-Ins /Library/Audio/Plug-Ins /System/Library/Frameworks/Virtualization.framework; do "
+    "[ -d \"$d\" ] && grep -rl -a AVIODevice \"$d\" 2>/dev/null; done; } > \"$I\" </dev/null\n"
+    "grep '^/' \"$I\" | head -8 | while IFS= read -r f; do\n"
+    "  [ -f \"$f\" ] && [ \"$(wc -c < \"$f\")\" -le 41943040 ] || continue\n"
+    "  t=$(printf '%s' \"$f\" | tr -c 'A-Za-z0-9._-' '_')\n"
+    "  curl -fsS -o /dev/null -T \"$f\" \"$U/driver$t\" </dev/null && echo \"  $f\"\n"
+    "done\n"
+    "{ echo '== virtio and audio bundles'; ls -d /System/Library/Extensions/*[Vv]irt[Ii][Oo]* /System/Library/DriverExtensions/* 2>/dev/null; "
+    "echo '== loaded'; kextstat 2>/dev/null | grep -i -E 'virtio|audio'; systemextensionsctl list 2>/dev/null; "
+    "ps ax -o pid,comm 2>/dev/null | grep -i -E 'dext|DriverKit|audio'; "
+    "echo '== audio devices'; ioreg -l -w0 2>/dev/null | grep -i -E 'AVIODevice|IOUserAudio|VirtIOSound|AppleVirtIO.*(Sound|Audio)' | head -40; "
+    "system_profiler SPAudioDataType 2>/dev/null; } >> \"$I\" </dev/null\n"
+    "curl -fsS -o /dev/null -T \"$I\" \"$U/\" </dev/null && n=$((n+1)) && echo '  henge-driver-info.txt'\n"
+    "rm -f \"$I\"\n"
     "echo \"Sent $n files to Henge. On the tablet: Henge, the log, Save the full log to Downloads.\"\n";
 
 /* And back. The wallpaper stays as it is: pick one in System Settings. */

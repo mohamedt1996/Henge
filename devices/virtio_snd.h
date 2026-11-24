@@ -59,7 +59,17 @@ typedef struct HvVirtioSnd {
     pthread_mutex_t pace_mu;
     HvSndPace pace;
     uint64_t tx_count, tx_bytes_min, tx_bytes_max, dropped_bytes; /* for the log */
+    /* 0.3.118: what the guest's driver does, for the log (hv_virtio_snd_trace_line): the gaps between its buffers'
+       arrivals and between their returns, how many it has out at once, and its requests with their times. */
+    uint64_t tr_last_arrive_ns, tr_last_done_ns, tr_start_ns;
+    uint32_t tr_arrive_min_us, tr_arrive_max_us, tr_done_min_us, tr_done_max_us, tr_out_max, tr_bursts, tr_arrivals, tr_dones;
+    uint64_t tr_arrive_sum_us, tr_done_sum_us;
+    char tr_first[1200]; /* the first events after each start, as text */
+    uint32_t tr_first_len, tr_first_events, tr_starts;
 } HvVirtioSnd;
+
+/* The trace since the last call, as one line into `out`; clears it. Returns 0 when there is nothing. */
+int hv_virtio_snd_trace_line(HvVirtioSnd *d, char *out, unsigned cap);
 
 HvVirtioSnd *hv_virtio_snd_create(HvMachine *m, HvPcie *bus);
 /* CPU thread, each tick: return played buffers to the guest. */

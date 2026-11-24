@@ -348,6 +348,7 @@ public class VmService extends Service {
         }
         boolean sound = !install && !"off".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("sound", "on"));
         cmd.add("--sound"); cmd.add(sound ? "1" : "0");
+        soundDeviceOff = !install && !sound; // 0.3.118: Sound: Off leaves the Mac without a sound device (HV_NO_SOUND, below)
         cmd.add("--ram"); cmd.add(Integer.toString(gunyah() ? Math.min(ram, 3072) : ram));
         cmd.add("--cpus"); cmd.add(Integer.toString(cpus));
         // Settings > JIT cache: the translated code's room; 0.3.62: 512 MB where nothing is set. The cache is in four
@@ -475,6 +476,9 @@ public class VmService extends Service {
             // the screen's 🎈 sets how much (VNC message 254).
             if (!install && !gunyah() && "on".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("balloon", "off")))
                 pb.environment().put("HV_BALLOON", "0");
+            // 0.3.118: with Sound: Off the Mac gets no sound device at all (devices/vmapple.c), where it had one whose
+            // sound went nowhere. Safari's GPU process dies on its sound thread; with no device it has none.
+            if (soundDeviceOff) pb.environment().put("HV_NO_SOUND", "1");
             if (!install) { // the shared folder, at http://10.0.2.4 in macOS (android/runner.c)
                 macAppsDir(this).mkdirs();
                 macReportsDir(this).mkdirs(); // 0.3.113: where "curl -s http://10.0.2.4/.henge/reports | sh" puts crash reports
@@ -1343,6 +1347,7 @@ public class VmService extends Service {
     }
 
     static volatile String engineMode = "jit";
+    private boolean soundDeviceOff;
     static boolean gunyah() { return "gunyah".equals(engineMode); }
 
     /**

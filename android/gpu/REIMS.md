@@ -1444,3 +1444,22 @@ log does not say why (its crash report will).
   settled. In the engine itself: the search for PAC hypercalls read all 3 GB of the Mac's RAM in one go every 30 s
   (found nothing after the start in any log); it now goes 16 MB at a time across the same half minute. The Mac's
   screen is written to storage every 30 s for 5 minutes only, then every 10 minutes.
+
+0.3.118 (2026-11-24): 0.3.117's run on Gunyah, its log, sound log and the new crash report.
+- The device's own clock helped and did not settle it: 322 buffers of 4096 frames in 30 s (the driver asks for a buffer
+  of 49152 frames in periods of 4096), the Mac's sound later than the 50 ms lead 88 times (2.4 s in all, 171 ms at
+  most), 2.0 s of silence (0.3.116: 3.3 s), the pump never late, the ring never full.
+- coreaudiod still re-anchors, in a cycle of exactly four of its 12480-frame timestamp periods (1.04 s; the virtio
+  buffer is 49152 frames, 1.024 s): two overloads a cycle, 12 and then 31 or 32 IO cycles of 1024 frames after its
+  anchors, and "Sample time is not consecutive ... sample diff: 49920, host diff 19968000" twice: the driver's
+  timestamps are still exactly nominal and it skips or shifts them itself. The cycle has been 1.04 s under every
+  timing this device has had (buffers back at their last byte with and without latency_bytes, at 19 and 19.2 MHz,
+  and by its own clock). Why the driver does that is not in any log; it is in the driver.
+- Not reims: no nil buffer, no GPU restart, no GPU fault in the run. Safari's GPU process died as in every report (the
+  tenth): thread com.apple.audio.IOThread.client, CoreAudio's is_thread_configured_for_realtime logging until the
+  stack ends, 1437 "Throwing Exception" in its log, after the overloads above. Nothing of the GPU is on that stack.
+- Sound: Off now leaves the Mac without a sound device (HV_NO_SOUND; it had the device, with its sound going
+  nowhere, so Safari crashed all the same). Not tested on the tablet, on Gunyah or otherwise.
+- For the driver: the device logs each of its requests (a refused one too) and, every 30 s, how its buffers arrive
+  and go back (gaps, bursts, how many out at once) and the first 36 events after a start; /.henge/reports also
+  sends the files under /System/Library that hold "AVIODevice" (under 40 MB) and what is loaded.

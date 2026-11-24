@@ -111,6 +111,10 @@ static void *pump_thread(void *unused) {
                         (unsigned long long)held_ms, (unsigned long long)held_max, (unsigned long long)cuts,
                         (unsigned long long)(sh / fb * 1000 / rate), (unsigned long long)full, (unsigned long long)(late - late0),
                         (unsigned long long)((d->dropped_bytes - drop0) / fb * 1000 / rate));
+                {
+                    static char tl[1800];
+                    if (hv_virtio_snd_trace_line(d, tl, sizeof tl)) fprintf(stderr, "hengevm: sound: the Mac's driver, last 30 s: %s\n", tl);
+                }
                 cuts0 = d->underruns, short0 = d->short_bytes, full0 = d->ring_full, late0 = late, tx0 = d->tx_count;
                 drop0 = d->dropped_bytes, d->tx_bytes_min = 0, d->tx_bytes_max = 0;
             }

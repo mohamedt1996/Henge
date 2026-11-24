@@ -40,6 +40,33 @@ static uint64_t now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* 0.3.118: the first 36 events after each of the first 6 starts, each with its time since that start in ms. */
+static void tr_event(HvVirtioSnd *d, const char *what, uint64_t a, uint64_t b) {
+    if (d->tr_starts > 6 || d->tr_first_events >= 36 || d->tr_first_len + 48 > sizeof d->tr_first) return;
+    uint64_t now = now_ns();
+    int n = snprintf(d->tr_first + d->tr_first_len, sizeof d->tr_first - d->tr_first_len, " +%.1f %s%llu/%llu",
+                     d->tr_start_ns ? (double)(now - d->tr_start_ns) / 1e6 : 0.0, what, (unsigned long long)a, (unsigned long long)b);
+    if (n > 0) d->tr_first_len += (uint32_t)n, d->tr_first_events++;
+}
+
+int hv_virtio_snd_trace_line(HvVirtioSnd *d, char *out, unsigned cap) {
+    if (!d->tr_arrivals && !d->tr_dones && !d->tr_first_len) return 0;
+    int n = snprintf(out, cap, "%u buffers arrived %.1f ms apart (%.1f to %.1f; %u within 5 ms of the one before), %u went back %.1f ms "
+                               "apart (%.1f to %.1f), at most %u out at once",
+                     d->tr_arrivals, d->tr_arrivals > 1 ? (double)d->tr_arrive_sum_us / 1e3 / (d->tr_arrivals - 1) : 0.0,
+                     d->tr_arrive_min_us / 1e3, d->tr_arrive_max_us / 1e3, d->tr_bursts, d->tr_dones,
+                     d->tr_dones > 1 ? (double)d->tr_done_sum_us / 1e3 / (d->tr_dones - 1) : 0.0, d->tr_done_min_us / 1e3,
+                     d->tr_done_max_us / 1e3, d->tr_out_max);
+    if (d->tr_first_len && n > 0 && (unsigned)n < cap)
+        snprintf(out + n, cap - (unsigned)n, "; after a start (ms; tx size/out, done end/latency, ctl code/status):%s", d->tr_first);
+    d->tr_arrivals = d->tr_dones = d->tr_bursts = d->tr_out_max = 0;
+    d->tr_arrive_sum_us = d->tr_done_sum_us = 0;
+    d->tr_arrive_min_us = d->tr_arrive_max_us = d->tr_done_min_us = d->tr_done_max_us = 0;
+    d->tr_last_arrive_ns = d->tr_last_done_ns = 0;
+    d->tr_first_len = 0, d->tr_first[0] = 0;
+    return 1;
+}
+
 static unsigned format_bytes(unsigned f) {
     return f == HV_VSND_FMT_S16 ? 2 : 4;
 }
@@ -174,6 +201,18 @@ static uint32_t control(HvVirtioSnd *d, const HvVirtqElem *e) {
         status = S_NOT_SUPP;
         break;
     }
+    if (code != R_PCM_INFO && code != R_JACK_INFO && code != R_CHMAP_INFO) {
+        /* 0.3.118: every request that changes the stream, said, a refused one too (the first 40). */
+        static int said;
+        if (code == R_PCM_START) d->tr_starts++, d->tr_first_events = 0, d->tr_start_ns = now_ns();
+        tr_event(d, "ctl", code, status);
+        if (said++ < 40)
+            fprintf(stderr, "hengevm: sound: the Mac's driver: request %#x -> %s (%u channels, format %u, rate code %u = %u Hz, buffer %u "
+                            "bytes, period %u; %s)\n", code, status == S_OK ? "ok" : status == S_NOT_SUPP ? "NOT SUPPORTED" : "BAD MESSAGE",
+                    code == R_PCM_SET_PARAMS ? req[20] : d->channels, code == R_PCM_SET_PARAMS ? req[21] : d->format,
+                    code == R_PCM_SET_PARAMS ? req[22] : d->rate, d->rate_hz, d->buffer_bytes, d->period_bytes,
+                    d->running ? "running" : d->prepared ? "prepared" : "stopped");
+    }
     if (logging())
         fprintf(stderr, "virtio-snd: request %#x [%u %u %u] -> %#x (ch %u fmt %u rate %u buffer %u period %u)\n", code, start, count, size, status,
                 d->channels, d->format, d->rate_hz, d->buffer_bytes, d->period_bytes);
@@ -218,6 +257,20 @@ static void take_tx(HvVirtioSnd *d) {
     while (d->ptail - d->phead < HV_VSND_PENDING) {
         if (hv_virtq_pop(v, TXQ, &d->pending[d->ptail % HV_VSND_PENDING]) <= 0) break;
         d->ptail++;
+        {
+            uint64_t t = now_ns();
+            uint32_t out = d->ptail - d->phead;
+            if (d->tr_last_arrive_ns) {
+                uint32_t us = (uint32_t)((t - d->tr_last_arrive_ns) / 1000);
+                if (!d->tr_arrive_min_us || us < d->tr_arrive_min_us) d->tr_arrive_min_us = us;
+                if (us > d->tr_arrive_max_us) d->tr_arrive_max_us = us;
+                d->tr_arrive_sum_us += us;
+                if (us < 5000) d->tr_bursts++;
+            }
+            d->tr_last_arrive_ns = t, d->tr_arrivals++;
+            if (out > d->tr_out_max) d->tr_out_max = out;
+            tr_event(d, "tx", readable(&d->pending[(d->ptail - 1) % HV_VSND_PENDING]), out);
+        }
     }
     fill_ring(d);
 }
@@ -264,6 +317,17 @@ void hv_virtio_snd_poll(HvVirtioSnd *d) {
         put32(st + 4, (uint32_t)queued);
         hv_virtq_write(v, e, 0, st, 8);
         hv_virtq_push(v, TXQ, e, 8);
+        {
+            uint64_t t = now_ns();
+            if (d->tr_last_done_ns) {
+                uint32_t us = (uint32_t)((t - d->tr_last_done_ns) / 1000);
+                if (!d->tr_done_min_us || us < d->tr_done_min_us) d->tr_done_min_us = us;
+                if (us > d->tr_done_max_us) d->tr_done_max_us = us;
+                d->tr_done_sum_us += us;
+            }
+            d->tr_last_done_ns = t, d->tr_dones++;
+            tr_event(d, "done", d->pending_end[d->phead % HV_VSND_PENDING], queued);
+        }
         d->phead++;
         any = 1;
     }

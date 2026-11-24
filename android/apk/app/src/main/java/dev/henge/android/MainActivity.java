@@ -694,6 +694,10 @@ public class MainActivity extends Activity {
         c.addView(hairline());
         c.addView(choiceRow("Sound", new String[]{"On", "Off"}, "off".equals(prefs.getString("sound", "on")) ? 1 : 0,
                 i -> { prefs.edit().putString("sound", i == 0 ? "on" : "off").apply(); render(true); }));
+        TextView snote = text("Off: the Mac has no sound device at all (0.3.118). Safari's videos stop playing when macOS's sound "
+                + "system reports a late cycle, which it does here; without a sound device they play, silent.", 13, DIM, false);
+        snote.setPadding(dp(17), 0, dp(17), dp(12));
+        c.addView(snote);
         c.addView(hairline());
         c.addView(choiceRow("Full speed", new String[]{"Off", "On"}, "on".equals(prefs.getString("fullspeed", "off")) ? 1 : 0,
                 i -> { prefs.edit().putString("fullspeed", i == 1 ? "on" : "off").apply(); render(true); }));
