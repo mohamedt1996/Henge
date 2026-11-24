@@ -867,16 +867,15 @@ public class MainActivity extends Activity {
         enote.setPadding(dp(17), 0, dp(17), dp(12));
         c.addView(enote);
         c.addView(hairline());
-        if ("gunyah".equals(engineMode())) { // 0.3.113 (host/gunyah.c: the kernel's timebase-frequency)
-            final boolean exact = "exact".equals(prefs.getString("gunyahClock", "whole"));
-            c.addView(choiceRow("Mac's clock", new String[]{"Whole MHz", "Exact"}, exact ? 1 : 0,
-                    i -> { prefs.edit().putString("gunyahClock", i == 1 ? "exact" : "whole").apply(); render(true); }));
-            TextView cnote = text(exact
-                    ? "macOS is told the tablet's timer rate as it is (19.2 MHz on the Mi Pad 7), as up to 0.3.112. Its clock keeps "
-                        + "the tablet's pace, but its microseconds step back up to 10 ms every second, which programs can trip over."
-                    : "macOS is told the nearest whole MHz (19 on the Mi Pad 7), the only kind of rate its microsecond clock counts "
-                        + "right. Its clock then runs about 1% fast. If the Mac no longer starts or its sound breaks up with this, "
-                        + "choose Exact: that is how 0.3.112 started it.", 13, DIM, false);
+        if ("gunyah".equals(engineMode())) { // 0.3.113; 0.3.116: Exact by default (host/gunyah.c: the kernel's timebase-frequency)
+            final boolean whole = "whole".equals(prefs.getString("gunyahClock116", "exact"));
+            c.addView(choiceRow("Mac's clock", new String[]{"Exact", "Whole MHz"}, whole ? 1 : 0,
+                    i -> { prefs.edit().putString("gunyahClock116", i == 1 ? "whole" : "exact").apply(); render(true); }));
+            TextView cnote = text(whole
+                    ? "macOS is told the nearest whole MHz (19 on the Mi Pad 7). Its microseconds count right, but its clock "
+                        + "runs 1% fast against the tablet's, and its sound cuts out about once a second (0.3.115's run)."
+                    : "macOS is told the tablet's timer rate as it is (19.2 MHz on the Mi Pad 7), so its clock and its sound "
+                        + "keep the tablet's pace. Its microsecond clock steps back up to 10 ms every second.", 13, DIM, false);
             cnote.setPadding(dp(17), 0, dp(17), dp(12));
             c.addView(cnote);
             c.addView(hairline());

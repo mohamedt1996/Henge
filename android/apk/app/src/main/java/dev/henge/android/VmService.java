@@ -1357,8 +1357,9 @@ public class VmService extends Service {
         if (ram != null && ram.contains("resmem")) b.append(" HV_GUNYAH_RAM=resmem");
         else if (ram != null && ram.contains("plain")) b.append(" HV_GUNYAH_RAM=plain");
         // 0.3.113: Settings > Mac's clock. Exact: the kernel is told the counter's own rate (19.2 MHz), as up to 0.3.112.
-        if ("exact".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("gunyahClock", "whole")))
-            b.append(" HV_GUNYAH_TIMEBASE=exact");
+        // 0.3.116: Exact is the default again (Whole MHz made the Mac's sound clock reset once a second).
+        b.append("whole".equals(getSharedPreferences("henge", MODE_PRIVATE).getString("gunyahClock116", "exact"))
+                ? " HV_GUNYAH_TIMEBASE=whole" : " HV_GUNYAH_TIMEBASE=exact");
         return b.toString();
     }
     static String sq(String s) { return "'" + s.replace("'", "'\\''") + "'"; }

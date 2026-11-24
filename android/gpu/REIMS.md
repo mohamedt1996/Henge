@@ -1402,3 +1402,17 @@ log does not say why (its crash report will).
   its sound (silence played), how often the ring was full, how often the pump itself ran 30 ms late.
 - At 19 MHz the Mac makes 1.05% more sound than the tablet plays; the 0.68 s ring absorbs about a minute of it. The
   "ring was full" count will show whether that matters; Mac's clock: Exact takes it away.
+
+0.3.116 (2026-11-24): 0.3.115's run on Gunyah and its sound log.
+- latency_bytes 0 worked: no "Out of bounds host time detected" at all (0.3.114: one each 0.26 s). No nil buffer, no
+  GPU restart again; only Safari's GPU process and BiomeAgent crashed.
+- What is left is the 19 MHz clock of 0.3.113. coreaudiod: "Re-anchoring IO timeline. Sample time is consecutive,
+  host time is not consecutive" every 50,000 samples (1.04 s), each with an overload, safety_violation_time_gap 10.2 to
+  10.8 ms. The device hands a 0.26 s buffer back when the tablet has played it, 0.26 s by the tablet's clock, which
+  the Mac at 19 MHz counts as 0.26274 s: 2.74 ms late each, 10.9 ms after four. Safari's GPU process still died
+  logging one (1437 "Throwing Exception"). The engine's pump was never 30 ms late, the Mac never late with its
+  sound, the ring never full (no line).
+- The kernel is told the counter's own rate again unless Settings > Mac's clock says Whole MHz (a new setting key,
+  so every tablet starts at Exact). The microsecond clock's step back each second returns with it; no harm from it
+  has been shown, and it would need the sound pump to run at the Mac's rate (96 frames taken for each 95 played).
+- The fastest core was held to 1.7 to 1.9 of 2.8 GHz again, at 61 to 82 C.

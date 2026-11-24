@@ -789,7 +789,10 @@ static int kpatch(void) {
        tablet's. HV_GUNYAH_TIMEBASE=exact (Settings > Mac's clock: Exact) tells it the counter's own rate, as before. */
     uint64_t counter_hz = f;
     const char *tbm = getenv("HV_GUNYAH_TIMEBASE");
-    int tb_exact = tbm && !strcmp(tbm, "exact");
+    /* 0.3.116: exact unless asked (HV_GUNYAH_TIMEBASE=whole). The sound device is paced by the tablet's clock, so at
+       19 MHz every 0.26 s buffer came back 2.7 ms "late" by the Mac's: coreaudiod re-anchored its clock each fourth one
+       (10.7 ms, "host time is not consecutive") and reported an overload, once a second, for the whole of 0.3.115's run. */
+    int tb_exact = !(tbm && !strcmp(tbm, "whole"));
     if (!tb_exact && f % 1000000 && (f + 500000) / 1000000 > 0) f = (f + 500000) / 1000000 * 1000000;
     int changed = 0;
     if (dtva >= virt && dtlen > 8) {
@@ -857,7 +860,7 @@ static int kpatch(void) {
                 f % 1000000 ? " (not a whole MHz: the Mac's microsecond clock steps back each second; Settings > Mac's clock)" : "");
     else
         fprintf(stderr, "gunyah: the kernel's timebase-frequency: %d set to %llu Hz, the whole MHz nearest the CPU's %llu Hz "
-                        "(the Mac's clock runs %.2f%% %s; Settings > Mac's clock: Exact for the counter's own rate)\n", changed,
+                        "(the Mac's clock runs %.2f%% %s, its sound device with the tablet's: Settings > Mac's clock)\n", changed,
                 (unsigned long long)f, (unsigned long long)counter_hz,
                 100.0 * (counter_hz > f ? (double)(counter_hz - f) / (double)f : (double)(f - counter_hz) / (double)f),
                 counter_hz > f ? "fast" : "slow");
