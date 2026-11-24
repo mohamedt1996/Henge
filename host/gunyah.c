@@ -331,12 +331,16 @@ static void gic_external(int intid, int level, int edge) {
 
 static uint64_t pac_patched;
 
-static void pac_scan(void) {
+/* `spread`: 0.3.117. The pass every 30 s read all 3 GB of the Mac's RAM in one go, a second or so of one core and of
+   the memory bus and the caches the Mac's CPUs share with it, in the middle of whatever the Mac was doing. It now
+   takes 16 MB at a time with a rest between (about 190 pieces: the same RAM in the same half minute). */
+static void pac_scan(int spread) {
     for (int r = 0; r < M->nram; r++) {
         uint32_t *w = (uint32_t *)M->ram[r].host;
         size_t n = M->ram[r].size / 4;
         for (size_t i = 0; i + 1 < n; i++) {
             if (!(i & 0xfffff) && stop_req) return;
+            if (spread && i && !(i & 0x3fffff)) usleep(150000);
             if (w[i] != HVC0 || w[i + 1] != CBNZ_X0_SELF) continue;
             /* The cbnz first: a CPU already spinning on it leaves at once, with x0 whatever it is. */
             __atomic_store_n(&w[i + 1], NOP, __ATOMIC_RELEASE);
@@ -363,9 +367,13 @@ static void *pac_thread(void *arg) {
     while (!stop_req) {
         /* The kernel's own calls were rewritten before the start (kpatch); this is for code loaded later (the
            auxiliary kernel collection), a pass over all of the Mac's RAM every 30 s. */
-        for (int i = 0; i < 300 && !stop_req; i++) usleep(100000);
+        /* 0.3.117: the first pass 30 s in, at once (the auxiliary collection loads during the boot); each later one
+           spread over its half minute. */
+        static int passes;
+        if (!passes)
+            for (int i = 0; i < 300 && !stop_req; i++) usleep(100000);
         if (stop_req) break;
-        pac_scan();
+        pac_scan(passes++ > 0);
         if (pac_patched != reported) {
             fprintf(stderr, "gunyah: %llu PAC hypercalls rewritten so far\n", (unsigned long long)pac_patched);
             reported = pac_patched;
@@ -1642,7 +1650,9 @@ static void *watch_thread(void *arg) {
         if ((still == 3 && dumps < 3) || (still && still % 60 == 0 && dumps < 6)) dump_msgbuf(), dumps++;
         double quiet = uart_last_ns ? (double)(now_ns() - uart_last_ns) / 1e9 : 0;
         mb_follow(quiet >= 3);
-        if (s % 30 == 0) dump_screen(); /* 0.3.102: what the Mac shows, every 30 s (gunyah-screen.bmp) */
+        /* 0.3.102: what the Mac shows, every 30 s (gunyah-screen.bmp). 0.3.117: for the first 5 minutes, then every 10
+           (a 3 MB file to the tablet's storage each time, beside the Mac's own disk work). */
+        if (s % 30 == 0 && (s <= 300 || s % 600 == 0)) dump_screen();
         if (quiet >= 5 && !still) {
             if ((!in_quiet || quiet - quiet_at >= 60) && quiet_reports < 4) silence_report(quiet), quiet_reports++, quiet_at = quiet;
             /* 0.3.99: still stuck 45 s on: one of vCPU 0's polling reads gets an abort, so the kernel panics with a

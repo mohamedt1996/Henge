@@ -120,6 +120,9 @@ static uint32_t control(HvVirtioSnd *d, const HvVirtqElem *e) {
         d->rate = rate;
         d->rate_hz = rate == HV_VSND_RATE_44100 ? 44100 : 48000;
         d->frame_bytes = ch * format_bytes(fmt);
+        if (buffer_bytes != d->buffer_bytes || period_bytes != d->period_bytes)
+            fprintf(stderr, "hengevm: sound: the Mac's driver asks for a buffer of %u frames in periods of %u (%u bytes a frame)\n",
+                    d->frame_bytes ? buffer_bytes / d->frame_bytes : 0, d->frame_bytes ? period_bytes / d->frame_bytes : 0, d->frame_bytes);
         d->buffer_bytes = buffer_bytes;
         d->period_bytes = period_bytes;
         break;
@@ -134,6 +137,12 @@ static uint32_t control(HvVirtioSnd *d, const HvVirtqElem *e) {
             break;
         }
         if (!d->running) {
+            if (d->pace_on) {
+                pthread_mutex_lock(&d->pace_mu);
+                hv_snd_pace_start(&d->pace, atomic_load(&d->written), now_ns(), d->rate_hz * d->frame_bytes,
+                                  d->rate_hz / 1000 * d->pace_lead_ms * d->frame_bytes);
+                pthread_mutex_unlock(&d->pace_mu);
+            }
             d->running = 1;
             d->clock_start_ns = now_ns();
             d->clock_start_consumed = atomic_load(&d->consumed);
@@ -194,6 +203,9 @@ static void fill_ring(HvVirtioSnd *d) {
             off += n;
         }
         atomic_store_explicit(&d->written, w + len, memory_order_release);
+        d->tx_count++;
+        if (!d->tx_bytes_min || len < d->tx_bytes_min) d->tx_bytes_min = len;
+        if (len > d->tx_bytes_max) d->tx_bytes_max = len;
         d->pending_end[d->pcopy % HV_VSND_PENDING] = w + len;
         d->pcopy++;
         d->xfers++;
@@ -228,6 +240,14 @@ void hv_virtio_snd_poll(HvVirtioSnd *d) {
     }
     take_tx(d);
     uint64_t c = atomic_load_explicit(&d->consumed, memory_order_acquire);
+    if (d->pace_on && d->running && d->backend.start && d->pace.rate) {
+        /* 0.3.117: a buffer goes back when the device's clock passes its end (snd_pace.h), not when the player has
+           taken its last byte. Never behind the player: what it has taken is played. */
+        pthread_mutex_lock(&d->pace_mu);
+        uint64_t pos = hv_snd_pace_advance(&d->pace, atomic_load(&d->written), now_ns());
+        pthread_mutex_unlock(&d->pace_mu);
+        if (pos > c) c = pos;
+    }
     int any = 0;
     while (d->phead != d->pcopy && d->pending_end[d->phead % HV_VSND_PENDING] <= c) {
         HvVirtqElem *e = &d->pending[d->phead % HV_VSND_PENDING];
@@ -256,7 +276,30 @@ void hv_virtio_snd_poll(HvVirtioSnd *d) {
 uint32_t hv_virtio_snd_pull(HvVirtioSnd *d, void *buf, uint32_t len) {
     uint64_t c = atomic_load_explicit(&d->consumed, memory_order_relaxed);
     uint64_t w = atomic_load_explicit(&d->written, memory_order_acquire);
-    uint32_t n = w - c < len ? (uint32_t)(w - c) : len;
+    uint64_t have = w - c;
+    int late = 1; /* a short pull is the guest's lateness (without the device's clock it always is) */
+    if (d->pace_on && d->running && d->frame_bytes && d->pace.rate) {
+        /* 0.3.117: the player stays the lead behind the device's clock (snd_pace.h). */
+        pthread_mutex_lock(&d->pace_mu);
+        hv_snd_pace_advance(&d->pace, w, now_ns());
+        uint64_t to = hv_snd_pace_play_to(&d->pace, w);
+        late = hv_snd_pace_held(&d->pace);
+        pthread_mutex_unlock(&d->pace_mu);
+        uint64_t may = to > c ? to - c : 0;
+        /* A player that fell behind (its thread held up for longer than it makes up for) drops what is over a
+           tenth of a second, rather than play that much later from then on. */
+        uint64_t most = (uint64_t)len + (uint64_t)d->rate_hz / 10 * d->frame_bytes;
+        if (may > most) {
+            uint64_t drop = may - len;
+            drop -= drop % d->frame_bytes;
+            if (atomic_compare_exchange_strong(&d->consumed, &c, c + drop)) d->dropped_bytes += drop, c += drop;
+            may = to > c ? to - c : 0;
+            have = w - c;
+        }
+        may -= may % d->frame_bytes;
+        if (have > may) have = may;
+    }
+    uint32_t n = have < len ? (uint32_t)have : len;
     uint32_t off = 0;
     while (off < n) {
         uint32_t at = (uint32_t)((c + off) % HV_VSND_RING), k = n - off;
@@ -266,11 +309,11 @@ uint32_t hv_virtio_snd_pull(HvVirtioSnd *d, void *buf, uint32_t len) {
     }
     if (n < len) {
         memset((uint8_t *)buf + n, 0, len - n);
-        if (d->running) d->underruns++, d->short_bytes += len - n;
+        if (d->running && late) d->underruns++, d->short_bytes += len - n;
     }
     /* compare-exchange: a release on the CPU thread may have moved it on */
     atomic_compare_exchange_strong(&d->consumed, &c, c + n);
-    if (n) hv_machine_wake(d->vio.m);
+    if (n || d->pace_on) hv_machine_wake(d->vio.m); /* with the device's clock a buffer may be due between pulls */
     return n;
 }
 
@@ -312,6 +355,7 @@ HvVirtioSnd *hv_virtio_snd_create(HvMachine *m, HvPcie *bus) {
     memcpy(v->config + 8, &chmaps, 4);
     v->config_len = 12;
     d->ring = calloc(1, HV_VSND_RING);
+    pthread_mutex_init(&d->pace_mu, NULL);
     hv_pcie_attach(bus, &v->pci);
     return d;
 }
@@ -322,6 +366,12 @@ void hv_virtio_snd_resume(HvVirtioSnd *d) {
     if (!d) return;
     d->clock_start_ns = now_ns();
     d->clock_start_consumed = atomic_load(&d->consumed);
+    if (d->pace_on && d->running && d->frame_bytes) { /* the device's clock from now too */
+        pthread_mutex_lock(&d->pace_mu);
+        hv_snd_pace_start(&d->pace, atomic_load(&d->written), now_ns(), d->rate_hz * d->frame_bytes,
+                          d->rate_hz / 1000 * d->pace_lead_ms * d->frame_bytes);
+        pthread_mutex_unlock(&d->pace_mu);
+    }
     if (d->running && d->backend.start && d->backend.start(d->backend.opaque, d->channels, d->format, d->rate_hz) != 0)
         d->backend.start = NULL;
 }

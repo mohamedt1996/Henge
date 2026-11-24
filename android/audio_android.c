@@ -88,20 +88,31 @@ static void *pump_thread(void *unused) {
                 else A.sent++;
             }
         }
-        /* 0.3.115: every 30 s of playing, what the Mac's side of the sound did, if anything: silence a pull had to add
-           (the Mac was late with its sound: a cut) and buffers that found the ring full (the Mac ahead of the player). */
+        /* 0.3.115, 0.3.117: every 30 s of playing, what the Mac's side of the sound did: its buffers, how often its
+           sound was late (later than the lead, with the device's clock) and what silence that cost, a full ring, a
+           late pump, sound dropped to catch up. */
         {
-            static uint64_t passes, cuts0, short0, full0, late0;
+            static uint64_t passes, cuts0, short0, full0, late0, tx0, drop0;
             static uint64_t late; /* pulls that started 30 ms or more behind their time */
             if (A.d && ++passes % 3000 == 0) {
-                uint64_t cuts = A.d->underruns - cuts0, sh = A.d->short_bytes - short0, full = A.d->ring_full - full0;
-                unsigned fb = A.channels * bytes_per ? A.channels * bytes_per : 1;
-                if (cuts || full || late != late0)
-                    fprintf(stderr, "hengevm: sound: last 30 s: the Mac was late with its sound %llu time(s), %llu ms of silence "
-                                    "played for it; the ring was full %llu time(s); the engine's pump ran 30 ms or more late %llu time(s)\n",
-                            (unsigned long long)cuts, (unsigned long long)(sh / fb * 1000 / (A.rate ? A.rate : 48000)),
-                            (unsigned long long)full, (unsigned long long)(late - late0));
-                cuts0 = A.d->underruns, short0 = A.d->short_bytes, full0 = A.d->ring_full, late0 = late;
+                HvVirtioSnd *d = A.d;
+                uint64_t cuts = d->underruns - cuts0, sh = d->short_bytes - short0, full = d->ring_full - full0;
+                unsigned fb = A.channels * bytes_per ? A.channels * bytes_per : 1, rate = A.rate ? A.rate : 48000;
+                pthread_mutex_lock(&d->pace_mu);
+                uint64_t holds = d->pace.holds, held_ms = d->pace.held_ns / 1000000, held_max = d->pace.held_max_ns / 1000000;
+                d->pace.holds = 0, d->pace.held_ns = 0, d->pace.held_max_ns = 0;
+                pthread_mutex_unlock(&d->pace_mu);
+                fprintf(stderr, "hengevm: sound: last 30 s: %llu buffers from the Mac of %llu to %llu frames; its sound was late "
+                                "%llu time(s) (%llu ms in all, %llu at most), %llu pull(s) came up short, %llu ms of silence played "
+                                "for it; the ring was full %llu time(s); the pump ran 30 ms or more late %llu time(s); %llu ms dropped "
+                                "to catch up\n",
+                        (unsigned long long)(d->tx_count - tx0), (unsigned long long)(d->tx_bytes_min / fb),
+                        (unsigned long long)(d->tx_bytes_max / fb), (unsigned long long)(d->pace_on ? holds : cuts),
+                        (unsigned long long)held_ms, (unsigned long long)held_max, (unsigned long long)cuts,
+                        (unsigned long long)(sh / fb * 1000 / rate), (unsigned long long)full, (unsigned long long)(late - late0),
+                        (unsigned long long)((d->dropped_bytes - drop0) / fb * 1000 / rate));
+                cuts0 = d->underruns, short0 = d->short_bytes, full0 = d->ring_full, late0 = late, tx0 = d->tx_count;
+                drop0 = d->dropped_bytes, d->tx_bytes_min = 0, d->tx_bytes_max = 0;
             }
             struct timespec t;
             clock_gettime(CLOCK_MONOTONIC, &t);
@@ -160,6 +171,21 @@ static void stop(void *opaque) {
     pthread_mutex_unlock(&A.mu);
 }
 
+/* 0.3.117: the device's own clock (devices/snd_pace.h): buffers go back to the Mac at the stream's rate by this
+   clock and the pump plays HV_SND_LEAD_MS (50) behind it. HV_SND_LEAD_MS=0: as up to 0.3.116. */
+static void pace_setup(HvVirtioSnd *d) {
+    const char *e = getenv("HV_SND_LEAD_MS");
+    int ms = e && *e ? atoi(e) : 50;
+    if (ms < 0) ms = 0;
+    if (ms > 200) ms = 200;
+    d->pace_lead_ms = (uint32_t)ms;
+    d->pace_on = ms > 0;
+    static int said;
+    if (!said++)
+        fprintf(stderr, ms ? "hengevm: sound: the device keeps its own clock; the player runs %d ms behind it\n"
+                           : "hengevm: sound: buffers go back to the Mac as they are played out (HV_SND_LEAD_MS=%d)\n", ms);
+}
+
 static int listening; /* the port and the threads stay from the first attach on: the app keeps its connection */
 
 void hv_audio_attach(HvVirtioSnd *d) {
@@ -168,6 +194,7 @@ void hv_audio_attach(HvVirtioSnd *d) {
         A.d = d;
         pthread_mutex_unlock(&A.mu);
         d->backend = (HvVirtioSndBackend){start, stop, d};
+        pace_setup(d);
         return;
     }
     const char *p = getenv("HV_AUDIO_PORT");
@@ -192,6 +219,7 @@ void hv_audio_attach(HvVirtioSnd *d) {
     pthread_detach(t);
     listening = 1;
     d->backend = (HvVirtioSndBackend){start, stop, d};
+    pace_setup(d);
     fprintf(stderr, "hengevm: sound on 127.0.0.1:%d, for the app to play\n", port);
 }
 

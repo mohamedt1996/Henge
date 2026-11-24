@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
+#include "snd_pace.h"
 #include "virtio.h"
 
 /* virtio-snd (virtio 1.2, section 5.14) with one output stream: what
@@ -51,6 +52,13 @@ typedef struct HvVirtioSnd {
     /* 0.3.115, for the backend's 30 s line: bytes of silence a pull had to add while the stream ran (the guest was
        late: a cut), and how often a waiting buffer found the ring full (the guest ahead of the player). */
     uint64_t short_bytes, ring_full;
+    /* 0.3.117: the device's own clock (snd_pace.h), for a backend that pulls by the host's clock (Android's pump sets
+       pace_on; HV_SND_LEAD_MS, 50 by default, 0 for buffers handed back as they are played out, as before). */
+    int pace_on;
+    uint32_t pace_lead_ms;
+    pthread_mutex_t pace_mu;
+    HvSndPace pace;
+    uint64_t tx_count, tx_bytes_min, tx_bytes_max, dropped_bytes; /* for the log */
 } HvVirtioSnd;
 
 HvVirtioSnd *hv_virtio_snd_create(HvMachine *m, HvPcie *bus);

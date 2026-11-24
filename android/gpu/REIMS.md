@@ -1416,3 +1416,31 @@ log does not say why (its crash report will).
   so every tablet starts at Exact). The microsecond clock's step back each second returns with it; no harm from it
   has been shown, and it would need the sound pump to run at the Mac's rate (96 frames taken for each 95 played).
 - The fastest core was held to 1.7 to 1.9 of 2.8 GHz again, at 61 to 82 C.
+
+0.3.117 (2026-11-24): 0.3.116's run on Gunyah (Exact clock, latency_bytes 0), its log and sound log, read whole.
+- 0.3.116's reading was wrong: with the clock exact again coreaudiod still re-anchored once every 1.04 s ("Sample time
+  is consecutive, host time is not consecutive"), with overloads whose safety_violation_time_gap alternates 9 to 10 ms
+  and 84 to 88 ms. The 19 MHz clock was not the cause (it stays off: it does add 1% of its own).
+- The engine's new line names it: "the Mac was late with its sound 377 time(s), 3331 ms of silence played for it" in
+  30 s, the pump never late, the ring never full. One gap per transmit buffer (85 ms: about 12 a second): a buffer
+  went back to the Mac when the player had taken its last byte, the driver sends the next when one comes back, and
+  until that arrived the ring was empty. Each gap made the device 9 to 10 ms late by the Mac's reckoning; its driver
+  keeps a nominal timeline (its timestamps are exactly 4,992,000 ticks apart) and jumps it when the device has
+  fallen behind, which is the re-anchor. tests/test_snd_pace.c shows the same with a guest that sends at each
+  return and no lead: 3.2 s of silence a minute.
+- devices/snd_pace.h: the device keeps a clock of its own. A buffer goes back when that clock passes its end (to the
+  millisecond, on the device thread, not at the pump's 10 ms steps); the pump plays 50 ms behind it
+  (HV_SND_LEAD_MS; 0: as before), so the next buffer is in the ring before the last runs out, and a guest up to 50 ms
+  late shows nowhere. The simulation: no silence and buffers back every 85 to 86 ms for a guest that sends by timer
+  (30 ms of jitter) and for one that sends at each return (30 ms to turn around). Not run on the tablet.
+- The 30 s sound line is always written while sound plays: the Mac's buffers and their sizes, how often and how long
+  its sound was later than the lead, silence played, a full ring, a late pump, sound dropped to catch up. The driver's
+  buffer and period are logged when it sets them.
+- Safari: its GPU process died again logging an overload (1439 "Throwing Exception"); only the overloads' end can
+  spare it.
+- Speed, from the same log (the tablet cool this time, no core held back): the Mac's CPUs waited 6 to 14% of their
+  time for a core and 1.5 to 5.7 s of each 30 on GPU registers; the tablet had 600 to 790 MB free with 1.8 to 2.2 GB
+  in swap, and swapped 100 to 370 MB each way per 30 s; the disk was busy 9 to 20 s of each 30 until the desktop
+  settled. In the engine itself: the search for PAC hypercalls read all 3 GB of the Mac's RAM in one go every 30 s
+  (found nothing after the start in any log); it now goes 16 MB at a time across the same half minute. The Mac's
+  screen is written to storage every 30 s for 5 minutes only, then every 10 minutes.
