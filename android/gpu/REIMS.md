@@ -1288,3 +1288,13 @@ view refused so is now a duplicate of the registered shared mapping of the RAM (
 maps no file anew; its first use is logged. The app re-probes a new map of the file every 10 s and says when that
 changes, to time the refusal. The panic finder skips reports kept on disk (their JSON escapes): recoveryOS reads the
 old panic report in, and 0.3.107/0.3.108 printed it six times a pass.
+
+0.3.110 (2026-11-24): 0.3.109 worked: on Gunyah, "views of guest pages are duplicates of the RAM's mapping", the GPU's
+root FIFO up, 80,000 register accesses and 21,000 interrupts, 4,311 presents and 2,537 frames shown at up to 60
+frames/s, WindowServer alive, the Boot Picker drawn (Macintosh HD listed as bootable). The app's re-probe showed a new
+map of the RAM's file refused once the Mac ran on Gunyah. Zero-copy was off in that run: /dev/udmabuf would not open,
+so Turnip (no VK_EXT_external_memory_host) could make no no-copy buffer over guest pages, a few early GPU tasks
+faulted and macOS restarted its GPU before drawing ("Trying to restart GPU"): Zero-copy on avoids that.
+Last step to macOS: choosing Macintosh HD restarts the Mac, and on Gunyah the VM ends at a restart. The engine now
+reads the kernel's last word ("MACH Reboot" or "CPU halted") when the VM exits; a restart (and the JIT's PSCI
+SYSTEM_RESET too) exits 3, and the app starts the Mac again, at most 3 times in 10 minutes.

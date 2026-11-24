@@ -183,7 +183,19 @@ public class VmService extends Service {
         return START_NOT_STICKY;
     }
 
-    private void run(String mode, int ram, int cpus, String release, boolean deleteImage, String gpu) {
+    /** 0.3.110: when macOS restarts, the engine exits 3 and the Mac is started again (a Mac restarts); at most 3 times in
+     *  10 minutes, so a panic that restarts the Mac each boot does not go round for ever. */
+    private static final java.util.ArrayDeque<Long> restarts = new java.util.ArrayDeque<>();
+    private static synchronized boolean restartAllowed() {
+        long now = System.currentTimeMillis();
+        while (!restarts.isEmpty() && now - restarts.peekFirst() > 10 * 60 * 1000L) restarts.pollFirst();
+        if (restarts.size() >= 3) return false;
+        restarts.addLast(now);
+        return true;
+    }
+
+    private void run(String mode, int ram, int cpus, String release, boolean deleteImage, String gpuAsked) {
+        String gpu = gpuAsked;
         boolean install = "install".equals(mode);
         state = install ? "installing" : "running";
         File files = getFilesDir(), mac = macDir(this), log = logFile(this), pidFile = new File(files, "engine.pid");
@@ -483,6 +495,15 @@ public class VmService extends Service {
         new File(mac, "disk.img.ram").delete();
         if (code > 128) appendLog(log, "henge app: the engine was killed by " + signalName(code - 128)
                 + (code - 128 == 31 ? " (a syscall Android's seccomp filter does not allow)" : ""));
+        if (!install && code == 3) {
+            if (restartAllowed()) {
+                appendLog(log, "henge app: macOS restarted: starting the Mac again");
+                process = null;
+                new Thread(() -> run(mode, ram, cpus, release, deleteImage, gpuAsked), "engine").start();
+                return;
+            }
+            appendLog(log, "henge app: macOS restarted a fourth time in 10 minutes: not started again (start it yourself)");
+        }
         state = install ? (code == 0 ? "installed" : "install failed (" + code + ")")
                         : (code == 0 ? "stopped" : "stopped (" + code + ")");
         process = null;

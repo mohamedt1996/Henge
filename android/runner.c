@@ -953,7 +953,13 @@ int main(int argc, char **argv) {
         }
     }
     hv_vm_flush_disks();
-    fprintf(stderr, "hengevm: stopped: %s\n", hv_vm_reason_name(reason));
+    /* 0.3.110: macOS restarted (a startup disk chosen in the Boot Picker, an update, a panic's restart): exit 3, and
+       the app starts the Mac again, as a Mac restarts. On Gunyah the VM ends at the restart (HV_GUNYAH_RESTART). */
+    if (!install_dir && (reason == HV_GUNYAH_RESTART || (!gunyah && atomic_load(&hv_vm_cpu(0)->halted) == HV_HALT_RESET))) {
+        fprintf(stderr, "hengevm: stopped: macOS restarted; the app starts it again\n");
+        return 3;
+    }
+    fprintf(stderr, "hengevm: stopped: %s\n", reason == HV_GUNYAH_RESTART ? "restart" : hv_vm_reason_name(reason));
     if (install_dir) {
         if (install_done != 0) return 1;
         fprintf(stderr, "henge: macOS is installed. Start it with: hengevm-android --mac %s\n", install_dir);

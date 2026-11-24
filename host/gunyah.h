@@ -12,6 +12,7 @@
    RAM all in 2 MB pages. Experimental: see gunyah.c for what is assumed. */
 
 #define HV_GUNYAH_NOT_STARTED (-2) /* nothing of Gunyah's was started: Henge's CPUs can go on (hv_vm_resume_jit) */
+#define HV_GUNYAH_RESTART (-3) /* 0.3.110: the VM exited after the kernel's "MACH Reboot": macOS restarted, start it again */
 
 /* Call once hv_vm_run_cpu0 returned with CPU 0 halted for the hand-over and hv_vm_end_jit ended the others.
    Runs until the guest powers off or resets, the VM fails, or hv_gunyah_stop(); returns an HV_EXIT_*-like reason

@@ -1545,6 +1545,34 @@ static void mb_find(void) {
         return;
     }
 }
+/* 0.3.110: whether the kernel's last word before the VM exited was a restart. XNU's halt_all_cpus prints "MACH Reboot"
+   for a restart (a chosen startup disk, a panic's restart) and "CPU halted" for a shut down; Gunyah ends the VM on the
+   guest's PSCI SYSTEM_RESET and SYSTEM_OFF alike (status 2, "exited"), so the log says which it was. 1: restart. */
+static int kernel_said_reboot(void) {
+    mb_find();
+    if (!mb_pa) return 0;
+    const uint8_t *h = hv_phys_ptr(M, mb_pa, 24);
+    if (!h) return 0;
+    uint32_t size = rd32(h + 4), bufx = rd32(h + 8);
+    uint64_t bufc = rd64(h + 16);
+    const char *buf = bufc >= k_virt ? hv_phys_ptr(M, bufc - k_virt + k_phys, size) : NULL;
+    if (!buf || bufx >= size) return 0;
+    /* the most recent of each, by distance back from the write index (the buffer is a ring) */
+    uint64_t reboot_age = UINT64_MAX, halt_age = UINT64_MAX;
+    for (uint32_t i = 0; i + 11 <= size; i++) {
+        if (buf[i] == 'M' && !memcmp(buf + i, "MACH Reboot", 11)) {
+            uint64_t age = (uint64_t)((bufx + size - i) % size);
+            if (age < reboot_age) reboot_age = age;
+        } else if (buf[i] == 'C' && i + 10 <= size && !memcmp(buf + i, "CPU halted", 10)) {
+            uint64_t age = (uint64_t)((bufx + size - i) % size);
+            if (age < halt_age) halt_age = age;
+        }
+    }
+    say("gunyah: the kernel's log ends in %s\n", reboot_age < halt_age ? "\"MACH Reboot\" (a restart)"
+        : halt_age != UINT64_MAX ? "\"CPU halted\" (a shut down)" : "neither \"MACH Reboot\" nor \"CPU halted\"");
+    return reboot_age < halt_age;
+}
+
 static void mb_follow(int force_start) {
     static uint32_t spam_n;
     static time_t spam_t;
@@ -1877,7 +1905,7 @@ static void *vcpu_thread(void *arg) {
             memcpy(&reason, r->status.reason, r->status.reason_size < 4 ? r->status.reason_size : 4);
             fprintf(stderr, "gunyah: the VM stopped (seen by vCPU %d): status %u (1 load failed, 2 exited, 3 crashed), "
                             "type %u, reason %#x\n", id, r->status.status, r->status.type, reason);
-            vm_reason = r->status.status == 2 ? 0 : HV_EXIT_UNSUPPORTED;
+            vm_reason = r->status.status != 2 ? HV_EXIT_UNSUPPORTED : kernel_said_reboot() ? HV_GUNYAH_RESTART : 0;
             break;
         } else {
             fprintf(stderr, "gunyah: unknown exit %u on vCPU %d\n", r->exit_reason, id);
