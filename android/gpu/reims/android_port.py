@@ -239,6 +239,8 @@ def main() -> None:
     subprocess.run([sys.executable, '-I', str(HERE / 'reims_view_why.py'), str(reims)], check=True)
     # Why a no-copy buffer over a GPU task's pages is refused: the hole, said (reims_hole_why.py).
     subprocess.run([sys.executable, '-I', str(HERE / 'reims_hole_why.py'), str(reims)], check=True)
+    # A protection the kernel refuses leaves the view, not a mapping over a gap (reims_protect_kept.py).
+    subprocess.run([sys.executable, '-I', str(HERE / 'reims_protect_kept.py'), str(reims)], check=True)
     # reims-vgpu's dma-buf answers of 2026-11-15, backported: udmabuf's limits read once a second, and
     # each source's latest answers kept (reims_dma_buf_kept.py). Only where the revision lacks them.
     if 'fn host_limits()' not in (reims / 'crates/reims-vgpu-vulkan/src/os/linux/dma_buf.rs').read_text():

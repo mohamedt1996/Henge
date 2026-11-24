@@ -1353,3 +1353,31 @@ log does not say why (its crash report will).
   reason for any of them. In the Mac's Terminal, `curl -s http://10.0.2.4/.henge/reports | sh` now sends the newest
   crash reports (40 of the user's, 40 of the system's) to the shared folder's "Mac Reports", and Save the full log to
   Downloads saves them as henge-mac-reports-*.zip: no Console, no copying inside the Mac.
+
+0.3.114 (2026-11-24): 0.3.113's run on Gunyah, its log and 33 reports sent out of the Mac by /.henge/reports.
+- The clock at 19 MHz worked: the Mac booted, no kernel stamp above 999,999 microseconds, no negative "took" times.
+  Sound in that run: no gaps, 120 ms dropped of 26 s.
+- The GPU restarts (229 nil no-copy buffers over task 2's pages 0xad, 0xf5, 0xf9; "Trying to restart GPU" at each).
+  0.3.112's report names the hole: the buffer's 16 KB are a gap of the app's address space with no entry in the
+  backing table, among live views and Turnip's dma-buf maps. The path that leaves exactly that: core lowers a mapping
+  over a read-only leaf to read-only (protect_max), and where that is refused it frees the allocation and makes the
+  mapping anyway (Apple's own flaw, kept upstream). On this tablet mprotect of the RAM file's mappings is refused as
+  new maps of it are (EACCES once the Mac runs on Gunyah; `refused` logs nothing for it). reims_protect_kept.py: on
+  Android an EACCES/EPERM there leaves the view read and write and answers success; the first and each 256th are
+  logged ("(Henge) protect_max: the kernel refuses protection ..."), any other errno is logged and refused as before.
+  A mapping over a freed range is also unmapped again when it ends, which can take away whatever view was put there
+  since: that may be behind stamps that never arrive ("stamp wait report: FIFO 4 pending") and memory that changes
+  under macOS (below). Not shown by this log.
+- Safari's GPU process (9 reports, 0.3.111 to 0.3.113): always thread com.apple.audio.IOThread.client, a stack
+  overflow: CoreAudio's AMCP::Utility::is_thread_configured_for_realtime logs an error, the log call makes a
+  With_Realtime_Disabled, which asks is_thread_configured_for_realtime again, 500 frames deep. Each level is one
+  "Sandbox: com.apple.WebKit.GPU deny(1) syscall-mig 261" (1437 of them before the first crash). So Safari's sandbox
+  refuses the thread-policy call CoreAudio makes when its sound thread has something to report; Chrome's does not.
+  What the thread wanted to report is not in the crash report (511 frames kept). /.henge/reports now also sends the
+  last 15 minutes of CoreAudio's log (henge-sound-log.txt). With Sound: Off the Mac has no sound device to open.
+- Other programs' crashes in the same runs are damaged memory, not one bug: stack guards (WebContent, neagent,
+  searchpartyd, nsurlsessiond, corespotlightd), malloc's own data (UIKitSystem, coresymbolicationd,
+  spotlightknowledged), a jump into nothing (AppleUserHIDDrivers), an illegal instruction in WindowServer. None
+  before the first desktop on Gunyah (2026-11-23).
+- The ten panic-full reports are one panic (2026-11-21, incident 4A8369BC), written again at every start: the
+  "shut down because of a problem" notice at each boot is that one.

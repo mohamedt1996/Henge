@@ -667,7 +667,16 @@ static const char reports_script[] =
     "  done < /tmp/henge-reports.$$\n"
     "  rm -f /tmp/henge-reports.$$\n"
     "done\n"
-    "echo \"Sent $n reports to Henge. On the tablet: Henge, the log, Save the full log to Downloads.\"\n";
+    /* 0.3.114: what CoreAudio said. Safari's GPU process dies on its sound thread (a CoreAudio log call that recurses
+       until the stack ends), and what the thread was about to log is only in the system's log. */
+    "echo 'Collecting the last 15 minutes of the sound log (this can take a few minutes)...'\n"
+    "L=/tmp/henge-sound-log.txt\n"
+    "log show --last 15m --style compact --predicate "
+    "'process == \"coreaudiod\" OR process == \"com.apple.WebKit.GPU\" OR subsystem BEGINSWITH \"com.apple.coreaudio\"' "
+    "2>&1 </dev/null | tail -8000 > \"$L\"\n"
+    "if [ -s \"$L\" ] && curl -fsS -o /dev/null -T \"$L\" \"$U/\" </dev/null; then n=$((n+1)); echo '  henge-sound-log.txt'; fi\n"
+    "rm -f \"$L\"\n"
+    "echo \"Sent $n files to Henge. On the tablet: Henge, the log, Save the full log to Downloads.\"\n";
 
 /* And back. The wallpaper stays as it is: pick one in System Settings. */
 static const char unlighten_script[] =
