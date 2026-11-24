@@ -361,6 +361,18 @@ uint64_t hv_pvg_reims_wait_ns(void) { return __atomic_load_n(&R.wait_ns, __ATOMI
 int hv_pvg_reims_screen(int *w, int *h) {
     if (!R.h || !R.h->engine_alive || !R.h->display_w || !R.h->display_h) return -1;
     *w = (int)R.h->display_w, *h = (int)R.h->display_h;
+    /* 0.3.125: the mode macOS set, where the app has told it: macOS may keep another resolution than the one offered
+       first (chosen in its Displays settings), and a touch reckoned by the offered one landed off by their ratio,
+       further off the further from the screen's top left. */
+    uint32_t mw = __atomic_load_n(&R.h->mode_w, __ATOMIC_ACQUIRE), mh = __atomic_load_n(&R.h->mode_h, __ATOMIC_ACQUIRE);
+    if (mw >= 320 && mh >= 200) {
+        static uint32_t said_w, said_h;
+        if ((mw != said_w || mh != said_h) && (mw != R.h->display_w || mh != R.h->display_h))
+            fprintf(stderr, "hengevm: pointer: the Mac's screen is %ux%u now (offered %ux%u): places are reckoned by it\n", mw, mh,
+                    R.h->display_w, R.h->display_h);
+        said_w = mw, said_h = mh;
+        *w = (int)mw, *h = (int)mh;
+    }
     return 0;
 }
 

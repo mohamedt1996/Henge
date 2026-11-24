@@ -462,6 +462,10 @@ public class VmService extends Service {
             // 3.5 minutes; without (0.3.61's run) by 7.5. The engine's waits rest in WFE now, which wakes at once.
             boolean awakeOn = coresOn && "on".equals(prefs.getString("coreAwake", "off"));
             pb.environment().put("HV_CPU_PIN", coresOn ? "1" : "0");
+            // 0.3.125, Gunyah: the engine's threads that are not the Mac's CPUs keep to the slow cores (android/runner.c);
+            // Settings > Cores for the Mac: Off leaves them where Android puts them, as before.
+            if (!install && gunyah() && !"off".equals(prefs.getString("coreTuning", "on")))
+                pb.environment().put("HV_CPU_HELPERS_SLOW", "1");
             // Settings > Big core: Leave out (the default) keeps the Mac's CPUs off a core faster than all the others.
             pb.environment().put("HV_CPU_PRIME", "use".equals(prefs.getString("bigCore", "avoid")) ? "1" : "0");
             String coreKept = "";

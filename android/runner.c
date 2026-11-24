@@ -383,6 +383,11 @@ static void fast_find(void) {
     const char *pin = getenv("HV_CPU_PIN");
     pin_cores = !(pin && *pin == '0') && hv_vm_ncpus() <= fast_count;
     pin_helpers = pin_cores && !hv_runner_installing;
+    /* 0.3.125, Gunyah (HV_CPU_HELPERS_SLOW=1): the Mac's CPUs float over the fast cores there, and the engine's
+       other threads floated over them too; the logs' "waited for a core" is 11 to 20% of the CPUs' time. The other
+       threads go to the slow cores as they do with the JIT's one core each. */
+    const char *hs = getenv("HV_CPU_HELPERS_SLOW");
+    if (hs && *hs == '1' && !hv_runner_installing && slow_count) pin_helpers = 1;
     pthread_t th;
     if (pthread_create(&th, NULL, fast_again, NULL) == 0) pthread_detach(th);
 }

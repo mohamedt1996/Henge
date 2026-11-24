@@ -341,6 +341,10 @@ static void on_mode(void *ctx, uint16_t w, uint16_t hgt, uint32_t format) {
     (void)format;
     pthread_mutex_lock(&h->lock);
     h->mode_w = w, h->mode_h = hgt, h->mode_changed = 1, h->frame_pending = 1;
+    if (h->h) {
+        __atomic_store_n(&h->h->mode_w, (uint32_t)w, __ATOMIC_RELEASE);
+        __atomic_store_n(&h->h->mode_h, (uint32_t)hgt, __ATOMIC_RELEASE);
+    }
     pthread_cond_signal(&h->wake);
     pthread_mutex_unlock(&h->lock);
     hlog("reims: mode %ux%u", w, hgt);

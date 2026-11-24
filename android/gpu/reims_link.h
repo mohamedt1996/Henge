@@ -59,7 +59,10 @@ typedef struct {
        pixels, written by the app at each move: the engine's pointer correction reads it (hv_vm_pointer),
        as it reads pvg_lite's display page. cursor_seq is odd while a write is under way. */
     uint32_t cursor_x, cursor_y, cursor_seq, cursor_valid;
-    uint64_t pad[6];
+    /* 0.3.125: the mode macOS set (0s before it has), written by the app: places on the Mac's screen are reckoned by
+       it, not by the mode offered first (macOS keeps the resolution chosen in its Displays settings). */
+    uint32_t mode_w, mode_h;
+    uint64_t pad[5];
     HvReimsSlot slot[HV_REIMS_SLOTS];
 } HvReimsHeader;
 

@@ -1561,3 +1561,22 @@ so nothing was rewritten and the Mac booted on the counter's own rate, as it is 
 in that log is the old report still in RAM and on disk). The surroundings alone were too loose. Now a candidate must
 also end in fleh_dispatch64's jump to the handler within four instructions of mov x0, x21: br x22 (d61f02c0) or
 braa x22, sp (d71f0adf). Every loose candidate is logged with its 16 words, so a miss can be read from the log.
+
+0.3.125 (2026-11-24): 0.3.124 at 24 MHz ran a whole session (boot to shut down, Chrome and Safari used):
+- fleh_dispatch64's call was the one of six candidates that ends in braa x22, sp; the wrapper went in; launchd lived.
+- Sound: the Mac's buffers arrive 89 ms apart (4096 frames are 85 ms) where they came 104 ms apart with a reset each
+  second; "late" 0 to 5 times and 0 to 790 ms of silence per 30 s (Exact, 0.3.119: 67 times, 2910 ms). What is left
+  comes with the Mac standing still (buffers up to 3.8 s apart in the worst half minute, the tablet swapping 844 MB
+  in and 870 out, 526 to 634 MB available), not with the clock.
+- Safari's GPU process (pids 711, 717, 761) stayed up through playback (mediaremoted follows 761); no report asked.
+- CPUs: ran 23 to 51% and waited 11 to 20% of the time for a core; hottest sensor 50 to 93 C, the fast cores held
+  to 1.9 to 2.7 of 2.8 GHz. (Exact's start in the same log: waited 7.6 to 14.5%.)
+Changes:
+- Pointer at every resolution. A touch is sent as a place in the Mac's pixels, which the app reckons by the mode
+  macOS set (reims_host_mode) and the engine turned into the tablet's 0..32767 by the mode offered first
+  (HvReimsHeader.display_w/h, fixed at the start). macOS keeps the resolution chosen in its Displays settings, so
+  with any other than the offered one a touch landed off by the two sizes' ratio. The app now writes the set mode
+  into the header (mode_w, mode_h) and hv_pvg_reims_screen answers with it.
+- Gunyah: the engine's threads that are not the Mac's CPUs keep to the slow cores (HV_CPU_HELPERS_SLOW=1, as the
+  JIT's "one core each" does); Settings > Cores for the Mac: Off leaves them as before. Not measured yet: the next
+  log's "waited for a core" says.
