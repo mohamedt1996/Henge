@@ -1527,3 +1527,16 @@ compare value, so those are checked at the MSR. 24 MHz is taken only if every ta
 (under 16 KB of zeros at a range's end); else nothing is rewritten and the Mac gets the counter's own rate.
 What has not run: any of it on the tablet. Each kernel read of the time is now an exception at EL1 (no hypervisor
 exit); and programs ask the kernel for the time (commpage +0x90 = 0), so the 24 MHz clock costs CPU time by design.
+
+0.3.122 (2026-11-24): 0.3.121 at 24 MHz: the three fix-ups of 3676 bytes fit range 0, the kernel booted on the traps
+(banner, drivers, disks, root mounted, commpage found and its +0x90 set to 0) and then "pid 1 exited -- exit reason
+namespace 2 subcode 0x4": launchd killed by SIGILL at its first exception, and the panic for it. Cause, from Apple's
+osfmk/arm64/locore.s for xnu-11417.140.69: fleh_dispatch64 calls recount_leave_user (which reads the time) for an
+exception from a program before fleh_synchronous reads ESR_EL1 and FAR_EL1; the trap had made ESR_EL1 "class 0", so
+the program's system call was handled as an undefined instruction. A stub would not have done this; a trap does.
+Now that call's BL goes to a 10-instruction wrapper in range 0's padding (196 bytes were left) that saves ESR_EL1 and
+FAR_EL1 over the call and writes them back. The call is found by its surroundings (mov x21, x0; mov x22, x1; one BL
+within the next 12 instructions; mov x0, x21 after it) and must be found exactly once, in a range with page padding;
+else nothing is rewritten and the Mac gets the counter's own rate. The words around it are logged. Other places a
+trap could spoil: ELR_EL1 and SPSR_EL1 are saved by SPILL_REGISTERS before any call and restored after
+recount_enter_user on the way out; no other call lies between an exception's entry and its reads of ESR/FAR there.

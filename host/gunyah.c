@@ -881,6 +881,59 @@ static int kpatch(void) {
                         "it is not there: the Mac gets the counter's own rate (as Settings > Mac's clock: Exact)\n");
         g_tb24 = 0;
     }
+    /* 0.3.121's start reached launchd, which died of SIGILL: a trap rewrites ESR_EL1, and XNU's fleh_dispatch64
+       (osfmk/arm64/locore.s) calls recount_leave_user, which reads the time, between an exception from a program and
+       the handler's reading ESR_EL1 and FAR_EL1; the program's system call was then taken for an undefined
+       instruction. That one call (mov x21, x0; mov x22, x1; cmp; b.gt; stp fp, lr; mov fp, sp; BL; ...; mov x0, x21)
+       now goes through a wrapper in the page padding that keeps the two registers over it. Not found once, or no
+       room: nothing is rewritten. */
+    if (g_tb24) {
+        int found = 0, fr = -1;
+        uint64_t fi = 0;
+        for (int r = 0; r < nxr; r++) {
+            uint32_t *w = hv_phys_ptr(M, xr[r].pa, xr[r].size);
+            if (!w || zs[r] < 16) continue;
+            for (uint64_t i = 0; i + 16 < zs[r]; i++) {
+                if (w[i] != 0xaa0003f5u || w[i + 1] != 0xaa0103f6u) continue; /* mov x21, x0; mov x22, x1 */
+                int bl = -1, nbl = 0, back = 0;
+                for (int k = 2; k < 14 && !back; k++) {
+                    if ((w[i + k] & 0xfc000000u) == 0x94000000u) bl = k, nbl++;
+                    else if (w[i + k] == 0xaa1503e0u) back = k; /* mov x0, x21 */
+                }
+                if (nbl != 1 || !back || bl > back) continue;
+                found++, fr = r, fi = i + (uint64_t)bl;
+            }
+        }
+        uint32_t *w = found == 1 ? hv_phys_ptr(M, xr[fr].pa, xr[fr].size) : NULL;
+        if (!w || xr[fr].size - zs[fr] * 4 > 16384 || pools[fr] + 10 > xr[fr].size / 4) {
+            fprintf(stderr, "gunyah: the Mac's clock at 24 MHz: the kernel's call of recount_leave_user was found %d times%s: the "
+                            "Mac gets the counter's own rate (as Settings > Mac's clock: Exact)\n", found,
+                    found == 1 ? ", and its code range has no page padding left for the wrapper" : " (once is needed)");
+            g_tb24 = 0;
+        } else {
+            uint64_t site = xr[fr].pa + fi * 4, stub = xr[fr].pa + pools[fr] * 4;
+            int64_t off = (int64_t)(w[fi] & 0x3ffffff);
+            if (off & (1ll << 25)) off -= 1ll << 26;
+            uint64_t target = site + (uint64_t)(off * 4);
+            uint32_t *c = &w[pools[fr]];
+            c[0] = 0xa9be7bfdu; /* stp x29, x30, [sp, #-32]! */
+            c[1] = 0xd5385210u; /* mrs x16, esr_el1 */
+            c[2] = 0xd5386011u; /* mrs x17, far_el1 */
+            c[3] = 0xa90147f0u; /* stp x16, x17, [sp, #16] */
+            c[4] = 0x94000000u | (uint32_t)(((int64_t)(target - (stub + 16)) >> 2) & 0x3ffffff); /* bl recount_leave_user */
+            c[5] = 0xa94147f0u; /* ldp x16, x17, [sp, #16] */
+            c[6] = 0xd5185210u; /* msr esr_el1, x16 */
+            c[7] = 0xd5186011u; /* msr far_el1, x17 */
+            c[8] = 0xa8c27bfdu; /* ldp x29, x30, [sp], #32 */
+            c[9] = 0xd65f03c0u; /* ret */
+            w[fi] = 0x94000000u | (uint32_t)(((int64_t)(stub - site) >> 2) & 0x3ffffff);
+            pools[fr] += 10;
+            fprintf(stderr, "gunyah: the kernel's call of recount_leave_user (pa %#llx, to %#llx) keeps ESR_EL1 and FAR_EL1 now "
+                            "(wrapper at pa %#llx; around the call: %08x %08x %08x %08x | %08x %08x %08x %08x)\n",
+                    (unsigned long long)site, (unsigned long long)target, (unsigned long long)stub, w[fi - 4], w[fi - 3],
+                    w[fi - 2], w[fi - 1], w[fi + 1], w[fi + 2], w[fi + 3], w[fi + 4]);
+        }
+    }
     for (int r = 0; r < nxr; r++) {
         uint32_t *w = hv_phys_ptr(M, xr[r].pa, xr[r].size);
         if (!w || !zs[r]) continue;
@@ -912,7 +965,7 @@ static int kpatch(void) {
             (unsigned long long)g_ct_seen[1], (unsigned long long)g_ct_seen[2], (unsigned long long)g_ct_seen[3],
             (unsigned long long)g_ct_seen[4], (unsigned long long)g_ct_seen[5],
             g_tb24 ? "each is now a trap the exception fix-up carries out: the Mac's clock is 24 MHz (the counter's 19.2 MHz times 5/4)" : "as they are",
-            g_ct_left ? " (SOME LEFT as they were: Settings > Mac's clock: Exact)" : "");
+            g_ct_left ? " (but for some that name the zero register, left as they were)" : "");
     /* The timebase: the kernel's tree says the 24 MHz Henge's JIT counts; Gunyah gives the CPU's own counter. */
     uint64_t f;
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
